@@ -126,15 +126,42 @@ buzz once. Within 5 seconds, touch the Favorite Position being edited."
 
 ## Notifications
 
-The notify characteristic carries an LED/status bitmask, not positions. The
-vendor app parses it into exactly two live indicators - sleep timer (`0x8000`)
-and alarm (`0x4000`) - and no parsed value ever influences a later command.
+The notify characteristic carries a state bitmask, not positions. It is both
+readable and notify-capable, and needs the same encrypted link the write
+characteristic does - already satisfied, because this bed type pairs.
 
-There is **no position, angle, percentage, motor-state or error feedback of any
-kind** in either app. Under-bed light state is *not* among the bits either app
-reads, so the integration exposes the light as a blind toggle. Users have
-reported that the physical remote does show light state; confirming that would
-need a BLE capture of the notify characteristic while toggling the light.
+The box emits a frame on **every** state change regardless of what caused it,
+including the wired remote, and a GATT read returns the current frame. The
+integration therefore reads once after connect and subscribes for updates.
+
+Observed frame layout (20 bytes, captured from a CU170 box):
+
+| Bytes | Meaning |
+|---|---|
+| `0` | low nibble is the payload size (9 observed) |
+| `1` | wire opcode (`0x0b` observed) |
+| `2..5` | **state bitmask, big-endian** |
+| `6..9` | a second copy of bytes `2..5` |
+| `10` | `0xFF` observed |
+| `11+` | unknown |
+
+Every frame is a full-state replace on this hardware, so the integration does
+not implement the vendor app's opcode dispatch (6/7/8/9/11) and does not
+cross-check the duplicate copy. Frames shorter than 6 bytes are logged and
+dropped.
+
+**State bits mirror keycode values**: the bit for a function equals the keycode
+that toggles it. This is confirmed on hardware for the under-bed light
+(`0x00020000`) only - it is a convention inferred from one bit, not a proven
+rule - so the integration derives each named state bit from its keycode
+constant, and further bits can be named as captures confirm them. The vendor app
+parses just two indicators from this mask, sleep timer (`0x8000`) and alarm
+(`0x4000`), and no parsed value ever influences a later command.
+
+There is still **no position, angle, percentage, motor-state or error feedback
+of any kind**. Diagnostics include the last raw frame and the parsed mask, so
+captures from other boxes sharing this characteristic (Okimat, Nectar) can
+identify further bits.
 
 ## Provenance
 
