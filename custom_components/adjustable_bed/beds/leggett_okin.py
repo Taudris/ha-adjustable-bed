@@ -221,8 +221,13 @@ class LeggettOkinController(BedController):
 
     @property
     def supports_discrete_light_control(self) -> bool:
-        """Return False - Okin only supports toggle, not discrete on/off."""
-        return False
+        """Return True - the wire primitive is a toggle, but on/off are discrete.
+
+        lights_on and lights_off decide against the state the bed reports, so
+        they are idempotent in the way a discrete control has to be. This is
+        what puts the under-bed light on a switch instead of a toggle button.
+        """
+        return True
 
     @property
     def supports_under_bed_lights(self) -> bool:

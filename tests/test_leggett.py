@@ -6,8 +6,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from bleak.exc import BleakError
-from homeassistant.const import CONF_ADDRESS, CONF_NAME
+from homeassistant.const import CONF_ADDRESS, CONF_NAME, STATE_OFF, STATE_ON
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.adjustable_bed.beds.leggett_gen2 import (
@@ -21,6 +22,7 @@ from custom_components.adjustable_bed.beds.leggett_okin import (
 )
 from custom_components.adjustable_bed.const import (
     BED_TYPE_LEGGETT_GEN2,
+    BED_TYPE_LEGGETT_OKIN,
     BED_TYPE_LEGGETT_PLATT,
     BED_TYPE_OKIMAT,
     CONF_BED_TYPE,
@@ -69,6 +71,31 @@ def mock_leggett_gen2_config_entry(
         data=mock_leggett_gen2_config_entry_data,
         unique_id="AA:BB:CC:DD:EE:FF",
         entry_id="leggett_gen2_test_entry",
+    )
+    entry.add_to_hass(hass)
+    return entry
+
+
+OKIN_TEST_ADDRESS = "AA:BB:CC:DD:EE:FF"
+
+
+@pytest.fixture
+def mock_leggett_okin_config_entry(hass: HomeAssistant) -> MockConfigEntry:
+    """Return a mock config entry for a Leggett & Platt Okin bed."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Leggett Okin Test Bed",
+        data={
+            CONF_ADDRESS: OKIN_TEST_ADDRESS,
+            CONF_NAME: "Leggett Okin Test Bed",
+            CONF_BED_TYPE: BED_TYPE_LEGGETT_OKIN,
+            CONF_MOTOR_COUNT: 2,
+            CONF_HAS_MASSAGE: True,
+            CONF_DISABLE_ANGLE_SENSING: True,
+            CONF_PREFERRED_ADAPTER: "auto",
+        },
+        unique_id=OKIN_TEST_ADDRESS,
+        entry_id="leggett_okin_test_entry",
     )
     entry.add_to_hass(hass)
     return entry
@@ -554,6 +581,63 @@ class TestLeggettOkinStateFeedback:
 
         sent = [call.args[0] for call in controller.write_command.await_args_list]
         assert sent.count(bytes.fromhex("040200020000")) == 2
+
+
+class TestLeggettOkinDiscreteLightControl:
+    """Test the light capability that reported state makes honest."""
+
+    def test_light_control_is_declared_discrete(self):
+        """State-aware on/off is discrete control, whatever the wire primitive is."""
+        controller = LeggettOkinController(MagicMock())
+
+        assert controller.supports_discrete_light_control is True
+        assert controller.supports_under_bed_lights is True
+
+    async def test_light_state_joins_the_coordinator_hydration_keys(
+        self,
+        hass: HomeAssistant,
+        mock_leggett_okin_config_entry,
+        mock_coordinator_connected,
+    ):
+        """Discrete control is what puts under_bed_lights_on in the refresh gate.
+
+        Without it the key set is empty, and an initial read that fails is never
+        retried because the gate has nothing left to satisfy.
+        """
+        coordinator = AdjustableBedCoordinator(hass, mock_leggett_okin_config_entry)
+        await coordinator.async_connect()
+
+        assert coordinator._readable_light_state_required_keys() == {"under_bed_lights_on"}
+
+    async def test_the_switch_follows_the_bed_over_its_own_optimism(
+        self,
+        hass: HomeAssistant,
+        mock_leggett_okin_config_entry,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """Discrete control lets the switch write state optimistically; frames outrank it."""
+        await hass.config_entries.async_setup(mock_leggett_okin_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+        coordinator = hass.data[DOMAIN][mock_leggett_okin_config_entry.entry_id]
+        entity_id = er.async_get(hass).async_get_entity_id(
+            "switch", DOMAIN, f"{OKIN_TEST_ADDRESS}_under_bed_lights"
+        )
+        assert entity_id is not None
+
+        await hass.services.async_call(
+            "switch", "turn_on", {"entity_id": entity_id}, blocking=True
+        )
+        await hass.async_block_till_done()
+        assert hass.states.get(entity_id).state == STATE_ON
+
+        # The bed reports the light off - e.g. someone used the wired remote.
+        coordinator.controller._handle_status_notification(
+            None, bytearray(_okin_state_frame(0))
+        )
+        await hass.async_block_till_done()
+        assert hass.states.get(entity_id).state == STATE_OFF
 
 
 class TestLeggettGen2CommandFormat:

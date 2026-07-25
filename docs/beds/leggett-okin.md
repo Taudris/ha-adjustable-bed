@@ -89,6 +89,13 @@ reprogram a slot with whatever position the bed happened to be in.
 Massage power is a **toggle** with no discrete off, so the integration exposes
 no massage-off button.
 
+The under-bed light is a toggle on the wire too, but the box reports its state
+(see [Notifications](#notifications)), so the integration turns it into discrete
+on/off: it sends the toggle only when the reported state differs, and exposes
+the light as a stateful **switch** rather than a toggle button. With no state
+reported yet - notify refused, nothing received - it falls back to a blind
+toggle.
+
 There is no massage timer. `0x00000200` appears in the app as a constant
 (`FBP_KEYCODE_M5_IN`, a fifth actuator channel) but is never bound to a control
 and never written; it must not be reconstructed as a command.
