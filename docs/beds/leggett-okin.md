@@ -150,13 +150,21 @@ not implement the vendor app's opcode dispatch (6/7/8/9/11) and does not
 cross-check the duplicate copy. Frames shorter than 6 bytes are logged and
 dropped.
 
-**State bits mirror keycode values**: the bit for a function equals the keycode
-that toggles it. This is confirmed on hardware for the under-bed light
-(`0x00020000`) only - it is a convention inferred from one bit, not a proven
-rule - so the integration derives each named state bit from its keycode
-constant, and further bits can be named as captures confirm them. The vendor app
-parses just two indicators from this mask, sleep timer (`0x8000`) and alarm
-(`0x4000`), and no parsed value ever influences a later command.
+Known mask bits:
+
+| Bit | Meaning | Evidence |
+|---|---|---|
+| `0x00020000` | under-bed light on | hardware capture on this bed |
+| `0x00008000` | sleep timer armed | vendor app only (`activity_main.xml` `ledMask` tags); not confirmed on this bed |
+| `0x00004000` | alarm armed | vendor app only (same source); not confirmed on this bed |
+
+**Mask bits do not mirror keycode values.** The light bit happening to equal the
+light toggle keycode (`0x00020000`) is a coincidence, not a rule: `0x4000` and
+`0x8000` are alarm and sleep-timer *indicators* in this mask, while the same two
+values as *keycodes* recall memory slots 3 and 4. Every state bit therefore needs
+its own evidence, and the integration writes each identified bit out as a literal
+rather than deriving it from a keycode constant. No value the app parses from
+this mask ever influences a later command.
 
 There is still **no position, angle, percentage, motor-state or error feedback
 of any kind**. Diagnostics include the last raw frame and the parsed mask, so

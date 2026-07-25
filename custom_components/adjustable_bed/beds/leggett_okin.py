@@ -130,16 +130,21 @@ FLAT_HOLD_S = 30.0
 STATUS_FRAME_MIN_LENGTH = 6
 _STATUS_MASK_BYTES = slice(2, 6)
 
+# Under-bed light, confirmed on hardware. It happens to equal TOGGLE_LIGHTS, but
+# it is written out here because mask bits do NOT generally mirror keycodes: the
+# app renders mask bits 0x4000 and 0x8000 as the alarm-armed and sleep-timer-armed
+# indicators (activity_main.xml ledMask tags), while those same values as keycodes
+# recall memory slots 3 and 4. Each state bit needs its own evidence.
+STATUS_LIGHT = 0x20000
+
 
 @dataclass(frozen=True, slots=True)
 class LeggettOkinStatus:
     """State bitmask reported by the control box.
 
-    A state bit has the same value as the keycode that toggles that function, so
-    each named property derives its bit from the matching LeggettOkinCommands
-    constant. That mirroring is a convention confirmed on hardware for the
-    under-bed light only; further functions can be named the same way as
-    captures confirm their bits.
+    Only the under-bed light bit is identified here. The raw mask is kept intact
+    so unidentified bits reach diagnostics, and further bits get named as
+    evidence for each one arrives.
     """
 
     mask: int
@@ -154,7 +159,7 @@ class LeggettOkinStatus:
     @property
     def light(self) -> bool:
         """Return True when the under-bed light is on."""
-        return bool(self.mask & LeggettOkinCommands.TOGGLE_LIGHTS)
+        return bool(self.mask & STATUS_LIGHT)
 
     def __repr__(self) -> str:
         """Return the raw mask in hex, so unnamed bits survive into logs."""

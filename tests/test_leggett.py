@@ -370,6 +370,11 @@ class TestLeggettOkinController:
         assert not hasattr(controller, "massage_timer_step")
 
 
+# Written out rather than taken from the source constant, so a change to the
+# parser's idea of the light bit fails here instead of agreeing with itself.
+_LIGHT_BIT = 0x20000
+
+
 def _okin_state_frame(mask: int) -> bytes:
     """Build a state frame in the 20-byte layout captured from a CU170 box."""
     body = mask.to_bytes(4, "big")
@@ -392,8 +397,8 @@ class TestLeggettOkinStateFeedback:
     """Test Leggett & Platt Okin under-bed light state reading."""
 
     def test_state_frame_carries_the_light_bit(self):
-        """Bytes 2-5 big-endian are the state mask, and the light bit mirrors its keycode."""
-        on = LeggettOkinStatus.from_frame(_okin_state_frame(LeggettOkinCommands.TOGGLE_LIGHTS))
+        """Bytes 2-5 big-endian are the state mask; 0x20000 is the light, per capture."""
+        on = LeggettOkinStatus.from_frame(_okin_state_frame(_LIGHT_BIT))
         off = LeggettOkinStatus.from_frame(_okin_state_frame(0))
 
         assert on is not None
@@ -402,8 +407,12 @@ class TestLeggettOkinStateFeedback:
         assert off is not None
         assert off.light is False
 
-    def test_unknown_bits_are_kept_and_do_not_affect_the_light(self):
-        """Bits we do not name yet must survive into the mask for diagnostics."""
+    def test_bits_this_code_does_not_identify_are_kept_and_ignored(self):
+        """Unidentified bits must survive into the mask for diagnostics.
+
+        0x8000 is the app's sleep-timer indicator, and as a keycode it is the
+        memory-4 recall - which is why mask bits are not read as keycodes.
+        """
         status = LeggettOkinStatus.from_frame(_okin_state_frame(0x8000))
 
         assert status is not None
@@ -422,7 +431,7 @@ class TestLeggettOkinStateFeedback:
         controller = LeggettOkinController(coordinator)
 
         controller._handle_status_notification(
-            None, bytearray(_okin_state_frame(LeggettOkinCommands.TOGGLE_LIGHTS))
+            None, bytearray(_okin_state_frame(_LIGHT_BIT))
         )
 
         coordinator.handle_controller_state_updates.assert_called_once_with(
@@ -433,7 +442,7 @@ class TestLeggettOkinStateFeedback:
         # An unchanged light bit must not republish; a change must.
         coordinator.handle_controller_state_updates.reset_mock()
         controller._handle_status_notification(
-            None, bytearray(_okin_state_frame(LeggettOkinCommands.TOGGLE_LIGHTS | 0x8000))
+            None, bytearray(_okin_state_frame(_LIGHT_BIT | 0x8000))
         )
         coordinator.handle_controller_state_updates.assert_not_called()
 
@@ -447,7 +456,7 @@ class TestLeggettOkinStateFeedback:
         coordinator = MagicMock()
         controller = LeggettOkinController(coordinator)
         controller._handle_status_notification(
-            None, bytearray(_okin_state_frame(LeggettOkinCommands.TOGGLE_LIGHTS))
+            None, bytearray(_okin_state_frame(_LIGHT_BIT))
         )
         coordinator.handle_controller_state_updates.reset_mock()
 
@@ -492,7 +501,7 @@ class TestLeggettOkinStateFeedback:
 
     async def test_read_light_state_hydrates_from_the_state_characteristic(self):
         """The initial read resolves the light state before any notification arrives."""
-        frame = _okin_state_frame(LeggettOkinCommands.TOGGLE_LIGHTS)
+        frame = _okin_state_frame(_LIGHT_BIT)
         coordinator = _okin_connected_coordinator(frame)
         controller = LeggettOkinController(coordinator)
 
@@ -514,7 +523,7 @@ class TestLeggettOkinStateFeedback:
         controller = LeggettOkinController(MagicMock())
         controller.write_command = AsyncMock()
         controller._handle_status_notification(
-            None, bytearray(_okin_state_frame(LeggettOkinCommands.TOGGLE_LIGHTS))
+            None, bytearray(_okin_state_frame(_LIGHT_BIT))
         )
 
         await controller.lights_on()
