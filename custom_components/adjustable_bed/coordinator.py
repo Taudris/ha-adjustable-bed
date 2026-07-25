@@ -42,6 +42,11 @@ from .adapter import (
 )
 from .address_lock import async_get_connect_lock
 from .ble_auth import is_ble_authentication_error
+from .ble_availability import (
+    AdvertisementTelemetry,
+    BleAvailabilityTracker,
+    async_advertisement_telemetry,
+)
 from .const import (
     ADAPTER_AUTO,
     BED_MOTOR_PULSE_DEFAULTS,
@@ -387,6 +392,10 @@ class AdjustableBedCoordinator:
         self._last_command_end: datetime | None = None
         self._active_operation_name: str | None = None
         self._last_notify_received: datetime | None = None
+
+        # What HA's Bluetooth stack sees of this bed, so connection failures can
+        # be correlated with whether it was still advertising at the time.
+        self._availability = BleAvailabilityTracker(hass, self._address)
 
         # Adapter selection details for diagnostics (issue #168)
         self._actual_adapter: str | None = None
@@ -1260,6 +1269,25 @@ class AdjustableBedCoordinator:
         }
 
     @property
+    def availability(self) -> BleAvailabilityTracker:
+        """Return the BLE availability tracker for this bed."""
+        return self._availability
+
+    @property
+    def availability_diagnostics(self) -> dict[str, Any]:
+        """Return BLE visibility state for diagnostics."""
+        return self._availability.diagnostics
+
+    @callback
+    def async_start_availability_tracking(self) -> Callable[[], None]:
+        """Start BLE availability telemetry and return the stop callback."""
+        return self._availability.async_start()
+
+    def _advertisement_telemetry(self) -> AdvertisementTelemetry:
+        """Return what the Bluetooth stack currently knows about this bed."""
+        return async_advertisement_telemetry(self.hass, self._address)
+
+    @property
     def adapter_details(self) -> dict[str, Any]:
         """Return adapter selection details for diagnostics."""
         return {
@@ -1740,13 +1768,20 @@ class AdjustableBedCoordinator:
                 )
                 await asyncio.sleep(pre_retry_delay)
 
+            # Record what the Bluetooth stack saw before the attempt, so a later
+            # failure can be read against the bed's visibility at the time.
+            start_telemetry = self._advertisement_telemetry()
+            attempt_details["advertisement_at_start"] = start_telemetry.as_dict()
+
             try:
                 _LOGGER.debug(
-                    "Connection attempt %d/%d: Looking up device %s via HA Bluetooth (preferred adapter: %s)",
+                    "Connection attempt %d/%d: Looking up device %s via HA Bluetooth "
+                    "(preferred adapter: %s, %s)",
                     attempt_number,
                     attempt_limit,
                     self._address,
                     self._preferred_adapter,
+                    start_telemetry.as_log_fragment(),
                 )
 
                 # Log available Bluetooth adapters/scanners
@@ -1792,13 +1827,16 @@ class AdjustableBedCoordinator:
                     attempt_details["lookup_elapsed_seconds"] = round(lookup_elapsed, 3)
                     attempt_details["total_elapsed_seconds"] = round(lookup_elapsed, 3)
                     attempt_details["result"] = "device_not_found"
+                    failure_telemetry = self._advertisement_telemetry()
+                    attempt_details["advertisement_at_failure"] = failure_telemetry.as_dict()
                     _LOGGER.warning(
-                        "Device %s NOT FOUND in Bluetooth scanner after %.1fs (attempt %d/%d). "
+                        "Device %s NOT FOUND in Bluetooth scanner after %.1fs (attempt %d/%d; %s). "
                         "Bed may be powered off, out of range, or connected to another device.",
                         self._address,
                         lookup_elapsed,
                         attempt_number,
                         attempt_limit,
+                        failure_telemetry.as_log_fragment(),
                     )
                     # Log what devices ARE visible
                     try:
@@ -2627,6 +2665,8 @@ class AdjustableBedCoordinator:
                 attempt_details["result"] = "failed"
                 attempt_details["error"] = str(err)
                 attempt_details["error_type"] = type(err).__name__
+                failure_telemetry = self._advertisement_telemetry()
+                attempt_details["advertisement_at_failure"] = failure_telemetry.as_dict()
                 err_str = str(err).lower()
                 # Categorize the error for clearer diagnostics
                 if isinstance(err, TimeoutError) or "timeout" in err_str:
@@ -2656,13 +2696,14 @@ class AdjustableBedCoordinator:
                 self._last_connection_error_type = type(err).__name__
 
                 _LOGGER.warning(
-                    "✗ %s to %s after %.1fs (attempt %d/%d): %s",
+                    "✗ %s to %s after %.1fs (attempt %d/%d): %s [%s]",
                     error_category,
                     self._address,
                     attempt_elapsed,
                     attempt_number,
                     attempt_limit,
                     err,
+                    failure_telemetry.as_log_fragment(),
                 )
                 _LOGGER.debug(
                     "Connection error details - type: %s, args: %s",
@@ -2684,13 +2725,16 @@ class AdjustableBedCoordinator:
                 attempt_details["error"] = str(err)
                 attempt_details["error_type"] = type(err).__name__
                 attempt_details["error_category"] = "UNEXPECTED ERROR"
+                failure_telemetry = self._advertisement_telemetry()
+                attempt_details["advertisement_at_failure"] = failure_telemetry.as_dict()
 
                 _LOGGER.warning(
-                    "Unexpected error connecting to %s (attempt %d/%d): %s",
+                    "Unexpected error connecting to %s (attempt %d/%d): %s [%s]",
                     self._address,
                     attempt_number,
                     attempt_limit,
                     err,
+                    failure_telemetry.as_log_fragment(),
                 )
                 _LOGGER.debug(
                     "Exception details - type: %s, args: %s",
@@ -2712,7 +2756,7 @@ class AdjustableBedCoordinator:
         self._last_disconnect_reason = "connect_failed"
         self._notify_connection_state_change(False)
         _LOGGER.error(
-            "✗ FAILED to connect to %s after %d attempts (%.1fs total). "
+            "✗ FAILED to connect to %s after %d attempts (%.1fs total; %s). "
             "Troubleshooting:\n"
             "  1. Power cycle bed (unplug 30 seconds)\n"
             "  2. Close any phone apps connected to bed\n"
@@ -2722,6 +2766,7 @@ class AdjustableBedCoordinator:
             self._address,
             self._max_retries,
             total_elapsed,
+            self._advertisement_telemetry().as_log_fragment(),
         )
         return False
 
