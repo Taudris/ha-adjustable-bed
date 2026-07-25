@@ -127,6 +127,15 @@ async def async_get_config_entry_diagnostics(
         if protocol_state:
             controller_info["protocol_state"] = protocol_state
 
+        # Raw state feedback, so users of other beds sharing the characteristic
+        # can contribute captures that identify further state bits.
+        last_feedback_frame = getattr(controller, "last_feedback_frame", None)
+        if last_feedback_frame is not None:
+            controller_info["last_feedback_frame"] = last_feedback_frame
+        feedback_state_mask = getattr(controller, "feedback_state_mask", None)
+        if feedback_state_mask is not None:
+            controller_info["feedback_state_mask"] = f"0x{feedback_state_mask:08x}"
+
     # Get position data
     position_data = dict(coordinator.position_data)
 
