@@ -19,6 +19,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.adjustable_bed.adapter import AdapterSelectionResult
 from custom_components.adjustable_bed.ble_availability import (
     ADVERTISEMENT_UPDATE_INTERVAL,
+    POST_DISCONNECT_ADVERTISEMENT_GRACE,
     BleAvailabilityTracker,
     async_advertisement_telemetry,
 )
@@ -319,6 +320,113 @@ class TestBleAvailabilityTracker:
         track_unavailable.call_args.args[1](_service_info())
 
         assert updates == [None]
+
+    def test_unavailable_while_connected_is_suppressed(self, caplog):
+        """Advertisement absence during our own connection is expected, not a problem."""
+        tracker, track_unavailable, _, _, _ = self._start()
+        updates: list[None] = []
+        tracker.async_add_listener(lambda: updates.append(None))
+        on_unavailable = track_unavailable.call_args.args[1]
+
+        tracker.async_set_connected(True)
+        on_unavailable(_service_info())
+
+        assert tracker.unavailable is False
+        assert tracker.diagnostics["unavailable_transitions"] == 0
+        assert "no longer sees advertisements" not in caplog.text
+        assert updates == []
+
+    def test_disconnect_with_stale_adverts_waits_for_grace(self, caplog):
+        """After disconnect the bed gets the full grace window to resume advertising."""
+        tracker, track_unavailable, _, _, _ = self._start()
+        on_unavailable = track_unavailable.call_args.args[1]
+
+        tracker.async_set_connected(True)
+        on_unavailable(_service_info())
+        with patch(
+            "custom_components.adjustable_bed.ble_availability.async_call_later"
+        ) as call_later:
+            tracker.async_set_connected(False)
+
+        assert call_later.call_count == 1
+        assert call_later.call_args.args[1] == POST_DISCONNECT_ADVERTISEMENT_GRACE
+        assert tracker.unavailable is False
+        assert "no longer sees advertisements" not in caplog.text
+
+    def test_grace_expiry_without_adverts_warns_once(self, caplog):
+        """A bed still silent after the grace window is declared unavailable once."""
+        tracker, track_unavailable, _, _, _ = self._start()
+        on_unavailable = track_unavailable.call_args.args[1]
+
+        tracker.async_set_connected(True)
+        on_unavailable(_service_info())
+        with patch(
+            "custom_components.adjustable_bed.ble_availability.async_call_later"
+        ) as call_later:
+            tracker.async_set_connected(False)
+        grace_expired = call_later.call_args.args[2]
+
+        grace_expired(None)
+
+        assert tracker.unavailable is True
+        assert caplog.text.count("no longer sees advertisements") == 1
+
+        # A repeated stack callback after the judgement is not a new transition.
+        on_unavailable(_service_info())
+        assert tracker.diagnostics["unavailable_transitions"] == 1
+        assert caplog.text.count("no longer sees advertisements") == 1
+
+    def test_advertisement_during_grace_cancels_judgement(self, caplog):
+        """A bed that resumes advertising within the grace window stays available."""
+        tracker, track_unavailable, register_callback, _, _ = self._start()
+        on_unavailable = track_unavailable.call_args.args[1]
+        on_advertisement = register_callback.call_args.args[1]
+
+        tracker.async_set_connected(True)
+        on_unavailable(_service_info())
+        with patch(
+            "custom_components.adjustable_bed.ble_availability.async_call_later"
+        ) as call_later:
+            tracker.async_set_connected(False)
+            on_advertisement(_service_info(), None)
+
+        assert call_later.return_value.call_count == 1  # timer cancelled
+        # Even if the timer had fired anyway, adverts are fresh: no judgement.
+        call_later.call_args.args[2](None)
+        assert tracker.unavailable is False
+        assert "no longer sees advertisements" not in caplog.text
+
+    def test_unavailable_shortly_after_disconnect_defers_remaining_grace(self):
+        """A stack callback inside the grace window schedules the remainder."""
+        tracker, track_unavailable, _, _, _ = self._start()
+        on_unavailable = track_unavailable.call_args.args[1]
+
+        tracker.async_set_connected(True)
+        tracker.async_set_connected(False)
+        with patch(
+            "custom_components.adjustable_bed.ble_availability.async_call_later"
+        ) as call_later:
+            on_unavailable(_service_info())
+
+        assert tracker.unavailable is False
+        assert call_later.call_count == 1
+        assert 0 < call_later.call_args.args[1] <= POST_DISCONNECT_ADVERTISEMENT_GRACE
+
+    def test_connecting_clears_declared_unavailable(self):
+        """Holding the connection is proof of availability."""
+        tracker, track_unavailable, _, _, _ = self._start()
+        updates: list[None] = []
+        tracker.async_add_listener(lambda: updates.append(None))
+        on_unavailable = track_unavailable.call_args.args[1]
+
+        on_unavailable(_service_info())  # never connected: declared immediately
+        assert tracker.unavailable is True
+
+        tracker.async_set_connected(True)
+
+        assert tracker.unavailable is False
+        assert tracker.diagnostics["last_available_at"] is not None
+        assert len(updates) == 2
 
     def test_diagnostics_report_untracked_state(self):
         """Diagnostics stay readable when tracking never started."""

@@ -9,6 +9,11 @@ central held it looks exactly like a bed that is simply out of range.
 This module records that context and makes it available to connection logging,
 diagnostic entities, and the diagnostics download. It is observation only:
 nothing here gates, delays, or otherwise changes connection behaviour.
+
+Availability is judged from plural signals: the bed is available while this
+integration holds its connection OR while advertisements are recent. A
+single-central bed stops advertising entirely while connected, so advertisement
+absence during our own connection is expected, not an availability problem.
 """
 
 from __future__ import annotations
@@ -28,6 +33,7 @@ from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
 )
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.event import async_call_later
 
 from .adapter import find_service_info_by_address
 
@@ -37,6 +43,14 @@ _LOGGER = logging.getLogger(__name__)
 # this interval so the recorder does not fill with BLE noise; availability
 # transitions bypass the throttle because those are the interesting events.
 ADVERTISEMENT_UPDATE_INTERVAL = 30.0
+
+# After we release our own connection the bed needs time to resume advertising
+# and a scanner needs to hear it, so advertisement absence within this window is
+# attributed to the just-finished connection rather than to the bed. Twice the
+# module's advertisement-staleness interval comfortably covers a slow ESPHome
+# proxy scan cycle while still reporting a genuinely powered-off bed within a
+# minute of disconnecting.
+POST_DISCONNECT_ADVERTISEMENT_GRACE = ADVERTISEMENT_UPDATE_INTERVAL * 2
 
 
 @dataclass(frozen=True)
@@ -141,6 +155,10 @@ class BleAvailabilityTracker:
         self._cancel_callbacks: list[Callable[[], None]] = []
         self._listeners: set[Callable[[], None]] = set()
         self._unavailable = False
+        self._connected = False
+        self._stack_unavailable = False
+        self._last_disconnect_monotonic: float | None = None
+        self._cancel_grace: Callable[[], None] | None = None
         self._last_advertisement: datetime | None = None
         self._last_rssi: int | None = None
         self._last_source: str | None = None
@@ -156,7 +174,12 @@ class BleAvailabilityTracker:
 
     @property
     def unavailable(self) -> bool:
-        """Return True when Home Assistant has declared the bed gone."""
+        """Return True when the bed is judged genuinely unavailable.
+
+        Judged, not raw: we do not hold its connection AND advertisements
+        stayed absent past the post-disconnect grace. Never True while this
+        integration is connected to the bed.
+        """
         return self._unavailable
 
     @property
@@ -212,8 +235,43 @@ class BleAvailabilityTracker:
     @callback
     def async_stop(self) -> None:
         """Unsubscribe from Bluetooth events. Safe to call more than once."""
+        self._async_cancel_grace()
         while self._cancel_callbacks:
             self._cancel_callbacks.pop()()
+
+    @callback
+    def async_set_connected(self, connected: bool) -> None:
+        """Record whether this integration itself holds the bed's connection.
+
+        The bed stops advertising while connected, so the tracker must know
+        when advertisement absence is our own doing: while connected it is
+        expected, and after we disconnect the bed gets
+        POST_DISCONNECT_ADVERTISEMENT_GRACE to resume advertising before
+        absence counts against it.
+        """
+        if connected == self._connected:
+            return
+        self._connected = connected
+
+        if connected:
+            self._async_cancel_grace()
+            if self._unavailable:
+                # We hold the connection, so the bed is definitively reachable.
+                self._unavailable = False
+                self._last_available_at = datetime.now(UTC)
+                _LOGGER.info(
+                    "Bed %s is connected; clearing its unavailable state",
+                    self._address,
+                )
+                self._async_notify_listeners()
+            return
+
+        self._last_disconnect_monotonic = time.monotonic()
+        if self._stack_unavailable:
+            # The stack stopped seeing advertisements while we held the
+            # connection (expected, and suppressed at the time). Re-judge once
+            # the bed has had time to resume advertising.
+            self._async_schedule_grace_check(POST_DISCONNECT_ADVERTISEMENT_GRACE)
 
     @callback
     def async_add_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
@@ -236,6 +294,8 @@ class BleAvailabilityTracker:
         return {
             "tracking": self.tracking,
             "unavailable": self._unavailable,
+            "connected": self._connected,
+            "stack_unavailable": self._stack_unavailable,
             "unavailable_transitions": self._unavailable_transitions,
             "last_advertisement": (
                 self._last_advertisement.isoformat() if self._last_advertisement else None
@@ -273,6 +333,8 @@ class BleAvailabilityTracker:
     ) -> None:
         """Record an advertisement and, on the first one after a gap, log recovery."""
         del change  # BluetoothChange only has ADVERTISEMENT
+        self._stack_unavailable = False
+        self._async_cancel_grace()
         self._last_advertisement = datetime.now(UTC)
         rssi = getattr(service_info, "rssi", None)
         self._last_rssi = rssi if isinstance(rssi, int) else None
@@ -295,8 +357,63 @@ class BleAvailabilityTracker:
 
     @callback
     def _async_handle_unavailable(self, service_info: BluetoothServiceInfoBleak) -> None:
-        """Log that Home Assistant no longer sees the bed advertising."""
+        """Judge advertisement absence against our own connection state."""
         del service_info  # The last-known advertisement is already recorded
+        self._stack_unavailable = True
+        if self._unavailable:
+            return
+
+        if self._connected:
+            # Expected: the bed cannot advertise while we hold its connection.
+            _LOGGER.debug(
+                "Bed %s stopped advertising while this integration holds its "
+                "connection; expected, not an availability problem",
+                self._address,
+            )
+            return
+
+        remaining_grace = self._grace_remaining()
+        if remaining_grace is not None:
+            # We disconnected moments ago; give the bed the rest of the grace
+            # window to resume advertising before judging it gone.
+            self._async_schedule_grace_check(remaining_grace)
+            return
+
+        self._async_declare_unavailable()
+
+    def _grace_remaining(self) -> float | None:
+        """Return seconds left in the post-disconnect grace window, if any."""
+        if self._last_disconnect_monotonic is None:
+            return None
+        elapsed = time.monotonic() - self._last_disconnect_monotonic
+        remaining = POST_DISCONNECT_ADVERTISEMENT_GRACE - elapsed
+        return remaining if remaining > 0 else None
+
+    @callback
+    def _async_schedule_grace_check(self, delay: float) -> None:
+        """Arrange a re-judgement after the post-disconnect grace elapses."""
+        if self._cancel_grace is not None:
+            return
+        self._cancel_grace = async_call_later(self.hass, delay, self._async_grace_expired)
+
+    @callback
+    def _async_cancel_grace(self) -> None:
+        """Cancel any pending post-disconnect grace check."""
+        if self._cancel_grace is not None:
+            self._cancel_grace()
+            self._cancel_grace = None
+
+    @callback
+    def _async_grace_expired(self, _fired_at: datetime) -> None:
+        """Declare the bed unavailable if it never resumed advertising."""
+        self._cancel_grace = None
+        if self._connected or not self._stack_unavailable:
+            return
+        self._async_declare_unavailable()
+
+    @callback
+    def _async_declare_unavailable(self) -> None:
+        """Record and log that the bed is genuinely unavailable, once."""
         if self._unavailable:
             return
 

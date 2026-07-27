@@ -396,6 +396,9 @@ class AdjustableBedCoordinator:
         # What HA's Bluetooth stack sees of this bed, so connection failures can
         # be correlated with whether it was still advertising at the time.
         self._availability = BleAvailabilityTracker(hass, self._address)
+        # The bed stops advertising while we hold its connection, so the
+        # tracker must know when advertisement absence is our own doing.
+        self.register_connection_state_callback(self._availability.async_set_connected)
 
         # Adapter selection details for diagnostics (issue #168)
         self._actual_adapter: str | None = None
