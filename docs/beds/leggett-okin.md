@@ -115,14 +115,20 @@ reported stuttering movement.
 
 ## Memory programming
 
-There is no program opcode. Storing a position is two ordinary held keycodes in
+There is no program opcode. Storing a position is two held keycodes in
 sequence:
 
-1. hold `0x00010000` for ~5 s, then release
-2. hold the slot keycode for ~2 s, then release
+1. stream `0x00010000` for ~5 s
+2. switch **directly** to the slot keycode for ~2 s - the app swaps its key
+   buffer within one 100 ms tick, so no release frames separate the stages
+3. release once: the normal four keycode-`0` frames
 
-The shipped user guide corroborates this: "Touch Save… the massage motors will
-buzz once. Within 5 seconds, touch the Favorite Position being edited."
+This is decompile-derived (`MainActivityBase.onPositionSetMessage`) and not yet
+verified on hardware. The shipped user guide describes the same two stages for
+the hand control - "Touch Save… the massage motors will buzz once. Within 5
+seconds, touch the Favorite Position being edited." - which implies the box's
+store window survives a release between the stages; the integration still
+mirrors the app's byte stream exactly.
 
 ## Notifications
 
