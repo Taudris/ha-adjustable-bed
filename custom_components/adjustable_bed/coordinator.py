@@ -2444,6 +2444,7 @@ class AdjustableBedCoordinator:
                 )
                 self._controller_state_refresh_retry_count = 0
                 self._controller_state_refresh_completed = False
+                self._invalidate_readable_light_state()
                 # Remember the resolved persistence so reconnect/idle decisions are
                 # correct even after _on_disconnect clears the controller.
                 self._persistent_connection_resolved = (
@@ -3846,6 +3847,22 @@ class AdjustableBedCoordinator:
         if controller.supports_light_timer:
             required_keys.update({"light_timer_minutes", "light_timer_option"})
         return required_keys
+
+    @callback
+    def _invalidate_readable_light_state(self) -> None:
+        """Drop readable light-state values inherited from a previous connection.
+
+        The refresh gate reads key presence in ``_controller_state`` as
+        "already hydrated". Values from a dead connection are stale — the
+        physical remote may have changed the light while we were disconnected —
+        and leaving them in place satisfies the gate, which then suppresses the
+        retry after a failed connect-time read and freezes the stale display
+        (hardware-verified via the explicit Disconnect/Connect buttons).
+        Dropping the keys fires no callbacks, so entities keep showing the last
+        known state until fresh data arrives.
+        """
+        for key in self._readable_light_state_required_keys():
+            self._controller_state.pop(key, None)
 
     @callback
     def _mark_controller_state_refresh_complete(self) -> None:

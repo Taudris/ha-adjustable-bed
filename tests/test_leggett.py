@@ -736,6 +736,56 @@ class TestLeggettOkinDiscreteLightControl:
         assert await coordinator.async_connect()
         assert coordinator.controller_state["under_bed_lights_on"] is True
 
+    async def test_explicit_disconnect_then_connect_corrects_state_changed_offline(
+        self,
+        hass: HomeAssistant,
+        mock_leggett_okin_config_entry,
+        mock_coordinator_connected,
+        mock_bleak_client,
+    ):
+        """The Connect button must hydrate even when the connect-time read fails.
+
+        Hardware sequence: Disconnect button, physical remote toggles the
+        light, Connect button. The connect-time read can fail while the link
+        is not yet re-encrypted (unbonded reads get ATT error 5); the retry
+        must not be suppressed by the stale value the previous connection left
+        in controller_state, or the switch freezes on the stale state.
+        """
+        state = {"frame": _okin_state_frame(_LIGHT_BIT), "failures": 0}
+
+        async def _read_gatt_char(target) -> bytes:
+            if str(target) != LEGGETT_OKIN_NOTIFY_CHAR_UUID:
+                return b""
+            if state["failures"] > 0:
+                state["failures"] -= 1
+                raise BleakError("ATT error: 0x05 (Insufficient Authentication)")
+            return state["frame"]
+
+        mock_bleak_client.read_gatt_char = AsyncMock(side_effect=_read_gatt_char)
+
+        coordinator = AdjustableBedCoordinator(hass, mock_leggett_okin_config_entry)
+        # The switch keeps its controller-state subscription across reconnects;
+        # the refresh-retry gate requires a subscriber.
+        coordinator.register_controller_state_callback(lambda _state: None)
+        assert await coordinator.async_connect()
+        assert coordinator.controller_state["under_bed_lights_on"] is True
+
+        # Disconnect button, then the remote turns the light off while offline.
+        await coordinator.async_disconnect(serialize_with_commands=True)
+        state["frame"] = _okin_state_frame(0)
+        state["failures"] = 1
+
+        with patch(
+            "custom_components.adjustable_bed.coordinator._READABLE_LIGHT_STATE_RETRY_DELAY",
+            0,
+        ):
+            # The Connect button calls async_ensure_connected.
+            assert await coordinator.async_ensure_connected()
+            await hass.async_block_till_done()
+            await hass.async_block_till_done()
+
+        assert coordinator.controller_state["under_bed_lights_on"] is False
+
 
 class TestLeggettGen2CommandFormat:
     """Verify Gen2 motor command bytes match the LP Control app (issue #385)."""
