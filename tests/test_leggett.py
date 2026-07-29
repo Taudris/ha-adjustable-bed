@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from bleak.exc import BleakError
-from homeassistant.const import CONF_ADDRESS, CONF_NAME, STATE_OFF, STATE_ON
+from homeassistant.const import CONF_ADDRESS, CONF_NAME, STATE_OFF, STATE_ON, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -645,14 +645,18 @@ class TestLeggettOkinDiscreteLightControl:
 
         assert coordinator._readable_light_state_required_keys() == {"under_bed_lights_on"}
 
-    async def test_the_switch_follows_the_bed_over_its_own_optimism(
+    async def test_the_switch_state_comes_only_from_the_bed(
         self,
         hass: HomeAssistant,
         mock_leggett_okin_config_entry,
         mock_coordinator_connected,
         enable_custom_integrations,
     ):
-        """Discrete control lets the switch write state optimistically; frames outrank it."""
+        """Command success never flips the switch; only reported state drives it.
+
+        The box ACKs writes it silently ignores on an unbonded link, so an
+        optimistic flip could display a state the device never entered.
+        """
         await hass.config_entries.async_setup(mock_leggett_okin_config_entry.entry_id)
         await hass.async_block_till_done()
 
@@ -661,19 +665,76 @@ class TestLeggettOkinDiscreteLightControl:
             "switch", DOMAIN, f"{OKIN_TEST_ADDRESS}_under_bed_lights"
         )
         assert entity_id is not None
+        # The connect-time read returned nothing, so no state has been claimed yet.
+        assert hass.states.get(entity_id).state == STATE_UNKNOWN
 
-        await hass.services.async_call(
-            "switch", "turn_on", {"entity_id": entity_id}, blocking=True
+        await hass.services.async_call("switch", "turn_on", {"entity_id": entity_id}, blocking=True)
+        await hass.async_block_till_done()
+        assert hass.states.get(entity_id).state == STATE_UNKNOWN
+
+        # Only the bed's own report drives the state - in either direction.
+        coordinator.controller._handle_status_notification(
+            None, bytearray(_okin_state_frame(_LIGHT_BIT))
         )
         await hass.async_block_till_done()
         assert hass.states.get(entity_id).state == STATE_ON
 
-        # The bed reports the light off - e.g. someone used the wired remote.
-        coordinator.controller._handle_status_notification(
-            None, bytearray(_okin_state_frame(0))
-        )
+        coordinator.controller._handle_status_notification(None, bytearray(_okin_state_frame(0)))
         await hass.async_block_till_done()
         assert hass.states.get(entity_id).state == STATE_OFF
+
+    async def test_setup_hydrates_the_switch_from_the_connect_time_read(
+        self,
+        hass: HomeAssistant,
+        mock_leggett_okin_config_entry,
+        mock_coordinator_connected,
+        mock_bleak_client,
+        enable_custom_integrations,
+    ):
+        """The forced read at connect resolves the state before any user action."""
+        frame = _okin_state_frame(_LIGHT_BIT)
+
+        async def _read_gatt_char(target) -> bytes:
+            if str(target) == LEGGETT_OKIN_NOTIFY_CHAR_UUID:
+                return frame
+            return b""
+
+        mock_bleak_client.read_gatt_char = AsyncMock(side_effect=_read_gatt_char)
+
+        await hass.config_entries.async_setup(mock_leggett_okin_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+        entity_id = er.async_get(hass).async_get_entity_id(
+            "switch", DOMAIN, f"{OKIN_TEST_ADDRESS}_under_bed_lights"
+        )
+        assert entity_id is not None
+        assert hass.states.get(entity_id).state == STATE_ON
+
+    async def test_reconnect_rereads_the_light_state(
+        self,
+        hass: HomeAssistant,
+        mock_leggett_okin_config_entry,
+        mock_coordinator_connected,
+        mock_bleak_client,
+    ):
+        """Every (re)connect repeats the forced read, correcting state missed offline."""
+        coordinator = AdjustableBedCoordinator(hass, mock_leggett_okin_config_entry)
+        assert await coordinator.async_connect()
+        assert "under_bed_lights_on" not in coordinator.controller_state
+
+        await coordinator.async_disconnect()
+
+        frame = _okin_state_frame(_LIGHT_BIT)
+
+        async def _read_gatt_char(target) -> bytes:
+            if str(target) == LEGGETT_OKIN_NOTIFY_CHAR_UUID:
+                return frame
+            return b""
+
+        mock_bleak_client.read_gatt_char = AsyncMock(side_effect=_read_gatt_char)
+
+        assert await coordinator.async_connect()
+        assert coordinator.controller_state["under_bed_lights_on"] is True
 
 
 class TestLeggettGen2CommandFormat:
