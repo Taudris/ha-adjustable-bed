@@ -571,16 +571,46 @@ class TestLeggettOkinStateFeedback:
             bytes.fromhex("040200020000"),
         )
 
-    async def test_unknown_state_falls_back_to_a_blind_toggle(self):
-        """Without a frame the bed behaves as it did before state reading existed."""
-        controller = LeggettOkinController(MagicMock())
+    async def test_an_empty_cache_is_resolved_by_a_read_before_deciding(self):
+        """With no frame yet, lights_on reads the state instead of blind-toggling."""
+        coordinator = _okin_connected_coordinator(_okin_state_frame(_LIGHT_BIT))
+        controller = LeggettOkinController(coordinator)
         controller.write_command = AsyncMock()
 
         await controller.lights_on()
+
+        coordinator.client.read_gatt_char.assert_awaited_once_with(LEGGETT_OKIN_NOTIFY_CHAR_UUID)
+        controller.write_command.assert_not_called()
+
+        # The read hydrated the cache, so the next decision does not read again.
+        coordinator.client.read_gatt_char.reset_mock()
+        await controller.lights_off()
+        coordinator.client.read_gatt_char.assert_not_called()
+        press, release = controller.write_command.await_args_list
+        assert press.args == (bytes.fromhex("040200020000"),)
+        assert release.args == (bytes.fromhex("040200000000"),)
+
+    async def test_a_failed_read_falls_back_to_a_blind_toggle(self):
+        """A box whose state characteristic refuses the read still gets the toggle."""
+        coordinator = _okin_connected_coordinator()
+        coordinator.client.read_gatt_char = AsyncMock(side_effect=BleakError("no such char"))
+        controller = LeggettOkinController(coordinator)
+        controller.write_command = AsyncMock()
+
+        await controller.lights_on()
+
+        sent = [call.args[0] for call in controller.write_command.await_args_list]
+        assert sent.count(bytes.fromhex("040200020000")) == 1
+
+    async def test_an_unusable_read_falls_back_to_a_blind_toggle(self):
+        """An empty read leaves the state unknown, so the toggle is still sent."""
+        controller = LeggettOkinController(_okin_connected_coordinator())
+        controller.write_command = AsyncMock()
+
         await controller.lights_off()
 
         sent = [call.args[0] for call in controller.write_command.await_args_list]
-        assert sent.count(bytes.fromhex("040200020000")) == 2
+        assert sent.count(bytes.fromhex("040200020000")) == 1
 
 
 class TestLeggettOkinDiscreteLightControl:
@@ -592,6 +622,12 @@ class TestLeggettOkinDiscreteLightControl:
 
         assert controller.supports_discrete_light_control is True
         assert controller.supports_under_bed_lights is True
+
+    def test_light_state_is_declared_feedback_driven(self):
+        """State feedback is what makes the switch pessimistic instead of optimistic."""
+        controller = LeggettOkinController(MagicMock())
+
+        assert controller.supports_light_state_feedback is True
 
     async def test_light_state_joins_the_coordinator_hydration_keys(
         self,

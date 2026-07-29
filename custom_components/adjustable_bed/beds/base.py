@@ -962,6 +962,19 @@ class BedController(ABC):
         return self.supports_discrete_light_control
 
     @property
+    def supports_light_state_feedback(self) -> bool:
+        """Return True if the device itself reports under-bed light state.
+
+        Feedback-driven controllers publish ``under_bed_lights_on`` controller
+        state updates from device notifications or reads. Their entities must
+        not assume a state after a command succeeds: the device reports the
+        outcome, and an optimistic flip can display a state the device never
+        entered (e.g. a write that was ACKed but ignored) with nothing left
+        to correct it.
+        """
+        return False
+
+    @property
     def supports_light_color_control(self) -> bool:
         """Return True if bed supports setting light RGB color directly."""
         return False

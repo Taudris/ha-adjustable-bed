@@ -235,6 +235,16 @@ class LeggettOkinController(BedController):
         return True
 
     @property
+    def supports_light_state_feedback(self) -> bool:
+        """Return True - the state characteristic reports every light change.
+
+        This is what keeps the switch entity pessimistic: the box ACKs writes
+        it silently ignores on an unbonded link, so command success proves
+        nothing and only reported state may drive the displayed state.
+        """
+        return True
+
+    @property
     def supports_memory_presets(self) -> bool:
         """Return True - Okin beds support memory presets 1-4."""
         return True
@@ -560,7 +570,7 @@ class LeggettOkinController(BedController):
         except BleakError as err:
             # State is a convenience here, not a prerequisite for control: a box
             # without this characteristic must still drive its motors, and the
-            # light falls back to a blind toggle.
+            # light falls back to a read before each command, then a blind toggle.
             _LOGGER.debug(
                 "Could not subscribe to Okin state notifications for %s: %s",
                 self._coordinator.address,
@@ -629,22 +639,37 @@ class LeggettOkinController(BedController):
         """Toggle lights."""
         await self._tap_keycode(LeggettOkinCommands.TOGGLE_LIGHTS, "lights_toggle")
 
-    async def lights_on(self) -> None:
-        """Turn on lights, skipping the toggle when the bed already reports them on.
+    async def _resolve_light_state(self) -> bool | None:
+        """Return the reported light state, reading it when the cache is empty.
 
-        The cache is not updated optimistically here: the box reports every state
-        change itself, whereas a toggle that never reached the light would leave
-        an optimistic cache inverted with no later frame to correct it. Until the
-        first frame arrives the state is unknown and this falls back to a blind
-        toggle, which is what this bed did before it reported state.
+        The cache is not updated optimistically anywhere: the box reports every
+        state change itself, whereas a toggle that never reached the light would
+        leave an optimistic cache inverted with no later frame to correct it.
+        Right after connect no frame has arrived yet, and a blind toggle sent
+        then can physically invert the light - so an empty cache is resolved
+        with a read first. A box without the state characteristic fails the
+        read and keeps the pre-state-feedback blind toggle as its only option.
         """
-        if self._status is not None and self._status.light:
+        if self._status is None:
+            try:
+                await self.read_light_state()
+            except (BleakError, ConnectionError, TimeoutError) as err:
+                _LOGGER.debug(
+                    "Could not read Okin light state before deciding for %s: %s",
+                    self._coordinator.address,
+                    err,
+                )
+        return None if self._status is None else self._status.light
+
+    async def lights_on(self) -> None:
+        """Turn on lights, skipping the toggle when the bed already reports them on."""
+        if await self._resolve_light_state() is True:
             return
         await self.lights_toggle()
 
     async def lights_off(self) -> None:
         """Turn off lights, skipping the toggle when the bed already reports them off."""
-        if self._status is not None and not self._status.light:
+        if await self._resolve_light_state() is False:
             return
         await self.lights_toggle()
 
