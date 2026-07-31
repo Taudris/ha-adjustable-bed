@@ -418,7 +418,38 @@ class BleAvailabilityTracker:
                 self._last_available_at.isoformat() if self._last_available_at else None
             ),
             "current": self.telemetry.as_dict(),
+            "decision": self._decision_diagnostics(),
         }
+
+    def _decision_diagnostics(self) -> dict[str, Any]:
+        """Return the inputs and outcome of the availability judgement.
+
+        Durations only, rounded: a raw monotonic timestamp means nothing
+        outside this process. Never raises - a diagnostics download must not
+        fail because the coordinator's connection state could not be read.
+        """
+        try:
+            connected = self._connected_now()
+            grace_remaining = self._grace_remaining()
+            return {
+                "connected_now": connected,
+                "stack_unavailable": self._stack_unavailable,
+                "seconds_since_disconnect": self._seconds_since_disconnect(),
+                "grace_remaining_seconds": (
+                    None if grace_remaining is None else round(grace_remaining, 1)
+                ),
+                "grace_threshold_seconds": POST_DISCONNECT_ADVERTISEMENT_GRACE,
+                "grace_check_pending": self._cancel_grace is not None,
+                "verdict": judge_availability(
+                    connected=connected,
+                    stack_unavailable=self._stack_unavailable,
+                    grace_remaining=grace_remaining,
+                ).value,
+                "reported_unavailable": self._unavailable,
+            }
+        except Exception as err:
+            _LOGGER.debug("Could not build availability decision diagnostics: %s", err)
+            return {"error": str(err)}
 
     @callback
     def _async_seed_from_scanner_history(self) -> None:
@@ -515,6 +546,12 @@ class BleAvailabilityTracker:
                 "connection; expected, not an availability problem",
                 self._address,
             )
+
+    def _seconds_since_disconnect(self) -> float | None:
+        """Return how long ago we released the bed's connection, if we have."""
+        if self._last_disconnect_monotonic is None:
+            return None
+        return round(max(0.0, self._clock() - self._last_disconnect_monotonic), 1)
 
     def _grace_remaining(self) -> float | None:
         """Return seconds left in the post-disconnect grace window, if any."""

@@ -7,6 +7,7 @@ connection attempts.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -635,6 +636,7 @@ class TestConnectionStateIsPulled:
 
         assert call_later.call_count == 0  # no grace window opened
         assert tracker.unavailable is True
+        assert tracker.diagnostics["decision"]["seconds_since_disconnect"] is None
 
     def test_connect_start_notification_does_not_defer_a_settled_verdict(self):
         """A stale "connected" would turn the connect-start False into a reprieve.
@@ -671,7 +673,101 @@ class TestConnectionStateIsPulled:
         track_unavailable.call_args.args[1](_service_info())
 
         assert tracker.unavailable is True
+        assert tracker.diagnostics["decision"]["connected_now"] is False
 
+
+class TestDecisionDiagnostics:
+    """Test the decision block added to the diagnostics download."""
+
+    def test_reports_the_grace_window_as_durations(self):
+        """Durations, never a raw monotonic timestamp, and rounded to 0.1 s."""
+        clock = _FakeClock()
+        connection = _FakeConnection()
+        tracker, track_unavailable, _, _, _ = _start(
+            is_connected=connection, clock=clock
+        )
+        on_unavailable = track_unavailable.call_args.args[1]
+
+        _connect(tracker, connection)
+        on_unavailable(_service_info())
+        with patch(_CALL_LATER):
+            _disconnect(tracker, connection)
+        clock.advance(12.25)
+
+        decision = tracker.diagnostics["decision"]
+
+        assert decision == {
+            "connected_now": False,
+            "stack_unavailable": True,
+            "seconds_since_disconnect": 12.2,
+            "grace_remaining_seconds": round(POST_DISCONNECT_ADVERTISEMENT_GRACE - 12.25, 1),
+            "grace_threshold_seconds": POST_DISCONNECT_ADVERTISEMENT_GRACE,
+            "grace_check_pending": True,
+            "verdict": AvailabilityVerdict.DEFERRED.value,
+            "reported_unavailable": False,
+        }
+
+    def test_is_json_serializable(self):
+        """Everything downstream forwards this verbatim into a JSON download."""
+        clock = _FakeClock()
+        connection = _FakeConnection()
+        tracker, track_unavailable, _, _, _ = _start(
+            is_connected=connection, clock=clock
+        )
+        _connect(tracker, connection)
+        with patch(_CALL_LATER):
+            _disconnect(tracker, connection)
+        track_unavailable.call_args.args[1](_service_info())
+
+        dumped = json.loads(json.dumps(tracker.diagnostics["decision"]))
+
+        assert dumped["verdict"] == "deferred"
+
+    def test_carries_no_redactable_field_names(self):
+        """"address", "name" and "title" are redacted case-insensitively."""
+        tracker, _, _, _, _ = _start()
+
+        keys = {key.lower() for key in tracker.diagnostics["decision"]}
+
+        assert keys.isdisjoint({"address", "name", "title"})
+
+    def test_reports_the_verdict_after_the_grace_expires(self):
+        """The block explains an unavailable bed as well as a deferred one."""
+        clock = _FakeClock()
+        connection = _FakeConnection()
+        tracker, track_unavailable, _, _, _ = _start(
+            is_connected=connection, clock=clock
+        )
+        on_unavailable = track_unavailable.call_args.args[1]
+
+        _connect(tracker, connection)
+        on_unavailable(_service_info())
+        with patch(_CALL_LATER) as call_later:
+            _disconnect(tracker, connection)
+        clock.advance(POST_DISCONNECT_ADVERTISEMENT_GRACE)
+        call_later.call_args.args[2](None)
+
+        decision = tracker.diagnostics["decision"]
+
+        assert decision["verdict"] == AvailabilityVerdict.UNAVAILABLE.value
+        assert decision["reported_unavailable"] is True
+        assert decision["grace_remaining_seconds"] is None
+        assert decision["grace_check_pending"] is False
+        assert decision["seconds_since_disconnect"] == POST_DISCONNECT_ADVERTISEMENT_GRACE
+
+    def test_survives_an_unreadable_connection_state(self):
+        """The diagnostics download must not fail on a best-effort input."""
+        tracker = BleAvailabilityTracker(
+            MagicMock(),
+            TEST_ADDRESS,
+            is_connected=MagicMock(side_effect=RuntimeError("coordinator gone")),
+        )
+
+        with patch(_LAST_SERVICE_INFO, return_value=None):
+            decision = tracker.diagnostics["decision"]
+
+        assert decision["connected_now"] is False
+        assert decision["verdict"] == AvailabilityVerdict.AVAILABLE.value
 
 
 class TestConnectionAttemptCorrelation:
