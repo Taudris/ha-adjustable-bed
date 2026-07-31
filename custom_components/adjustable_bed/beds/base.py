@@ -11,7 +11,9 @@ import asyncio
 import inspect
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
@@ -32,6 +34,40 @@ from ..diagnostic_payloads import format_payload
 _LOGGER = logging.getLogger(__name__)
 
 MotorCommandCallable = Callable[["BedController"], Coroutine[Any, Any, None]]
+
+# A caller-bounded hold: how long the caller wants the movement it is about to
+# start to last, and a statement that the caller ends that movement itself.
+#
+# Movement callables take no arguments beyond the controller (MotorCommandCallable
+# is the shape every bed module and every entity platform is written against), so
+# a per-call value cannot ride the signature. It rides the task context instead:
+# the coordinator runs each command in its own task, which copies the context at
+# creation, so a bound set around a call is visible to that call and invisible to
+# every other one.
+_CALLER_BOUNDED_HOLD_MS: ContextVar[int | None] = ContextVar(
+    "adjustable_bed_caller_bounded_hold_ms", default=None
+)
+
+
+@contextmanager
+def caller_bounded_hold(duration_ms: int) -> Iterator[None]:
+    """Declare that the movement started in this block runs for ``duration_ms``.
+
+    Controllers whose movement is a stream with no protocol-defined end need to
+    be told when a caller wants a bounded move, because their own end condition
+    is a later stop command. Reading it back out of the pulse count would make
+    the duration a hidden contract carried by a number that means something else
+    everywhere it is used.
+
+    The caller promises to end the movement with its own stop. That stop is the
+    movement's single terminator, so a controller under a bound must not send
+    one of its own - the same hand-off as a stream preempted by a successor.
+    """
+    token = _CALLER_BOUNDED_HOLD_MS.set(duration_ms)
+    try:
+        yield
+    finally:
+        _CALLER_BOUNDED_HOLD_MS.reset(token)
 
 
 @dataclass(frozen=True, slots=True)
@@ -614,6 +650,19 @@ class BedController(ABC):
             self._coordinator.motor_pulse_count,
             self._coordinator.motor_pulse_delay_ms,
         )
+
+    @property
+    def caller_bounded_hold_ms(self) -> int | None:
+        """Return the hold duration the current caller asked for, if any.
+
+        None means an ordinary movement, which ends when a stop arrives or when
+        the controller's own limit runs out. A duration means the caller bounded
+        this movement and will send the stop that ends it (see
+        ``caller_bounded_hold``). Only controllers whose movement has no
+        protocol-defined end need to read this; count-bounded controllers get
+        their bound from the pulse count as before.
+        """
+        return _CALLER_BOUNDED_HOLD_MS.get()
 
     async def _move_with_stop(self, command: bytes) -> None:
         """Execute a movement command with guaranteed STOP at end.

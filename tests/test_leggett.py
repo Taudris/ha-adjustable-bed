@@ -11,17 +11,21 @@ from homeassistant.const import CONF_ADDRESS, CONF_NAME
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.adjustable_bed import SERVICE_TIMED_MOVE
 from custom_components.adjustable_bed.beds import leggett_okin as leggett_okin_module
+from custom_components.adjustable_bed.beds.base import caller_bounded_hold
 from custom_components.adjustable_bed.beds.leggett_gen2 import (
     LeggettGen2Commands,
     LeggettGen2Controller,
 )
 from custom_components.adjustable_bed.beds.leggett_okin import (
+    RELEASE_FRAME_COUNT,
     LeggettOkinCommands,
     LeggettOkinController,
 )
 from custom_components.adjustable_bed.const import (
     BED_TYPE_LEGGETT_GEN2,
+    BED_TYPE_LEGGETT_OKIN,
     BED_TYPE_LEGGETT_PLATT,
     BED_TYPE_OKIMAT,
     CONF_BED_TYPE,
@@ -316,6 +320,87 @@ class TestLeggettOkinController:
         assert release_call.args == (ZERO_FRAME,)
         assert release_call.kwargs["repeat_count"] == 4
 
+    async def test_caller_bounded_hold_streams_for_the_requested_duration(self):
+        """A caller that asks for a duration gets that hold, not the safety cap.
+
+        The pulse count cannot carry this: it means "frames in a burst" for
+        every bed that sends one, and a hold deliberately ignores it. So the
+        duration arrives as its own value and sizes the stream, here twenty
+        frames of the 100ms cadence rather than the cap's six hundred.
+        """
+        controller = _streaming_okin_controller(pulse_count=99)
+
+        with caller_bounded_hold(2000):
+            await controller.move_head_up()
+
+        controller.write_command.assert_awaited_once()
+        assert controller.write_command.await_args.kwargs == {
+            "repeat_count": 20,
+            "repeat_delay_ms": 100,
+        }
+
+    async def test_caller_bounded_hold_leaves_the_release_to_its_caller(self):
+        """The caller's stop is the bounded hold's one release burst.
+
+        A bounded caller always follows the movement with its own stop, so a
+        release from the stream as well would be the double-release defect
+        again - and the second burst would land after the coordinator had
+        already handed the bed to whatever ran next.
+        """
+        controller = _streaming_okin_controller()
+
+        with caller_bounded_hold(2000):
+            await controller.move_head_up()
+        await controller.move_head_stop()
+
+        frames = [call.args[0] for call in controller.write_command.await_args_list]
+        assert frames == [bytes.fromhex("040200000001"), ZERO_FRAME]
+
+    async def test_a_failed_bounded_hold_still_leaves_the_release_to_its_caller(self):
+        """A write failure inside a bounded hold must not release either.
+
+        The caller sends its stop from a finally, so it runs on the failure
+        path too. Releasing here as cleanup would double it.
+        """
+        controller = _streaming_okin_controller()
+        controller.write_command.side_effect = BleakError("write failed")
+
+        with pytest.raises(BleakError, match="write failed"), caller_bounded_hold(2000):
+            await controller.move_head_up()
+
+        controller.write_command.assert_awaited_once()
+
+    async def test_the_safety_cap_outranks_a_longer_caller_bound(self):
+        """A caller may shorten a hold but never extend it past the cap.
+
+        The cap exists so a lost stop can never run a motor forever, and a
+        requested duration is not a stop.
+        """
+        controller = _streaming_okin_controller()
+
+        with caller_bounded_hold(int(leggett_okin_module.MOVEMENT_HOLD_CAP_S * 1000) * 2):
+            await controller.move_head_up()
+
+        assert controller.write_command.await_args.kwargs["repeat_count"] == 600
+
+    async def test_an_ordinary_hold_after_a_bounded_one_runs_to_the_cap(self):
+        """The bound covers one call and does not linger for the next.
+
+        Cover open/close and the card's motor buttons hold until stopped; a
+        duration left behind by an earlier timed move would silently cut them
+        short.
+        """
+        controller = _streaming_okin_controller()
+        with caller_bounded_hold(2000):
+            await controller.move_head_up()
+        controller.write_command.reset_mock()
+
+        await controller.move_head_up()
+
+        move_call, release_call = controller.write_command.await_args_list
+        assert move_call.kwargs["repeat_count"] == 600
+        assert release_call.args == (ZERO_FRAME,)
+
     @pytest.mark.parametrize(
         ("slot", "keycode"),
         [(1, "00001000"), (2, "00002000"), (3, "00004000"), (4, "00008000")],
@@ -512,6 +597,59 @@ class TestLeggettOkinController:
 
         assert not hasattr(LeggettOkinCommands, "MASSAGE_TIMER_STEP")
         assert not hasattr(controller, "massage_timer_step")
+
+
+class TestLeggettOkinTimedMove:
+    """The timed_move service against a hold that streams until it is stopped."""
+
+    async def test_timed_move_streams_for_its_duration_and_releases_once(
+        self,
+        hass: HomeAssistant,
+        mock_leggett_okin_config_entry: MockConfigEntry,
+        mock_coordinator_connected,
+        mock_bleak_client: MagicMock,
+        enable_custom_integrations,
+    ):
+        """A bounded move must end at its duration with a single release burst.
+
+        The service asks for a duration; the hold stream would otherwise run to
+        the safety cap because it sizes its own budget and never reads the
+        pulse count the service assigns. The service always sends its own stop,
+        so that stop is the lifecycle's one release burst and the stream must
+        not add a second.
+        """
+        entry = mock_leggett_okin_config_entry
+        with patch(
+            "custom_components.adjustable_bed.coordinator."
+            "AdjustableBedCoordinator.async_read_initial_positions",
+            new=AsyncMock(),
+        ):
+            await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done()
+
+        from homeassistant.helpers import device_registry as dr
+
+        device_registry = dr.async_get(hass)
+        devices = dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+        assert len(devices) == 1
+        mock_bleak_client.write_gatt_char.reset_mock()
+
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_TIMED_MOVE,
+            {
+                "device_id": [devices[0].id],
+                "motor": "back",
+                "direction": "up",
+                # One cadence interval, so the frame budget is a single frame
+                # and no wall clock decides the outcome.
+                "duration_ms": 100,
+            },
+            blocking=True,
+        )
+
+        payloads = [call.args[1] for call in mock_bleak_client.write_gatt_char.call_args_list]
+        assert payloads == [bytes.fromhex("040200000001"), *[ZERO_FRAME] * RELEASE_FRAME_COUNT]
 
 
 class TestLeggettGen2CommandFormat:

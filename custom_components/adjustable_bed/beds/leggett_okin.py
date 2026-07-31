@@ -266,6 +266,9 @@ class LeggettOkinController(BedController):
           other command families end with their own terminators. Sending
           zeros here as well is the double-release defect, and on a
           same-direction re-trigger it would stop the bed mid-hold.
+        - A caller-bounded hold (``caller_bounded_hold``): the caller ends the
+          movement with its own stop, so that stop is the release and none is
+          sent here on any path out.
         - The safety cap, for a stop that never arrives: release sent here.
         - A write failure: release attempted as cleanup, error propagates.
         - External cancellation (shutdown or unload, recognizable because the
@@ -275,31 +278,30 @@ class LeggettOkinController(BedController):
         frame = self._build_command(command)
         _, pulse_delay_ms = self.motor_pulse_settings()
         # Unlike preset_flat's fixed-duration hold, the frame budget here is
-        # bounded by the wall-clock cap rather than by the count, and each
-        # frame is paced by a write-with-response round trip on top of the
-        # sleep - so a small delay cannot flood the link and needs no floor
-        # beyond keeping the arithmetic sane.
+        # bounded by a wall clock rather than by the count, and each frame is
+        # paced by a write-with-response round trip on top of the sleep - so a
+        # small delay cannot flood the link and needs no floor beyond keeping
+        # the arithmetic sane.
         pulse_delay_ms = max(1, pulse_delay_ms)
-        frame_budget = max(1, round(MOVEMENT_HOLD_CAP_S * 1000 / pulse_delay_ms))
+        hold_s = self._hold_seconds()
+        frame_budget = max(1, round(hold_s * 1000 / pulse_delay_ms))
         try:
-            async with asyncio.timeout(MOVEMENT_HOLD_CAP_S):
+            async with asyncio.timeout(hold_s):
                 await self.write_command(
                     frame,
                     repeat_count=frame_budget,
                     repeat_delay_ms=pulse_delay_ms,
                 )
         except TimeoutError:
-            # The cap ended the lifecycle; fall through to the release.
+            # The hold ran to its limit; fall through to the release.
             pass
         except asyncio.CancelledError:
             if self._coordinator.cancel_command.is_set():
                 raise  # Preempted: the successor command owns the release.
-            self._motor_state = {}
-            await self._send_release_frames("movement stream", raise_on_error=False)
+            await self._end_hold(raise_on_release_error=False)
             raise
         except (BleakError, ConnectionError):
-            self._motor_state = {}
-            await self._send_release_frames("movement stream", raise_on_error=False)
+            await self._end_hold(raise_on_release_error=False)
             raise
         else:
             if self._coordinator.cancel_command.is_set():
@@ -307,11 +309,35 @@ class LeggettOkinController(BedController):
                 # set: preemption again, just observed before the task
                 # cancellation landed.
                 return
-        self._motor_state = {}
         # The lifecycle ended without a successor, so this release is the
         # operation's stop: losing it can leave the bed running and must
         # surface.
-        await self._send_release_frames("movement stream", raise_on_error=True)
+        await self._end_hold(raise_on_release_error=True)
+
+    def _hold_seconds(self) -> float:
+        """Return how long this movement may stream for.
+
+        A caller that bounded the movement decides its duration; the safety cap
+        still applies over it, because the cap exists so a lost stop can never
+        run a motor forever and a caller-supplied duration is not a stop.
+        """
+        bounded_ms = self.caller_bounded_hold_ms
+        if bounded_ms is None:
+            return MOVEMENT_HOLD_CAP_S
+        return min(bounded_ms / 1000, MOVEMENT_HOLD_CAP_S)
+
+    async def _end_hold(self, *, raise_on_release_error: bool) -> None:
+        """Drop the held keycode and release it, unless the caller does that.
+
+        Under a caller-bounded hold the caller's own stop is the movement's
+        single release burst. Adding one here would double it, and the second
+        burst would land after the coordinator handed the bed to whatever ran
+        next.
+        """
+        self._motor_state = {}
+        if self.caller_bounded_hold_ms is not None:
+            return
+        await self._send_release_frames("movement stream", raise_on_error=raise_on_release_error)
 
     async def _send_release_frames(self, context: str, *, raise_on_error: bool = False) -> None:
         """Send the release burst that ends a held keycode.
