@@ -113,6 +113,17 @@ LP Control 2.9.0 uses a 200 ms cadence for held commands where Prodigy CE uses
 outside a keep-alive window that a longer one satisfies, and users on 200 ms
 reported stuttering movement.
 
+For the movement stream, the configured motor pulse delay is a **target
+cadence**, not a sleep between writes: frame *k* is scheduled at stream start +
+*k* × cadence, so the BLE write round trip is absorbed into the interval
+instead of added to it. This matters through a proxy: the control box halts
+motion when the inter-frame gap exceeds roughly 300 ms (measured), and proxied
+write-with-response round trips of 105-300 ms plus a fixed sleep would push
+gaps past that window. When a round trip overruns its tick the next frame is
+sent immediately and the overrun is logged at debug level ("Frame N overran
+cadence by X ms"). The other command families (release burst, recalls, memory
+programming, flat) keep the plain fixed delay.
+
 ## Memory programming
 
 There is no program opcode. Storing a position is two ordinary held keycodes in

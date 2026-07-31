@@ -420,6 +420,7 @@ class BedController(ABC):
         cancel_event: asyncio.Event | None = None,
         response: bool = True,
         log_errors: bool = True,
+        pace_to_cadence: bool = False,
     ) -> None:
         """Write a command to a GATT characteristic with retry support.
 
@@ -442,6 +443,14 @@ class BedController(ABC):
             log_errors: Whether to log BleakError failures at ERROR level.
                      Set to False for callers that recover from expected errors
                      (e.g. Linak's post-connect auth-window probes).
+            pace_to_cadence: Treat repeat_delay_ms as a target send cadence
+                     instead of a post-response sleep. Write k is scheduled at
+                     loop start + k * repeat_delay_ms: after each response the
+                     loop sleeps only the remainder to the next tick, so the
+                     write round trip is absorbed into the interval rather
+                     than added to it. A response arriving past its tick sends
+                     the next write immediately and logs the overrun at debug.
+                     False (the default) keeps the historical fixed sleep.
 
         Raises:
             ConnectionError: If not connected to the bed
@@ -493,6 +502,12 @@ class BedController(ABC):
                 controller_class=type(self).__name__,
             )
 
+        # Cadence clock for pace_to_cadence: tick k is stream_start +
+        # k * repeat_delay_ms, fixed at loop entry so overruns never shift
+        # later ticks.
+        clock = asyncio.get_running_loop().time
+        stream_start = clock()
+
         for i in range(repeat_count):
             if effective_cancel is not None and effective_cancel.is_set():
                 _LOGGER.debug("Command cancelled after %d/%d writes", i, repeat_count)
@@ -524,7 +539,21 @@ class BedController(ABC):
                 raise
 
             if i < repeat_count - 1:
-                await asyncio.sleep(repeat_delay_ms / 1000)
+                if pace_to_cadence:
+                    remainder = stream_start + (i + 1) * (repeat_delay_ms / 1000) - clock()
+                    if remainder > 0:
+                        await asyncio.sleep(remainder)
+                    else:
+                        # The round trip ran past the tick: send the next
+                        # frame immediately. Logged only on overrun, so the
+                        # happy path pays nothing per frame.
+                        _LOGGER.debug(
+                            "Frame %d overran cadence by %.0f ms",
+                            i + 1,
+                            -remainder * 1000,
+                        )
+                else:
+                    await asyncio.sleep(repeat_delay_ms / 1000)
 
     async def write_command(
         self,
@@ -560,6 +589,42 @@ class BedController(ABC):
             repeat_delay_ms=repeat_delay_ms,
             cancel_event=cancel_event,
             response=self._write_with_response,
+        )
+
+    async def write_command_paced(
+        self,
+        command: bytes,
+        *,
+        repeat_count: int,
+        cadence_ms: int,
+        cancel_event: asyncio.Event | None = None,
+    ) -> None:
+        """Stream a command with repeats scheduled on a cadence clock.
+
+        write_command sleeps ``repeat_delay_ms`` after each write response, so
+        its real period is response round trip + delay. This variant schedules
+        write k at stream start + k * ``cadence_ms`` and sleeps only the
+        remainder after each response; a response arriving past its tick sends
+        the next write immediately and logs the overrun at debug. Use it for
+        keycode streams where a control-box keep-alive watchdog bounds the
+        inter-frame gap, so the gap must not grow with link latency.
+
+        Cancellation semantics are identical to write_command: the cancel
+        event (the coordinator's when none is given) is checked before every
+        write, and CancelledError propagates from any await point.
+
+        Raises:
+            ConnectionError: If not connected to the bed
+            BleakError: If the GATT write fails
+        """
+        await self._write_gatt_with_retry(
+            self.control_characteristic_uuid,
+            command,
+            repeat_count=repeat_count,
+            repeat_delay_ms=cadence_ms,
+            cancel_event=cancel_event,
+            response=self._write_with_response,
+            pace_to_cadence=True,
         )
 
     async def start_notify(self, callback: Callable[[str, float], None] | None = None) -> None:

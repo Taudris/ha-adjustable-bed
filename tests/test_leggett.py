@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -10,6 +12,7 @@ from homeassistant.const import CONF_ADDRESS, CONF_NAME
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.adjustable_bed.beds import base as base_module
 from custom_components.adjustable_bed.beds.leggett_gen2 import (
     LeggettGen2Commands,
     LeggettGen2Controller,
@@ -147,21 +150,27 @@ class TestLeggettOkinController:
         The app's output thread writes the held keycode every 100ms and emits
         exactly four keycode-0 frames on release (MaxZeroCount = 3). There is no
         distinct stop opcode; the release frame is an ordinary frame carrying 0.
+        The stream is cadence-paced, so a write round trip widens no
+        inter-frame gap.
         """
         coordinator = MagicMock()
         coordinator.motor_pulse_count = 10
         coordinator.motor_pulse_delay_ms = 100
         controller = LeggettOkinController(coordinator)
         controller.write_command = AsyncMock()
+        controller.write_command_paced = AsyncMock()
 
         await controller.move_head_up()
 
-        move_call, release_call = controller.write_command.await_args_list
+        controller.write_command_paced.assert_awaited_once()
+        move_call = controller.write_command_paced.await_args
         assert move_call.args == (bytes.fromhex("040200000001"),)
         assert move_call.kwargs == {
             "repeat_count": 10,
-            "repeat_delay_ms": 100,
+            "cadence_ms": 100,
         }
+        controller.write_command.assert_awaited_once()
+        release_call = controller.write_command.await_args
         assert release_call.args == (bytes.fromhex("040200000000"),)
         assert release_call.kwargs["repeat_count"] == 4
         assert release_call.kwargs["cancel_event"].is_set() is False
@@ -238,15 +247,18 @@ class TestLeggettOkinController:
         which one propagated: with a shared message it would pass even if the
         cleanup failure replaced the movement failure.
         """
-        controller = LeggettOkinController(MagicMock())
-        controller.write_command = AsyncMock(
-            side_effect=[BleakError("movement failed"), BleakError("release failed")]
-        )
+        coordinator = MagicMock()
+        coordinator.motor_pulse_count = 10
+        coordinator.motor_pulse_delay_ms = 100
+        controller = LeggettOkinController(coordinator)
+        controller.write_command_paced = AsyncMock(side_effect=BleakError("movement failed"))
+        controller.write_command = AsyncMock(side_effect=BleakError("release failed"))
 
         with pytest.raises(BleakError, match="movement failed"):
             await controller.move_head_up()
 
-        assert controller.write_command.await_count == 2
+        # The cleanup release was attempted despite failing.
+        controller.write_command.assert_awaited_once()
 
     async def test_preset_flat_floors_an_unsafe_pulse_delay(self):
         """Flat is a fixed-duration hold, so the cadence has a floor.
@@ -350,14 +362,23 @@ class TestLeggettOkinController:
         coordinator.motor_pulse_count = 10
         coordinator.motor_pulse_delay_ms = 100
         controller = LeggettOkinController(coordinator)
-        controller.write_command = AsyncMock(
-            side_effect=[None, BleakError("release failed")]
-        )
+        if action == "move_head_up":
+            # The movement streams via the paced write, so the release is the
+            # first (and only) plain write_command call.
+            controller.write_command_paced = AsyncMock()
+            controller.write_command = AsyncMock(side_effect=BleakError("release failed"))
+        else:
+            controller.write_command = AsyncMock(
+                side_effect=[None, BleakError("release failed")]
+            )
 
         with pytest.raises(BleakError, match="release failed"):
             await getattr(controller, action)()
 
-        first = controller.write_command.await_args_list[0]
+        if action == "move_head_up":
+            first = controller.write_command_paced.await_args_list[0]
+        else:
+            first = controller.write_command.await_args_list[0]
         assert first.args == (bytes.fromhex(primary_frame),)
 
     async def test_massage_timer_step_is_not_exposed(self):
@@ -366,6 +387,152 @@ class TestLeggettOkinController:
 
         assert not hasattr(LeggettOkinCommands, "MASSAGE_TIMER_STEP")
         assert not hasattr(controller, "massage_timer_step")
+
+
+def _paced_link_controller() -> tuple[LeggettOkinController, MagicMock]:
+    """Return a controller whose real base write loop runs against a fake client.
+
+    The cadence-pacing tests exercise BedController._write_gatt_with_retry
+    itself, so nothing on the write path is mocked except the BLE client. The
+    cancel event is a real asyncio.Event because the loop calls is_set() on it.
+    """
+    coordinator = MagicMock()
+    coordinator.address = "AA:BB:CC:DD:EE:FF"
+    coordinator.cancel_command = asyncio.Event()
+    client = MagicMock()
+    client.is_connected = True
+    client.services = []
+    client.write_gatt_char = AsyncMock()
+    coordinator.client = client
+    return LeggettOkinController(coordinator), client
+
+
+class TestLeggettOkinCadencePacing:
+    """Cadence pacing of the movement stream's underlying write loop.
+
+    The bed's control box halts motion when the inter-frame gap exceeds
+    roughly 300ms, and proxied write-with-response round trips reach that on
+    their own - so the stream schedules frame k at stream start + k * cadence
+    instead of sleeping the full delay after every response.
+    """
+
+    @staticmethod
+    def _install_fake_clock(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[dict[str, float], list[float]]:
+        """Drive the write loop from a fake clock.
+
+        The loop reads the running loop's time and pauses via asyncio.sleep;
+        both are redirected to the same fake clock so simulated round trips
+        and the recorded sleep durations are exact, with no wall time spent.
+        """
+        clock = {"now": 0.0}
+        sleeps: list[float] = []
+        monkeypatch.setattr(asyncio.get_running_loop(), "time", lambda: clock["now"])
+
+        async def _sleep(delay: float) -> None:
+            sleeps.append(delay)
+            clock["now"] += delay
+
+        monkeypatch.setattr(base_module.asyncio, "sleep", _sleep)
+        return clock, sleeps
+
+    async def test_stream_sleeps_the_remainder_of_each_tick(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Pacing sleeps cadence minus round trip, not cadence on top of it.
+
+        With 40ms round trips on a 100ms cadence the old post-response sleep
+        made every real gap 140ms; the paced loop must sleep only the 60ms
+        remainder so frames stay on the 100ms grid.
+        """
+        controller, client = _paced_link_controller()
+        clock, sleeps = self._install_fake_clock(monkeypatch)
+
+        async def _write(char_uuid: str, command: bytes, response: bool = True) -> None:
+            clock["now"] += 0.040
+
+        client.write_gatt_char = AsyncMock(side_effect=_write)
+
+        await controller.write_command_paced(
+            bytes.fromhex("040200000001"), repeat_count=4, cadence_ms=100
+        )
+
+        assert client.write_gatt_char.await_count == 4
+        assert sleeps == pytest.approx([0.06, 0.06, 0.06])
+
+    async def test_overrun_sends_immediately_and_logs(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        """A round trip past the tick must not add a sleep, and must be visible.
+
+        The next frame goes out immediately so the watchdog gap stops growing,
+        and the debug log is the only trace that the link fell behind cadence.
+        """
+        controller, client = _paced_link_controller()
+        clock, sleeps = self._install_fake_clock(monkeypatch)
+
+        async def _write(char_uuid: str, command: bytes, response: bool = True) -> None:
+            clock["now"] += 0.250
+
+        client.write_gatt_char = AsyncMock(side_effect=_write)
+
+        with caplog.at_level(logging.DEBUG, logger="custom_components.adjustable_bed.beds.base"):
+            await controller.write_command_paced(
+                bytes.fromhex("040200000001"), repeat_count=3, cadence_ms=100
+            )
+
+        assert client.write_gatt_char.await_count == 3
+        assert sleeps == []
+        assert "Frame 1 overran cadence by 150 ms" in caplog.text
+        assert "Frame 2 overran cadence by 300 ms" in caplog.text
+
+    async def test_unpaced_writes_keep_the_fixed_sleep(self, monkeypatch: pytest.MonkeyPatch):
+        """write_command's loop is untouched: the full delay follows every response.
+
+        Every other bed type shares this loop, so its timing must not change
+        however far the clock has advanced during the write.
+        """
+        controller, client = _paced_link_controller()
+        clock, sleeps = self._install_fake_clock(monkeypatch)
+
+        async def _write(char_uuid: str, command: bytes, response: bool = True) -> None:
+            clock["now"] += 0.040
+
+        client.write_gatt_char = AsyncMock(side_effect=_write)
+
+        await controller.write_command(
+            bytes.fromhex("040200000001"), repeat_count=3, repeat_delay_ms=100
+        )
+
+        assert sleeps == pytest.approx([0.1, 0.1])
+
+    async def test_paced_stream_stops_on_the_cancel_event_between_frames(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Preemption semantics survive pacing: the loop exits between frames.
+
+        A stop request has to be able to cut a movement short, so the paced
+        loop must keep checking the coordinator's cancel event before every
+        frame rather than running its whole frame budget.
+        """
+        controller, client = _paced_link_controller()
+        self._install_fake_clock(monkeypatch)
+        cancel = controller._coordinator.cancel_command
+        writes = {"count": 0}
+
+        async def _write(char_uuid: str, command: bytes, response: bool = True) -> None:
+            writes["count"] += 1
+            if writes["count"] == 2:
+                cancel.set()
+
+        client.write_gatt_char = AsyncMock(side_effect=_write)
+
+        await controller.write_command_paced(
+            bytes.fromhex("040200000001"), repeat_count=10, cadence_ms=100
+        )
+
+        assert writes["count"] == 2
 
 
 class TestLeggettGen2CommandFormat:

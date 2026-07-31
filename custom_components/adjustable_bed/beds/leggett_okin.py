@@ -225,11 +225,20 @@ class LeggettOkinController(BedController):
         completed = False
         try:
             if command:
-                pulse_count, pulse_delay_ms = self.motor_pulse_settings()
-                await self.write_command(
+                # The configured motor pulse delay is this stream's target
+                # cadence: frame k is scheduled at stream start + k * cadence,
+                # so a write round trip is absorbed into the interval instead
+                # of added to it. The box's keep-alive watchdog halts motion
+                # when the inter-frame gap exceeds roughly 300ms, and proxy
+                # round trips alone can approach that - a post-response sleep
+                # would push every gap past it. A small cadence cannot flood
+                # the link (each frame still waits for its write response), so
+                # the floor only keeps the arithmetic sane.
+                pulse_count, cadence_ms = self.motor_pulse_settings()
+                await self.write_command_paced(
                     self._build_command(command),
                     repeat_count=pulse_count,
-                    repeat_delay_ms=pulse_delay_ms,
+                    cadence_ms=max(1, cadence_ms),
                 )
             completed = True
         finally:
