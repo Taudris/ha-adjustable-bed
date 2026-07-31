@@ -20,6 +20,7 @@ import {
 } from "./discovery";
 import { MotorHold } from "./hold";
 import { localize } from "./localize";
+import { keepDefined } from "./registry";
 import {
   type AdjustableBedCardConfig,
   type BedEntities,
@@ -29,8 +30,9 @@ import {
   type MemorySlot,
   type MotorEntity,
 } from "./types";
-// Side-effect import: registers <adjustable-bed-card-editor> in the same bundle.
-import "./editor";
+// Registers <adjustable-bed-card-editor> in the same bundle; the class itself
+// is needed for the registry repair below.
+import { AdjustableBedCardEditor } from "./editor";
 
 @customElement("adjustable-bed-card")
 export class AdjustableBedCard extends LitElement {
@@ -1120,6 +1122,14 @@ w.customCards.push({
   description: "Native control card for the Adjustable Bed integration.",
   preview: true,
   documentationURL: "https://github.com/kristofferR/ha-adjustable-bed",
+});
+
+// Home Assistant can replace window.customElements after this bundle loads,
+// which would drop both elements from the registry Lovelace reads. See
+// ./registry.
+keepDefined({
+  "adjustable-bed-card": AdjustableBedCard,
+  "adjustable-bed-card-editor": AdjustableBedCardEditor,
 });
 
 // eslint-disable-next-line no-console
