@@ -42,15 +42,30 @@ _LOGGER = logging.getLogger(__name__)
 # Beds advertise several times per second. Entity state writes are throttled to
 # this interval so the recorder does not fill with BLE noise; availability
 # transitions bypass the throttle because those are the interesting events.
+# This is a recorder-noise budget and nothing else: no staleness or availability
+# threshold may be derived from it, or a future recorder-motivated change would
+# silently move that threshold too.
 ADVERTISEMENT_UPDATE_INTERVAL = 30.0
 
 # After we release our own connection the bed needs time to resume advertising
 # and a scanner needs to hear it, so advertisement absence within this window is
-# attributed to the just-finished connection rather than to the bed. Twice the
-# module's advertisement-staleness interval comfortably covers a slow ESPHome
-# proxy scan cycle while still reporting a genuinely powered-off bed within a
-# minute of disconnecting.
-POST_DISCONNECT_ADVERTISEMENT_GRACE = ADVERTISEMENT_UPDATE_INTERVAL * 2
+# attributed to the just-finished connection rather than to the bed.
+#
+# This grace is added on top of the Bluetooth stack's own latency, never instead
+# of it: the timer is armed only once the stack has already called us back as
+# unavailable. For a connectable address habluetooth applies no advertising-
+# interval test at all - the address goes unavailable only once it has dropped
+# out of every scanner's discovered set. Scanners drop entries older than
+# CONNECTABLE_FALLBACK_MAXIMUM_STALE_ADVERTISEMENT_SECONDS (195 s) on a 30 s
+# sweep, and the manager's unavailable sweep reschedules itself every
+# UNAVAILABLE_TRACK_SECONDS (300 s), so the stack's verdict lands roughly 195 to
+# 525 s after the last advertisement - three to nine minutes, not one.
+#
+# What the grace buys is therefore accuracy, not timeliness: it stops a
+# disconnect that happens to land just before the stack's sweep from being
+# blamed on the bed. One minute is ample for that, and is deliberately its own
+# number rather than a multiple of anything else in this module.
+POST_DISCONNECT_ADVERTISEMENT_GRACE = 60.0
 
 
 @dataclass(frozen=True)
