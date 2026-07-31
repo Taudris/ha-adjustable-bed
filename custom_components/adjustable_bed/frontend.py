@@ -142,8 +142,15 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
         return
 
     try:
+        # cache_headers=True adds a long-lived Cache-Control. Safe here because
+        # the URL carries a content digest (?v=version-digest): a rebuilt bundle
+        # is a different URL, so a cached response can never go stale. Without
+        # it the response has no Cache-Control at all and the browser guesses
+        # freshness from Last-Modified, re-validating the module on dashboard
+        # loads. aiohttp's FileResponse sends ETag and Last-Modified either way,
+        # so those re-validations were cheap 304s; this saves the round trip.
         await hass.http.async_register_static_paths(
-            [StaticPathConfig(URL_BASE, str(_dist_dir()), False)]
+            [StaticPathConfig(URL_BASE, str(_dist_dir()), True)]
         )
     except Exception:  # noqa: BLE001 - never let the card break setup
         _LOGGER.warning(
