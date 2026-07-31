@@ -113,16 +113,29 @@ LP Control 2.9.0 uses a 200 ms cadence for held commands where Prodigy CE uses
 outside a keep-alive window that a longer one satisfies, and users on 200 ms
 reported stuttering movement.
 
-For the movement stream, the configured motor pulse delay is a **target
-cadence**, not a sleep between writes: frame *k* is scheduled at stream start +
-*k* × cadence, so the BLE write round trip is absorbed into the interval
-instead of added to it. This matters through a proxy: the control box halts
-motion when the inter-frame gap exceeds roughly 300 ms (measured), and proxied
-write-with-response round trips of 105-300 ms plus a fixed sleep would push
-gaps past that window. When a round trip overruns its tick the next frame is
-sent immediately and the overrun is logged at debug level ("Frame N overran
-cadence by X ms"). The other command families (release burst, recalls, memory
-programming, flat) keep the plain fixed delay.
+Every one of these intervals is a **target cadence**, not a sleep between
+writes: frame *k* is scheduled at stream start + *k* × cadence, so the BLE
+write round trip is absorbed into the interval instead of added to it. This
+matters through a proxy: the control box halts motion when the inter-frame gap
+exceeds roughly 300 ms (measured), and proxied write-with-response round trips
+of 105-300 ms plus a fixed sleep would push gaps past that window. When a round
+trip overruns its tick the next frame is sent immediately and the overrun is
+logged at debug level ("Frame N overran cadence by X ms").
+
+Pacing applies to every repeated-frame path: motor movement, the memory-store
+arm and slot holds, flat, the release burst and the recall trigger. That
+mirrors the app, whose output thread is one unconditional 100 ms scheduler for
+every key including releases and recalls. Single-frame taps (light, massage)
+have no repeats, so they are unaffected either way.
+
+The inter-frame interval becomes `max(cadence, round trip)` rather than
+`cadence + round trip`, so on a link that keeps up with the cadence a burst of
+*n* frames takes *n* × cadence; on a slower proxied link it is round-trip
+bound, and never slower than the unpaced path. Two consequences beyond the
+watchdog: a frame count derived from a hold duration (memory programming, flat)
+runs to that duration instead of stretching well past it, and the bursts that
+only *trigger* something (release, recall) stop holding the command lock for
+whole seconds of pure sleep.
 
 ## Memory programming
 

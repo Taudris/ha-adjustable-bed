@@ -83,6 +83,18 @@ class LeggettOkinCommands:
     TOGGLE_LIGHTS = 0x20000
 
 
+# Every repeated-frame family below is a *cadence*, not a post-response sleep:
+# the app's output thread ticks one unconditional 100ms scheduler for every key
+# including releases and recalls, and the control box's keep-alive watchdog
+# bounds the gap between frames rather than the gap after a response. Adding a
+# BLE round trip on top of these numbers is what produced gaps past that
+# watchdog, so they are all sent through write_command_paced.
+#
+# Pacing makes the inter-frame interval max(cadence, round trip) instead of
+# cadence + round trip. A link that keeps up with the cadence therefore runs
+# these families at exactly the nominal numbers; a slower proxied link is round
+# trip bound and runs longer, but never longer than the unpaced path did.
+
 # The app streams a held keycode until release, then emits exactly four
 # keycode-0 frames (OutputThread.runNormal, MaxZeroCount = 3). There is no
 # distinct stop opcode: the release frame is an ordinary frame carrying 0.
@@ -90,19 +102,19 @@ RELEASE_FRAME_COUNT = 4
 # Same 100ms as the recall cadence today, but deliberately a separate constant:
 # these are independent findings about different command families, and retuning
 # one must not silently retune the other.
-RELEASE_FRAME_DELAY_MS = 100
+RELEASE_FRAME_CADENCE_MS = 100
 
 # A memory recall is a fixed 10-frame burst with no terminator at all. The
 # control box drives the move to completion by itself, so appending a release
 # frame here could cancel the motion the recall just started.
 RECALL_FRAME_COUNT = 10
-RECALL_FRAME_DELAY_MS = 100
+RECALL_FRAME_CADENCE_MS = 100
 
 # Programming a slot is a two-stage hold, not an opcode: arm with MEMORY_STORE
 # for ~5s, release, then hold the slot keycode for ~2s.
 MEMORY_STORE_HOLD_S = 5.0
 MEMORY_SLOT_HOLD_S = 2.0
-MEMORY_PROGRAM_FRAME_DELAY_MS = 100
+MEMORY_PROGRAM_FRAME_CADENCE_MS = 100
 
 # FLAT is a held button with no app-defined duration - the user holds it until
 # the bed is down. This is how long the integration streams it for; it is a
@@ -256,15 +268,22 @@ class LeggettOkinController(BedController):
         so mirror that rather than a single frame. The burst gets a fresh cancel
         event so a stop request cannot suppress the release itself.
 
+        The burst is paced like every other frame family here: the app's output
+        thread ticks these zeros on the same unconditional 100ms schedule as a
+        held key, so the round trip belongs inside the interval. That drops the
+        burst from four round trips plus 300ms of sleep to four round trips,
+        which matters because the cancellation path below blocks the command
+        lock until it finishes.
+
         ``raise_on_error`` is for callers where the burst *is* the operation, so
         a failure must reach the user. Cleanup callers leave it False: they are
         already unwinding and have their own error to report.
         """
         release = asyncio.ensure_future(
-            self.write_command(
+            self.write_command_paced(
                 self._build_command(0),
                 repeat_count=RELEASE_FRAME_COUNT,
-                repeat_delay_ms=RELEASE_FRAME_DELAY_MS,
+                cadence_ms=RELEASE_FRAME_CADENCE_MS,
                 cancel_event=asyncio.Event(),
             )
         )
@@ -364,11 +383,16 @@ class LeggettOkinController(BedController):
         the move to completion on its own. This is the one command family the
         app deliberately leaves unterminated, so no release frames follow -
         they could cancel the motion the recall just started.
+
+        The 10 frames are the trigger, not the motion, so pacing them costs
+        nothing and drops ~900ms of sleep from the burst: the box has latched
+        the recall by then and completes the move without us, while the burst
+        holds the command lock the whole time.
         """
-        await self.write_command(
+        await self.write_command_paced(
             self._build_command(command),
             repeat_count=RECALL_FRAME_COUNT,
-            repeat_delay_ms=RECALL_FRAME_DELAY_MS,
+            cadence_ms=RECALL_FRAME_CADENCE_MS,
         )
 
     async def preset_flat(self) -> None:
@@ -378,21 +402,27 @@ class LeggettOkinController(BedController):
         autonomous recall: the bed moves only while frames keep arriving, so
         this streams for roughly the time a full recline takes and then
         releases.
+
+        The stream is cadence-paced, so the hold runs FLAT_HOLD_S on any link
+        that keeps up with the cadence. Unpaced, every frame cost a round trip
+        on top of the delay, which stretched a nominal 30s hold to roughly 90s
+        at the measured round trips - half a minute of extra keycode asserted
+        past the endstops.
         """
         # The setup flows accept any integer for the pulse delay, and this hold
         # is a fixed duration, so a small or nonpositive value would expand it
         # into tens of thousands of sequential writes and flood the proxy (a
         # stored 0 would divide by zero outright). Streaming faster than the
         # protocol's proven cadence buys nothing here, so floor it at that.
-        _, pulse_delay_ms = self.motor_pulse_settings()
-        pulse_delay_ms = max(pulse_delay_ms, LEGGETT_OKIN_PULSE_DEFAULTS[1])
-        repeat_count = max(1, round(FLAT_HOLD_S * 1000 / pulse_delay_ms))
+        _, cadence_ms = self.motor_pulse_settings()
+        cadence_ms = max(cadence_ms, LEGGETT_OKIN_PULSE_DEFAULTS[1])
+        repeat_count = max(1, round(FLAT_HOLD_S * 1000 / cadence_ms))
         completed = False
         try:
-            await self.write_command(
+            await self.write_command_paced(
                 self._build_command(LeggettOkinCommands.PRESET_FLAT),
                 repeat_count=repeat_count,
-                repeat_delay_ms=pulse_delay_ms,
+                cadence_ms=cadence_ms,
             )
             completed = True
         finally:
@@ -437,12 +467,22 @@ class LeggettOkinController(BedController):
             await self._send_release_frames("memory store slot", raise_on_error=completed)
 
     async def _hold_keycode(self, command: int, hold_seconds: float) -> None:
-        """Stream a keycode for a fixed duration, as a held button would."""
-        repeat_count = max(1, round(hold_seconds * 1000 / MEMORY_PROGRAM_FRAME_DELAY_MS))
-        await self.write_command(
+        """Stream a keycode for a fixed duration, as a held button would.
+
+        The frame count is derived from the cadence, so pacing is what lets
+        ``hold_seconds`` mean seconds: unpaced, each frame cost a write round
+        trip on top of the cadence, and the box measures its arm and record
+        windows itself. Both stages are also long enough that an unpaced stream
+        would almost certainly hit at least one gap past the ~300ms keep-alive
+        watchdog, which drops the hold and makes the store look like the box
+        rejected it - and nothing here parses acknowledgements, so a dropped
+        hold is invisible.
+        """
+        repeat_count = max(1, round(hold_seconds * 1000 / MEMORY_PROGRAM_FRAME_CADENCE_MS))
+        await self.write_command_paced(
             self._build_command(command),
             repeat_count=repeat_count,
-            repeat_delay_ms=MEMORY_PROGRAM_FRAME_DELAY_MS,
+            cadence_ms=MEMORY_PROGRAM_FRAME_CADENCE_MS,
         )
 
     async def preset_zero_g(self) -> None:
