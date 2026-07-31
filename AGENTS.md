@@ -276,10 +276,14 @@ under `custom_components/adjustable_bed/frontend/`.
   **committed** (it ships with the integration). Rebuild and commit it whenever
   you change `frontend/src`.
 - **Registration**: `frontend.py` serves `frontend/dist` as a static path and
-  calls `add_extra_js_url`, so the card auto-loads with no manual Lovelace
-  resource. `frontend` is listed in `manifest.json` `after_dependencies` for
-  setup ordering; registration is best-effort and never blocks integration
-  setup.
+  creates a Lovelace storage resource, so the card auto-loads with no manual
+  setup. `add_extra_js_url` is the YAML-resource-mode fallback only, never
+  unconditional: it injects the bundle into `index.html`, where a fast card
+  can be defined before Home Assistant's `app.js` swaps in the
+  scoped-custom-element-registry polyfill, which leaves the card invisible to
+  the Lovelace editor (`frontend/src/registry.ts` repairs that). `frontend` is
+  listed in `manifest.json` `after_dependencies` for setup ordering;
+  registration is best-effort and never blocks integration setup.
 
 ## Development
 

@@ -171,13 +171,23 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
             exc_info=True,
         )
 
-    # Keep the frontend hook as well as the durable storage resource. Browsers
-    # deduplicate identical module imports, and this preserves early loading on
-    # fresh pages while the resource covers Lovelace's independent load path.
-    try:
-        add_extra_js_url(hass, card_url)
-    except Exception:  # noqa: BLE001 - never let the card break setup
-        if not resource_registered:
+    if not resource_registered:
+        # Only where no storage resource exists, because this path is a hazard
+        # as well as a fallback. add_extra_js_url injects the bundle as a
+        # parse-time import() in index.html, racing Home Assistant's own
+        # app.js. app.js first installs @webcomponents/scoped-custom-element-
+        # registry, which replaces window.customElements with an empty registry
+        # whose get() and whenDefined() never consult the native one. Our one
+        # small module routinely resolves before app.js's much larger graph,
+        # and a card defined before that swap stays invisible to Lovelace: the
+        # editor's 2 s whenDefined rejects with "Custom element not found"
+        # (home-assistant/frontend#52960). Lovelace imports storage resources
+        # from inside its own panel, which cannot run before app.js, so that
+        # path cannot lose the race. The bundle re-registers itself on a timer
+        # to repair this one.
+        try:
+            add_extra_js_url(hass, card_url)
+        except Exception:  # noqa: BLE001 - never let the card break setup
             _LOGGER.warning(
                 "Could not auto-load the Adjustable Bed Lovelace card; bed "
                 "control is unaffected. Add %s manually as a dashboard resource "
@@ -186,10 +196,5 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
                 exc_info=True,
             )
             return
-        _LOGGER.debug(
-            "Could not add the Adjustable Bed frontend module hook; the "
-            "Lovelace resource is registered",
-            exc_info=True,
-        )
 
     _LOGGER.debug("Registered Adjustable Bed Lovelace card (v%s)", version)

@@ -157,10 +157,10 @@ async def test_register_lovelace_resource_rejects_yaml_resources(
     )
 
 
-async def test_register_frontend_uses_resource_and_module_hook(
+async def test_register_frontend_skips_module_hook_for_storage_resources(
     hass: HomeAssistant,
 ) -> None:
-    """Storage mode is durable while retaining early frontend module loading."""
+    """The durable resource loads the card without racing the frontend bundle."""
     hass.http = MagicMock()
     hass.http.async_register_static_paths = AsyncMock()
 
@@ -183,7 +183,7 @@ async def test_register_frontend_uses_resource_and_module_hook(
 
     card_url = f"{CARD_URL}?v=3.3.0-abc123"
     register_resource.assert_awaited_once_with(hass, card_url)
-    add_extra_js_url.assert_called_once_with(hass, card_url)
+    add_extra_js_url.assert_not_called()
     hass.http.async_register_static_paths.assert_awaited_once()
     assert hass.data[DOMAIN][DATA_FRONTEND_REGISTERED] is True
 
