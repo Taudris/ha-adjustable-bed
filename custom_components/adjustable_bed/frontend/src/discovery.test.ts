@@ -133,6 +133,20 @@ test("4-motor bed with massage, climate, and colour light", () => {
   expect(bed.lights.switch).toBeUndefined();
 });
 
+test("Leggett Okin's head/pillow/lumbar/feet covers all bucket as motors", () => {
+  const hass = hassWith([
+    entry("cover.lp_head", "head"),
+    entry("cover.lp_pillow", "pillow"),
+    entry("cover.lp_lumbar", "lumbar"),
+    entry("cover.lp_feet", "feet"),
+  ]);
+  const bed = bedEntitiesForDevice(hass, "dev1");
+
+  // MOTOR_ORDER, not registry order: the card renders lumbar and pillow after
+  // the primary axes even though the remote lists pillow second.
+  expect(bed.motors.map((m) => m.key)).toEqual(["head", "feet", "lumbar", "pillow"]);
+});
+
 test("discrete up/down motor buttons without covers", () => {
   const hass = hassWith([
     entry("button.b_head_up", "head_up"),

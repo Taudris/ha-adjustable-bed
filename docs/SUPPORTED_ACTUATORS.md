@@ -10,7 +10,7 @@ This document provides an overview of supported bed brands. Click on a brand nam
 | [MotoSleep](beds/motosleep.md) | ✅ Supported | 2 memory presets, massage, lights, Zero-G |
 | [Octo](beds/octo.md) | ✅ Supported | Two protocol variants, optional PIN auth, RGBW lights. Sold as bett1.de, Dunlopillo, Hüsler Nest, Swiss Sense, Velda, Werkmeister, sleepling and more ([known brand list](beds/octo.md#bed-brands-that-ship-octo-actuators)) |
 | [Solace](beds/solace.md) | ✅ Supported | 5 memory presets, lift/tilt, Zero-G, massage (zones + timers), lights (11 levels) |
-| [Leggett & Platt](beds/leggett-platt.md) | ✅ Supported | Gen2: motor control + RGB lighting; Okin: tilt/lumbar, massage |
+| [Leggett & Platt](beds/leggett-platt.md) | ✅ Supported | Gen2: motor control + RGB lighting; Okin: head/pillow/lumbar/feet, massage |
 | [Reverie](beds/reverie.md) | ✅ Supported | Position control (0-100%), 4 presets, wave massage |
 | [Okimat/Okin](beds/okimat.md) | ✅ Supported | 4 memory presets, massage, lights (requires pairing) |
 | [Okin 64-Bit](beds/okin-64bit.md) | 🧪 Needs Testing | 10-byte Nordic/custom OKIN protocol, lumbar, lights, massage |
