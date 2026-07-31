@@ -8,7 +8,9 @@ connection attempts.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -20,8 +22,10 @@ from custom_components.adjustable_bed.adapter import AdapterSelectionResult
 from custom_components.adjustable_bed.ble_availability import (
     ADVERTISEMENT_UPDATE_INTERVAL,
     POST_DISCONNECT_ADVERTISEMENT_GRACE,
+    AvailabilityVerdict,
     BleAvailabilityTracker,
     async_advertisement_telemetry,
+    judge_availability,
 )
 from custom_components.adjustable_bed.const import (
     BED_TYPE_LINAK,
@@ -39,6 +43,11 @@ TEST_ADDRESS = "AA:BB:CC:DD:EE:FF"
 _LAST_SERVICE_INFO = (
     "custom_components.adjustable_bed.adapter.bluetooth.async_last_service_info"
 )
+_CALL_LATER = "custom_components.adjustable_bed.ble_availability.async_call_later"
+
+# Distinguishes "caller wants the default seeded record" from "caller wants no
+# scanner record at all", which is a meaningful scenario in its own right.
+_SEED_DEFAULT = object()
 
 
 def _service_info(
@@ -132,41 +141,123 @@ class TestAdvertisementTelemetry:
         assert telemetry.as_log_fragment() == "no advertisement on record"
 
 
+class _FakeClock:
+    """A monotonic clock the test drives by hand."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        """Move the clock forward."""
+        self.now += seconds
+
+
+class _FakeConnection:
+    """A pullable connection state, standing in for the coordinator."""
+
+    def __init__(self, connected: bool = False) -> None:
+        self.connected = connected
+
+    def __call__(self) -> bool:
+        return self.connected
+
+
+def _connect(tracker: BleAvailabilityTracker, connection: _FakeConnection) -> None:
+    """Take the connection and notify the tracker, as the coordinator does."""
+    connection.connected = True
+    tracker.async_connection_state_changed(True)
+
+
+def _disconnect(tracker: BleAvailabilityTracker, connection: _FakeConnection) -> None:
+    """Release the connection and notify the tracker, as the coordinator does."""
+    connection.connected = False
+    tracker.async_connection_state_changed(False)
+
+
+class TestJudgeAvailability:
+    """Test the pure availability judgement in isolation."""
+
+    def test_connection_outranks_advertisement_silence(self):
+        """Holding the connection is proof of availability, whatever the stack says."""
+        assert (
+            judge_availability(connected=True, stack_unavailable=True, grace_remaining=None)
+            is AvailabilityVerdict.AVAILABLE
+        )
+
+    def test_recent_advertisements_mean_available(self):
+        """A stack that still hears the bed settles it."""
+        assert (
+            judge_availability(connected=False, stack_unavailable=False, grace_remaining=None)
+            is AvailabilityVerdict.AVAILABLE
+        )
+
+    def test_silence_inside_the_grace_is_deferred(self):
+        """A bed that may still be resuming advertising is not yet judged."""
+        assert (
+            judge_availability(connected=False, stack_unavailable=True, grace_remaining=12.0)
+            is AvailabilityVerdict.DEFERRED
+        )
+
+    def test_silence_past_the_grace_is_the_beds_own(self):
+        """Nothing left to excuse the silence."""
+        assert (
+            judge_availability(connected=False, stack_unavailable=True, grace_remaining=None)
+            is AvailabilityVerdict.UNAVAILABLE
+        )
+
+
+def _start(
+    *,
+    seed: Any = _SEED_DEFAULT,
+    is_connected: Callable[[], bool] | None = None,
+    clock: _FakeClock | None = None,
+) -> tuple[BleAvailabilityTracker, MagicMock, MagicMock, MagicMock, MagicMock]:
+    """Start a tracker with stubbed Bluetooth subscriptions.
+
+    Seeded from a scanner record by default: "the stack has heard this bed" is
+    the ordinary case, and an unseeded start is itself a judgement (see
+    TestNeverSeenBed).
+    """
+    if seed is _SEED_DEFAULT:
+        seed = _service_info()
+    cancel_unavailable = MagicMock()
+    cancel_advertisement = MagicMock()
+    tracker = BleAvailabilityTracker(
+        MagicMock(),
+        TEST_ADDRESS,
+        is_connected=is_connected,
+        clock=clock,
+    )
+    with (
+        patch(_LAST_SERVICE_INFO, return_value=seed),
+        patch(
+            "custom_components.adjustable_bed.ble_availability.bluetooth.async_track_unavailable",
+            return_value=cancel_unavailable,
+        ) as track_unavailable,
+        patch(
+            "custom_components.adjustable_bed.ble_availability.bluetooth.async_register_callback",
+            return_value=cancel_advertisement,
+        ) as register_callback,
+    ):
+        tracker.async_start()
+    return (
+        tracker,
+        track_unavailable,
+        register_callback,
+        cancel_unavailable,
+        cancel_advertisement,
+    )
+
+
 class TestBleAvailabilityTracker:
     """Test subscription lifecycle, transition logging, and throttling."""
 
-    def _start(
-        self,
-        *,
-        seed: SimpleNamespace | None = None,
-    ) -> tuple[BleAvailabilityTracker, MagicMock, MagicMock, MagicMock, MagicMock]:
-        """Start a tracker with stubbed Bluetooth subscriptions."""
-        cancel_unavailable = MagicMock()
-        cancel_advertisement = MagicMock()
-        tracker = BleAvailabilityTracker(MagicMock(), TEST_ADDRESS)
-        with (
-            patch(_LAST_SERVICE_INFO, return_value=seed),
-            patch(
-                "custom_components.adjustable_bed.ble_availability.bluetooth.async_track_unavailable",
-                return_value=cancel_unavailable,
-            ) as track_unavailable,
-            patch(
-                "custom_components.adjustable_bed.ble_availability.bluetooth.async_register_callback",
-                return_value=cancel_advertisement,
-            ) as register_callback,
-        ):
-            tracker.async_start()
-        return (
-            tracker,
-            track_unavailable,
-            register_callback,
-            cancel_unavailable,
-            cancel_advertisement,
-        )
-
     def test_start_registers_both_subscriptions(self):
         """Both the unavailable tracker and the advertisement callback register."""
-        tracker, track_unavailable, register_callback, _, _ = self._start()
+        tracker, track_unavailable, register_callback, _, _ = _start()
 
         assert tracker.tracking is True
         assert track_unavailable.call_count == 1
@@ -179,7 +270,7 @@ class TestBleAvailabilityTracker:
 
     def test_stop_unregisters_and_is_idempotent(self):
         """Stopping cancels both subscriptions exactly once."""
-        tracker, _, _, cancel_unavailable, cancel_advertisement = self._start()
+        tracker, _, _, cancel_unavailable, cancel_advertisement = _start()
 
         tracker.async_stop()
         tracker.async_stop()
@@ -231,7 +322,7 @@ class TestBleAvailabilityTracker:
 
     def test_start_seeds_state_from_scanner_history(self):
         """Entities get a value immediately from the existing scanner record."""
-        tracker, _, _, _, _ = self._start(seed=_service_info(age_seconds=2.0))
+        tracker, _, _, _, _ = _start(seed=_service_info(age_seconds=2.0))
 
         assert tracker.last_rssi == -71
         assert tracker.last_source == "esp32-proxy"
@@ -239,7 +330,7 @@ class TestBleAvailabilityTracker:
 
     def test_unavailable_then_seen_again_transitions(self):
         """Both transitions are recorded and notified without throttling."""
-        tracker, track_unavailable, register_callback, _, _ = self._start()
+        tracker, track_unavailable, register_callback, _, _ = _start()
         updates: list[None] = []
         tracker.async_add_listener(lambda: updates.append(None))
 
@@ -264,7 +355,7 @@ class TestBleAvailabilityTracker:
 
     def test_repeated_unavailable_counts_once(self):
         """A repeated unavailable callback is not a new transition."""
-        tracker, track_unavailable, _, _, _ = self._start()
+        tracker, track_unavailable, _, _, _ = _start()
         on_unavailable = track_unavailable.call_args.args[1]
 
         on_unavailable(_service_info())
@@ -274,7 +365,8 @@ class TestBleAvailabilityTracker:
 
     def test_advertisement_updates_are_throttled(self):
         """Advertisements notify listeners at most once per throttle interval."""
-        tracker, _, register_callback, _, _ = self._start()
+        clock = _FakeClock()
+        tracker, _, register_callback, _, _ = _start(clock=clock)
         updates: list[None] = []
         tracker.async_add_listener(lambda: updates.append(None))
         on_advertisement = register_callback.call_args.args[1]
@@ -287,17 +379,14 @@ class TestBleAvailabilityTracker:
         # writes are throttled.
         assert tracker.last_rssi == -71
 
-        with patch(
-            "custom_components.adjustable_bed.ble_availability.time.monotonic",
-            return_value=time.monotonic() + ADVERTISEMENT_UPDATE_INTERVAL + 1,
-        ):
-            on_advertisement(_service_info(), None)
+        clock.advance(ADVERTISEMENT_UPDATE_INTERVAL + 1)
+        on_advertisement(_service_info(), None)
 
         assert len(updates) == 2
 
     def test_listener_can_unregister(self):
         """The unregister callback stops further notifications."""
-        tracker, _, register_callback, _, _ = self._start()
+        tracker, _, register_callback, _, _ = _start()
         updates: list[None] = []
         unregister = tracker.async_add_listener(lambda: updates.append(None))
         on_advertisement = register_callback.call_args.args[1]
@@ -309,7 +398,7 @@ class TestBleAvailabilityTracker:
 
     def test_listener_errors_do_not_break_other_listeners(self):
         """One misbehaving listener must not suppress the rest."""
-        tracker, track_unavailable, _, _, _ = self._start()
+        tracker, track_unavailable, _, _, _ = _start()
         updates: list[None] = []
 
         def _raise() -> None:
@@ -323,12 +412,13 @@ class TestBleAvailabilityTracker:
 
     def test_unavailable_while_connected_is_suppressed(self, caplog):
         """Advertisement absence during our own connection is expected, not a problem."""
-        tracker, track_unavailable, _, _, _ = self._start()
+        connection = _FakeConnection()
+        tracker, track_unavailable, _, _, _ = _start(is_connected=connection)
         updates: list[None] = []
         tracker.async_add_listener(lambda: updates.append(None))
         on_unavailable = track_unavailable.call_args.args[1]
 
-        tracker.async_set_connected(True)
+        _connect(tracker, connection)
         on_unavailable(_service_info())
 
         assert tracker.unavailable is False
@@ -338,15 +428,16 @@ class TestBleAvailabilityTracker:
 
     def test_disconnect_with_stale_adverts_waits_for_grace(self, caplog):
         """After disconnect the bed gets the full grace window to resume advertising."""
-        tracker, track_unavailable, _, _, _ = self._start()
+        connection = _FakeConnection()
+        tracker, track_unavailable, _, _, _ = _start(
+            is_connected=connection, clock=_FakeClock()
+        )
         on_unavailable = track_unavailable.call_args.args[1]
 
-        tracker.async_set_connected(True)
+        _connect(tracker, connection)
         on_unavailable(_service_info())
-        with patch(
-            "custom_components.adjustable_bed.ble_availability.async_call_later"
-        ) as call_later:
-            tracker.async_set_connected(False)
+        with patch(_CALL_LATER) as call_later:
+            _disconnect(tracker, connection)
 
         assert call_later.call_count == 1
         assert call_later.call_args.args[1] == POST_DISCONNECT_ADVERTISEMENT_GRACE
@@ -355,17 +446,22 @@ class TestBleAvailabilityTracker:
 
     def test_grace_expiry_without_adverts_warns_once(self, caplog):
         """A bed still silent after the grace window is declared unavailable once."""
-        tracker, track_unavailable, _, _, _ = self._start()
+        clock = _FakeClock()
+        connection = _FakeConnection()
+        tracker, track_unavailable, _, _, _ = _start(
+            is_connected=connection, clock=clock
+        )
         on_unavailable = track_unavailable.call_args.args[1]
 
-        tracker.async_set_connected(True)
+        _connect(tracker, connection)
         on_unavailable(_service_info())
-        with patch(
-            "custom_components.adjustable_bed.ble_availability.async_call_later"
-        ) as call_later:
-            tracker.async_set_connected(False)
+        with patch(_CALL_LATER) as call_later:
+            _disconnect(tracker, connection)
         grace_expired = call_later.call_args.args[2]
 
+        # The timer runs on the same monotonic clock as the grace window, so it
+        # cannot fire before the window is spent.
+        clock.advance(POST_DISCONNECT_ADVERTISEMENT_GRACE)
         grace_expired(None)
 
         assert tracker.unavailable is True
@@ -378,16 +474,17 @@ class TestBleAvailabilityTracker:
 
     def test_advertisement_during_grace_cancels_judgement(self, caplog):
         """A bed that resumes advertising within the grace window stays available."""
-        tracker, track_unavailable, register_callback, _, _ = self._start()
+        connection = _FakeConnection()
+        tracker, track_unavailable, register_callback, _, _ = _start(
+            is_connected=connection
+        )
         on_unavailable = track_unavailable.call_args.args[1]
         on_advertisement = register_callback.call_args.args[1]
 
-        tracker.async_set_connected(True)
+        _connect(tracker, connection)
         on_unavailable(_service_info())
-        with patch(
-            "custom_components.adjustable_bed.ble_availability.async_call_later"
-        ) as call_later:
-            tracker.async_set_connected(False)
+        with patch(_CALL_LATER) as call_later:
+            _disconnect(tracker, connection)
             on_advertisement(_service_info(), None)
 
         assert call_later.return_value.call_count == 1  # timer cancelled
@@ -398,23 +495,29 @@ class TestBleAvailabilityTracker:
 
     def test_unavailable_shortly_after_disconnect_defers_remaining_grace(self):
         """A stack callback inside the grace window schedules the remainder."""
-        tracker, track_unavailable, _, _, _ = self._start()
+        clock = _FakeClock()
+        connection = _FakeConnection()
+        tracker, track_unavailable, _, _, _ = _start(
+            is_connected=connection, clock=clock
+        )
         on_unavailable = track_unavailable.call_args.args[1]
 
-        tracker.async_set_connected(True)
-        tracker.async_set_connected(False)
-        with patch(
-            "custom_components.adjustable_bed.ble_availability.async_call_later"
-        ) as call_later:
+        _connect(tracker, connection)
+        _disconnect(tracker, connection)
+        clock.advance(10.0)
+        with patch(_CALL_LATER) as call_later:
             on_unavailable(_service_info())
 
         assert tracker.unavailable is False
         assert call_later.call_count == 1
-        assert 0 < call_later.call_args.args[1] <= POST_DISCONNECT_ADVERTISEMENT_GRACE
+        assert call_later.call_args.args[1] == pytest.approx(
+            POST_DISCONNECT_ADVERTISEMENT_GRACE - 10.0
+        )
 
     def test_connecting_clears_declared_unavailable(self):
         """Holding the connection is proof of availability."""
-        tracker, track_unavailable, _, _, _ = self._start()
+        connection = _FakeConnection()
+        tracker, track_unavailable, _, _, _ = _start(is_connected=connection)
         updates: list[None] = []
         tracker.async_add_listener(lambda: updates.append(None))
         on_unavailable = track_unavailable.call_args.args[1]
@@ -422,7 +525,7 @@ class TestBleAvailabilityTracker:
         on_unavailable(_service_info())  # never connected: declared immediately
         assert tracker.unavailable is True
 
-        tracker.async_set_connected(True)
+        _connect(tracker, connection)
 
         assert tracker.unavailable is False
         assert tracker.diagnostics["last_available_at"] is not None
@@ -439,6 +542,136 @@ class TestBleAvailabilityTracker:
         assert diagnostics["unavailable"] is False
         assert diagnostics["last_advertisement"] is None
         assert diagnostics["current"]["seen"] is False
+
+
+class TestNeverSeenBed:
+    """Test the bed that was already off before Home Assistant started.
+
+    The stack derives disappearances from history minus discovered, so an
+    address that never entered history can never disappear and no unavailable
+    callback ever arrives. Nothing but the seed can judge this bed.
+    """
+
+    def test_start_without_a_scanner_record_declares_unavailable(self, caplog):
+        """A bed the stack has never heard is judged at startup, not ignored."""
+        tracker, _, _, _, _ = _start(seed=None)
+
+        assert tracker.unavailable is True
+        assert tracker.diagnostics["unavailable_transitions"] == 1
+        assert "has never heard an advertisement" in caplog.text
+
+    def test_the_judgement_is_reversed_by_the_first_advertisement(self):
+        """Judging early is safe because the bed can still prove itself."""
+        tracker, _, register_callback, _, _ = _start(seed=None)
+        on_advertisement = register_callback.call_args.args[1]
+        assert tracker.unavailable is True
+
+        on_advertisement(_service_info(rssi=-64, source="hci0"), None)
+
+        assert tracker.unavailable is False
+        assert tracker.last_rssi == -64
+
+    def test_a_connection_beats_the_missing_scanner_record(self):
+        """A bed we can actually connect to is not judged unavailable."""
+        connection = _FakeConnection(connected=True)
+        tracker, _, _, _, _ = _start(seed=None, is_connected=connection)
+
+        assert tracker.unavailable is False
+        assert tracker.diagnostics["unavailable_transitions"] == 0
+
+    def test_a_seen_bed_is_not_judged_at_startup(self):
+        """The control case: an existing scanner record means no verdict yet."""
+        tracker, _, _, _, _ = _start(seed=_service_info(age_seconds=2.0))
+
+        assert tracker.unavailable is False
+        assert tracker.diagnostics["unavailable_transitions"] == 0
+
+
+class TestConnectionStateIsPulled:
+    """Test that the verdict reads connection state instead of trusting a cache."""
+
+    def test_a_missed_disconnect_notification_does_not_pin_the_verdict(self):
+        """The whole point of the pull: no notification, still the right answer."""
+        connection = _FakeConnection()
+        tracker, track_unavailable, _, _, _ = _start(is_connected=connection)
+        on_unavailable = track_unavailable.call_args.args[1]
+
+        _connect(tracker, connection)
+        # The bed drops the link and the coordinator's notification never
+        # arrives; only the pullable state reflects reality.
+        connection.connected = False
+
+        on_unavailable(_service_info())
+
+        assert tracker.unavailable is True
+
+    def test_a_missed_connect_notification_does_not_declare_a_connected_bed(self):
+        """The same in reverse: a bed we hold open is never declared unavailable."""
+        connection = _FakeConnection()
+        tracker, track_unavailable, _, _, _ = _start(is_connected=connection)
+        on_unavailable = track_unavailable.call_args.args[1]
+
+        connection.connected = True  # no notification
+
+        on_unavailable(_service_info())
+
+        assert tracker.unavailable is False
+        assert tracker.diagnostics["connected"] is True
+
+    def test_connect_start_notification_does_not_stamp_a_disconnect(self):
+        """The coordinator sends False when a connect *begins*, not when one ends.
+
+        Nothing was released, so no grace window may open.
+        """
+        connection = _FakeConnection()
+        tracker, track_unavailable, _, _, _ = _start(is_connected=connection)
+        on_unavailable = track_unavailable.call_args.args[1]
+
+        # Already disconnected; the coordinator announces "connecting" as False.
+        tracker.async_connection_state_changed(False)
+
+        with patch(_CALL_LATER) as call_later:
+            on_unavailable(_service_info())
+
+        assert call_later.call_count == 0  # no grace window opened
+        assert tracker.unavailable is True
+
+    def test_connect_start_notification_does_not_defer_a_settled_verdict(self):
+        """A stale "connected" would turn the connect-start False into a reprieve.
+
+        With the connection state cached, a missed disconnect leaves the tracker
+        believing it is connected, so it suppresses the stack's callback; the
+        next connect attempt then pushes False, which the tracker reads as a
+        fresh disconnect and answers with a fresh grace window. The verdict is
+        deferred again on every attempt, exactly when repeated connect failures
+        make it most worth having.
+        """
+        connection = _FakeConnection()
+        tracker, track_unavailable, _, _, _ = _start(is_connected=connection)
+        on_unavailable = track_unavailable.call_args.args[1]
+
+        _connect(tracker, connection)
+        connection.connected = False  # the link drops; no notification arrives
+        on_unavailable(_service_info())
+        assert tracker.unavailable is True
+
+        with patch(_CALL_LATER) as call_later:
+            tracker.async_connection_state_changed(False)  # the coordinator starts a connect
+
+        assert call_later.call_count == 0
+        assert tracker.unavailable is True
+
+    def test_an_unreadable_connection_state_counts_as_disconnected(self):
+        """Best-effort: a raising coordinator must not hide an unavailable bed."""
+
+        def _boom() -> bool:
+            raise RuntimeError("coordinator gone")
+
+        tracker, track_unavailable, _, _, _ = _start(is_connected=_boom)
+        track_unavailable.call_args.args[1](_service_info())
+
+        assert tracker.unavailable is True
+
 
 
 class TestConnectionAttemptCorrelation:

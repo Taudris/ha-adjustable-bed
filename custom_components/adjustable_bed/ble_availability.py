@@ -14,6 +14,12 @@ Availability is judged from plural signals: the bed is available while this
 integration holds its connection OR while advertisements are recent. A
 single-central bed stops advertising entirely while connected, so advertisement
 absence during our own connection is expected, not an availability problem.
+The judgement itself is the pure judge_availability function; the tracker only
+supplies its inputs and reacts to the verdict.
+
+The verdict feeds logs and the diagnostics download. It deliberately does not
+gate Home Assistant entity availability: this is an on-demand-connect device
+whose entities must stay actionable so that a command can trigger a reconnect.
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Any
 
 from homeassistant.components import bluetooth
@@ -66,6 +73,37 @@ ADVERTISEMENT_UPDATE_INTERVAL = 30.0
 # blamed on the bed. One minute is ample for that, and is deliberately its own
 # number rather than a multiple of anything else in this module.
 POST_DISCONNECT_ADVERTISEMENT_GRACE = 60.0
+
+
+class AvailabilityVerdict(StrEnum):
+    """What the availability inputs say about the bed at one instant."""
+
+    AVAILABLE = "available"
+    DEFERRED = "deferred"
+    UNAVAILABLE = "unavailable"
+
+
+def judge_availability(
+    *,
+    connected: bool,
+    stack_unavailable: bool,
+    grace_remaining: float | None,
+) -> AvailabilityVerdict:
+    """Return the availability verdict for one set of inputs.
+
+    Pure and total: the entire judgement is these three inputs, which is what
+    makes it testable on its own and dumpable straight into diagnostics.
+
+    Holding the connection, or the stack still hearing advertisements, means
+    available. Silence inside the post-disconnect grace is deferred rather than
+    decided, because the bed may still be resuming its advertising after we
+    released it. Silence past the grace is the bed's own.
+    """
+    if connected or not stack_unavailable:
+        return AvailabilityVerdict.AVAILABLE
+    if grace_remaining is not None:
+        return AvailabilityVerdict.DEFERRED
+    return AvailabilityVerdict.UNAVAILABLE
 
 
 @dataclass(frozen=True)
@@ -163,14 +201,38 @@ class BleAvailabilityTracker:
     here rather than each polling the Bluetooth stack themselves.
     """
 
-    def __init__(self, hass: HomeAssistant, address: str) -> None:
-        """Initialize the tracker for a configured address."""
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        address: str,
+        *,
+        is_connected: Callable[[], bool] | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        """Initialize the tracker for a configured address.
+
+        ``is_connected`` is read at decision time to answer "do we hold this
+        bed's connection right now". It is a pull rather than a pushed cache on
+        purpose: a cache would need "every connect notification is eventually
+        followed by a disconnect notification" to hold across every call site,
+        and a single missed disconnect would pin the verdict to available
+        forever. Omitting it means the tracker judges as if never connected.
+
+        ``clock`` is this tracker's own monotonic source, used for the grace
+        window and the listener throttle. It is deliberately *not* used for
+        advertisement ages: those are differences against the Bluetooth stack's
+        timestamps and must stay on the real monotonic clock.
+        """
         self.hass = hass
         self._address = address.upper()
+        self._is_connected = is_connected
+        self._clock = clock if clock is not None else time.monotonic
         self._cancel_callbacks: list[Callable[[], None]] = []
         self._listeners: set[Callable[[], None]] = set()
         self._unavailable = False
-        self._connected = False
+        # Edge detection for the disconnect stamp only. Never a decision input:
+        # see _connected_now.
+        self._connection_observed = False
         self._stack_unavailable = False
         self._last_disconnect_monotonic: float | None = None
         self._cancel_grace: Callable[[], None] | None = None
@@ -192,8 +254,10 @@ class BleAvailabilityTracker:
         """Return True when the bed is judged genuinely unavailable.
 
         Judged, not raw: we do not hold its connection AND advertisements
-        stayed absent past the post-disconnect grace. Never True while this
-        integration is connected to the bed.
+        stayed absent past the post-disconnect grace. This is the last verdict
+        that was logged and published to listeners, so it changes only on the
+        events that produce those - see judge_availability for the judgement
+        itself, and the "decision" block in diagnostics for its live inputs.
         """
         return self._unavailable
 
@@ -255,8 +319,23 @@ class BleAvailabilityTracker:
             self._cancel_callbacks.pop()()
 
     @callback
-    def async_set_connected(self, connected: bool) -> None:
-        """Record whether this integration itself holds the bed's connection.
+    def async_connection_state_changed(self, connected: bool) -> None:
+        """Re-read the connection state after the coordinator reports a change.
+
+        The pushed value is a wake-up, not the state: the coordinator also
+        sends False at the *start* of a connect attempt so the connectivity
+        sensor can show a connecting state. Taking that at face value would
+        stamp a disconnect that never happened and re-arm the grace window on
+        every attempt, deferring the verdict exactly when repeated connect
+        failures make it most worth having. Reading the coordinator instead
+        makes the tracker see only real edges.
+        """
+        del connected  # A hint that state may have changed, not the state
+        self._async_sync_connection_state()
+
+    @callback
+    def _async_sync_connection_state(self) -> None:
+        """Act on a change in whether we hold the bed's connection.
 
         The bed stops advertising while connected, so the tracker must know
         when advertisement absence is our own doing: while connected it is
@@ -264,9 +343,10 @@ class BleAvailabilityTracker:
         POST_DISCONNECT_ADVERTISEMENT_GRACE to resume advertising before
         absence counts against it.
         """
-        if connected == self._connected:
+        connected = self._connected_now()
+        if connected == self._connection_observed:
             return
-        self._connected = connected
+        self._connection_observed = connected
 
         if connected:
             self._async_cancel_grace()
@@ -281,12 +361,26 @@ class BleAvailabilityTracker:
                 self._async_notify_listeners()
             return
 
-        self._last_disconnect_monotonic = time.monotonic()
-        if self._stack_unavailable:
-            # The stack stopped seeing advertisements while we held the
-            # connection (expected, and suppressed at the time). Re-judge once
-            # the bed has had time to resume advertising.
-            self._async_schedule_grace_check(POST_DISCONNECT_ADVERTISEMENT_GRACE)
+        self._last_disconnect_monotonic = self._clock()
+        # The stack may have stopped seeing advertisements while we held the
+        # connection (expected, and suppressed at the time). Re-judge now that
+        # the grace window has started.
+        self._async_reevaluate()
+
+    def _connected_now(self) -> bool:
+        """Return whether this integration holds the bed's connection right now.
+
+        Best-effort like the rest of the module: an unreadable coordinator
+        counts as not connected, which errs toward reporting a problem rather
+        than hiding one.
+        """
+        if self._is_connected is None:
+            return False
+        try:
+            return bool(self._is_connected())
+        except Exception as err:
+            _LOGGER.debug("Could not read connection state for %s: %s", self._address, err)
+            return False
 
     @callback
     def async_add_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
@@ -309,7 +403,7 @@ class BleAvailabilityTracker:
         return {
             "tracking": self.tracking,
             "unavailable": self._unavailable,
-            "connected": self._connected,
+            "connected": self._connected_now(),
             "stack_unavailable": self._stack_unavailable,
             "unavailable_transitions": self._unavailable_transitions,
             "last_advertisement": (
@@ -332,9 +426,21 @@ class BleAvailabilityTracker:
 
         Without this, both diagnostic sensors stay unknown until the next
         advertisement, which for a slowly-advertising bed can be minutes.
+
+        A bed the stack has no record of at all is judged here and now, because
+        the stack will never judge it for us: it derives disappearances from
+        history minus discovered, so an address that was never in history can
+        never disappear and no unavailable callback will ever arrive. Without
+        this, a bed powered off before Home Assistant started would be reported
+        available forever. Judging early is safe - the verdict only feeds logs
+        and diagnostics, and the first advertisement clears it.
         """
         telemetry = self.telemetry
-        if not telemetry.seen or telemetry.age_seconds is None:
+        if not telemetry.seen:
+            self._stack_unavailable = True
+            self._async_reevaluate()
+            return
+        if telemetry.age_seconds is None:
             return
         self._last_advertisement = datetime.now(UTC) - timedelta(seconds=telemetry.age_seconds)
         self._last_rssi = telemetry.rssi
@@ -375,32 +481,46 @@ class BleAvailabilityTracker:
         """Judge advertisement absence against our own connection state."""
         del service_info  # The last-known advertisement is already recorded
         self._stack_unavailable = True
+        self._async_reevaluate()
+
+    @callback
+    def _async_reevaluate(self) -> None:
+        """Re-judge availability and act on the verdict.
+
+        Every path that can change one of the three judgement inputs ends here,
+        so the verdict cannot diverge between the stack callback, the grace
+        timer, and our own connection state.
+        """
         if self._unavailable:
             return
 
-        if self._connected:
+        connected = self._connected_now()
+        grace_remaining = self._grace_remaining()
+        verdict = judge_availability(
+            connected=connected,
+            stack_unavailable=self._stack_unavailable,
+            grace_remaining=grace_remaining,
+        )
+
+        if verdict is AvailabilityVerdict.UNAVAILABLE:
+            self._async_declare_unavailable()
+        elif verdict is AvailabilityVerdict.DEFERRED and grace_remaining is not None:
+            # We disconnected moments ago; give the bed the rest of the grace
+            # window to resume advertising before judging it gone.
+            self._async_schedule_grace_check(grace_remaining)
+        elif connected and self._stack_unavailable:
             # Expected: the bed cannot advertise while we hold its connection.
             _LOGGER.debug(
                 "Bed %s stopped advertising while this integration holds its "
                 "connection; expected, not an availability problem",
                 self._address,
             )
-            return
-
-        remaining_grace = self._grace_remaining()
-        if remaining_grace is not None:
-            # We disconnected moments ago; give the bed the rest of the grace
-            # window to resume advertising before judging it gone.
-            self._async_schedule_grace_check(remaining_grace)
-            return
-
-        self._async_declare_unavailable()
 
     def _grace_remaining(self) -> float | None:
         """Return seconds left in the post-disconnect grace window, if any."""
         if self._last_disconnect_monotonic is None:
             return None
-        elapsed = time.monotonic() - self._last_disconnect_monotonic
+        elapsed = self._clock() - self._last_disconnect_monotonic
         remaining = POST_DISCONNECT_ADVERTISEMENT_GRACE - elapsed
         return remaining if remaining > 0 else None
 
@@ -420,11 +540,14 @@ class BleAvailabilityTracker:
 
     @callback
     def _async_grace_expired(self, _fired_at: datetime) -> None:
-        """Declare the bed unavailable if it never resumed advertising."""
+        """Re-judge once the post-disconnect grace window has elapsed.
+
+        The timer runs on the event loop's monotonic clock, the same one the
+        grace window is measured against, so by the time this fires
+        _grace_remaining() has already gone to None.
+        """
         self._cancel_grace = None
-        if self._connected or not self._stack_unavailable:
-            return
-        self._async_declare_unavailable()
+        self._async_reevaluate()
 
     @callback
     def _async_declare_unavailable(self) -> None:
@@ -435,21 +558,29 @@ class BleAvailabilityTracker:
         self._unavailable = True
         self._unavailable_transitions += 1
         self._last_unavailable_at = datetime.now(UTC)
-        _LOGGER.info(
-            "Home Assistant no longer sees advertisements from bed %s "
-            "(last advertisement %s via %s at %s dBm). The bed may be powered off, out of "
-            "range, or holding a connection to another device",
-            self._address,
-            self._last_advertisement.isoformat() if self._last_advertisement else "never",
-            self._last_source or "unknown",
-            self._last_rssi if self._last_rssi is not None else "unknown",
-        )
+        if self._last_advertisement is None:
+            _LOGGER.info(
+                "Home Assistant has never heard an advertisement from bed %s. The bed "
+                "may be powered off, out of range, or holding a connection to another "
+                "device",
+                self._address,
+            )
+        else:
+            _LOGGER.info(
+                "Home Assistant no longer sees advertisements from bed %s "
+                "(last advertisement %s via %s at %s dBm). The bed may be powered off, out of "
+                "range, or holding a connection to another device",
+                self._address,
+                self._last_advertisement.isoformat(),
+                self._last_source or "unknown",
+                self._last_rssi if self._last_rssi is not None else "unknown",
+            )
         self._async_notify_listeners()
 
     @callback
     def _async_notify_listeners_throttled(self) -> None:
         """Notify listeners at most once per ADVERTISEMENT_UPDATE_INTERVAL."""
-        now = time.monotonic()
+        now = self._clock()
         if (
             self._last_listener_notify is not None
             and now - self._last_listener_notify < ADVERTISEMENT_UPDATE_INTERVAL
@@ -460,7 +591,7 @@ class BleAvailabilityTracker:
     @callback
     def _async_notify_listeners(self, *, now: float | None = None) -> None:
         """Notify listeners immediately, restarting the throttle window."""
-        self._last_listener_notify = time.monotonic() if now is None else now
+        self._last_listener_notify = self._clock() if now is None else now
         for listener in list(self._listeners):
             try:
                 listener()
