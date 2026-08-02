@@ -217,6 +217,64 @@ class TestLeggettOkinController:
         assert release_call.kwargs["repeat_count"] == 4
         assert release_call.kwargs["cancel_event"].is_set() is False
 
+    async def test_an_unknown_motor_raises_before_any_frame(self):
+        """An unroutable motor name must fail loudly, not stream release frames.
+
+        Its combined keycode is 0, and 0 is the release frame on this protocol,
+        so streaming it would push stop frames for the whole safety cap while
+        reporting success. The name comes from this module's own move_* methods,
+        so a miss is a programming error and belongs in the caller's face.
+        """
+        controller = _streaming_okin_controller()
+
+        with pytest.raises(ValueError, match="Unknown Leggett Okin motor: 'neck'"):
+            await controller._move_motor("neck", leggett_okin_module.MotorDirection.UP)
+
+        controller.write_command.assert_not_awaited()
+        assert controller._motor_state == {}
+
+    async def test_stop_stays_silent_for_any_motor_name(self):
+        """A stop asserts no keycode, so its name cannot be wrong enough to matter.
+
+        Stop clears the held state and sends the release burst whatever motor
+        it names; refusing to stop the bed over a label would be the worse
+        failure.
+        """
+        controller = _streaming_okin_controller()
+
+        await controller._move_motor("neck", leggett_okin_module.MotorDirection.STOP)
+
+        controller.write_command.assert_awaited_once()
+        assert controller.write_command.await_args.args == (ZERO_FRAME,)
+
+    async def test_every_movement_method_names_a_known_motor(self):
+        """The keycode table has to cover every motor the move_* methods use.
+
+        The raise only helps if it can never fire for shipped code, so drive
+        each movement entry point and assert none of them is unroutable.
+        """
+        for method in (
+            "move_head_up",
+            "move_head_down",
+            "move_legs_up",
+            "move_legs_down",
+            "move_feet_up",
+            "move_feet_down",
+            "move_back_up",
+            "move_back_down",
+            "move_tilt_up",
+            "move_tilt_down",
+            "move_lumbar_up",
+            "move_lumbar_down",
+        ):
+            controller = _streaming_okin_controller()
+            controller._coordinator.cancel_command.is_set.return_value = True
+
+            await getattr(controller, method)()
+
+            frame = controller.write_command.await_args.args[0]
+            assert frame != ZERO_FRAME, f"{method} streamed the release frame"
+
     async def test_preempted_hold_hands_off_without_zeros(self):
         """A hold preempted by the next command must not send release frames.
 

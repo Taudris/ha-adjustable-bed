@@ -203,26 +203,38 @@ class LeggettOkinController(BedController):
         """
         return build_okin_command(command_value)
 
+    # The motors this frame carries, and the keycode each direction asserts.
+    # This table is what "a known motor" means here: _move_motor rejects any
+    # name it does not list, so _motor_state can only ever hold these.
+    _MOTOR_KEYCODES: dict[str, dict[MotorDirection, int]] = {
+        "head": {
+            MotorDirection.UP: LeggettOkinCommands.MOTOR_HEAD_UP,
+            MotorDirection.DOWN: LeggettOkinCommands.MOTOR_HEAD_DOWN,
+        },
+        "feet": {
+            MotorDirection.UP: LeggettOkinCommands.MOTOR_FEET_UP,
+            MotorDirection.DOWN: LeggettOkinCommands.MOTOR_FEET_DOWN,
+        },
+        "tilt": {
+            MotorDirection.UP: LeggettOkinCommands.MOTOR_TILT_UP,
+            MotorDirection.DOWN: LeggettOkinCommands.MOTOR_TILT_DOWN,
+        },
+        "lumbar": {
+            MotorDirection.UP: LeggettOkinCommands.MOTOR_LUMBAR_UP,
+            MotorDirection.DOWN: LeggettOkinCommands.MOTOR_LUMBAR_DOWN,
+        },
+    }
+
     def _get_move_command(self) -> int:
-        """Calculate the combined motor movement command."""
+        """Combine the currently held motor keycodes into one frame.
+
+        No motors held is the resting state, not an error: it yields 0, which
+        is this protocol's release frame, and that is exactly what the stop
+        path has already cleared the state to mean.
+        """
         command = 0
-        state = self._motor_state
-        if state.get("head") == MotorDirection.UP:
-            command += LeggettOkinCommands.MOTOR_HEAD_UP
-        elif state.get("head") == MotorDirection.DOWN:
-            command += LeggettOkinCommands.MOTOR_HEAD_DOWN
-        if state.get("feet") == MotorDirection.UP:
-            command += LeggettOkinCommands.MOTOR_FEET_UP
-        elif state.get("feet") == MotorDirection.DOWN:
-            command += LeggettOkinCommands.MOTOR_FEET_DOWN
-        if state.get("tilt") == MotorDirection.UP:
-            command += LeggettOkinCommands.MOTOR_TILT_UP
-        elif state.get("tilt") == MotorDirection.DOWN:
-            command += LeggettOkinCommands.MOTOR_TILT_DOWN
-        if state.get("lumbar") == MotorDirection.UP:
-            command += LeggettOkinCommands.MOTOR_LUMBAR_UP
-        elif state.get("lumbar") == MotorDirection.DOWN:
-            command += LeggettOkinCommands.MOTOR_LUMBAR_DOWN
+        for motor, direction in self._motor_state.items():
+            command |= self._MOTOR_KEYCODES[motor][direction]
         return command
 
     async def _move_motor(self, motor: str, direction: MotorDirection) -> None:
@@ -233,10 +245,26 @@ class LeggettOkinController(BedController):
         with it, and a stop ends the active hold whichever motor it names
         (the preempted hold's stream is already gone by the time the stop
         runs, so re-streaming a different motor here would restart it).
+
+        A motor name absent from ``_MOTOR_KEYCODES`` is a wiring mistake in
+        this module, not a device condition, so it raises before the state is
+        recorded and before a single frame goes out. Its keycode would be 0,
+        and 0 is the release frame: the stream would push stop frames for the
+        full hold cap rather than doing nothing. The stop branch needs no such
+        check - it asserts no keycode, the name only labels a log line, and a
+        stop must reach the bed whatever it is called.
+
+        Raises:
+            ValueError: If ``motor`` is not one of this bed's motors.
         """
         if direction == MotorDirection.STOP:
             await self._stop_movement(f"{motor} stop")
             return
+        if motor not in self._MOTOR_KEYCODES:
+            raise ValueError(
+                f"Unknown Leggett Okin motor: {motor!r}; "
+                f"expected one of {sorted(self._MOTOR_KEYCODES)}"
+            )
         self._motor_state = {motor: direction}
         await self._stream_movement(self._get_move_command())
 
