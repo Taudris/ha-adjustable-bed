@@ -30,6 +30,7 @@ from ..const import (
     POSITION_TOLERANCE,
 )
 from ..diagnostic_payloads import format_payload
+from ..diagnostics_utils import STREAM_GAP_WATCHDOG_MS, summarize_stream_gaps
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -456,6 +457,7 @@ class BedController(ABC):
         cancel_event: asyncio.Event | None = None,
         response: bool = True,
         log_errors: bool = True,
+        pace_to_cadence: bool = False,
     ) -> None:
         """Write a command to a GATT characteristic with retry support.
 
@@ -478,6 +480,17 @@ class BedController(ABC):
             log_errors: Whether to log BleakError failures at ERROR level.
                      Set to False for callers that recover from expected errors
                      (e.g. Linak's post-connect auth-window probes).
+            pace_to_cadence: Treat repeat_delay_ms as a target send cadence
+                     instead of a post-response sleep. Write k is scheduled at
+                     loop start + k * repeat_delay_ms: after each response the
+                     loop sleeps only the remainder to the next tick, so the
+                     write round trip is absorbed into the interval rather
+                     than added to it. A response arriving past its tick sends
+                     the next write immediately. Paced streams also measure
+                     the gap between consecutive frames, warn once if one
+                     exceeds the keep-alive window, and file a histogram of
+                     the gaps in diagnostics.
+                     False (the default) keeps the historical fixed sleep.
 
         Raises:
             ConnectionError: If not connected to the bed
@@ -529,38 +542,119 @@ class BedController(ABC):
                 controller_class=type(self).__name__,
             )
 
-        for i in range(repeat_count):
-            if effective_cancel is not None and effective_cancel.is_set():
-                _LOGGER.debug("Command cancelled after %d/%d writes", i, repeat_count)
-                return
+        # Cadence clock for pace_to_cadence: tick k is stream_start +
+        # k * repeat_delay_ms, fixed at loop entry so overruns never shift
+        # later ticks.
+        clock = asyncio.get_running_loop().time
+        stream_start = clock()
+        gaps_ms: list[float] = []
+        previous_frame_at: float | None = None
+        gap_warned = False
 
-            try:
-                client = self.client
-                if client is None or not client.is_connected:
-                    _LOGGER.error("Cannot write command: BLE client disconnected during write")
-                    raise ConnectionError("Not connected to bed")
-                # Acquire BLE lock for each individual write to prevent conflicts
-                # with concurrent position reads during movement
-                async with self._ble_lock:
-                    await client.write_gatt_char(char_uuid, command, response=response)
-            except BleakError:
-                if log_errors:
-                    _LOGGER.exception(
-                        "Failed to write command %s to %s",
-                        logged_command,
-                        char_uuid,
-                    )
-                else:
-                    _LOGGER.debug(
-                        "Suppressed write failure for %s to %s",
-                        logged_command,
-                        char_uuid,
-                        exc_info=True,
-                    )
-                raise
+        try:
+            for i in range(repeat_count):
+                if effective_cancel is not None and effective_cancel.is_set():
+                    _LOGGER.debug("Command cancelled after %d/%d writes", i, repeat_count)
+                    return
 
-            if i < repeat_count - 1:
-                await asyncio.sleep(repeat_delay_ms / 1000)
+                try:
+                    client = self.client
+                    if client is None or not client.is_connected:
+                        _LOGGER.error("Cannot write command: BLE client disconnected during write")
+                        raise ConnectionError("Not connected to bed")
+                    # Acquire BLE lock for each individual write to prevent conflicts
+                    # with concurrent position reads during movement
+                    async with self._ble_lock:
+                        await client.write_gatt_char(char_uuid, command, response=response)
+                except BleakError:
+                    if log_errors:
+                        _LOGGER.exception(
+                            "Failed to write command %s to %s",
+                            logged_command,
+                            char_uuid,
+                        )
+                    else:
+                        _LOGGER.debug(
+                            "Suppressed write failure for %s to %s",
+                            logged_command,
+                            char_uuid,
+                            exc_info=True,
+                        )
+                    raise
+
+                if pace_to_cadence:
+                    frame_at = clock()
+                    if previous_frame_at is not None:
+                        gap_ms = (frame_at - previous_frame_at) * 1000
+                        gaps_ms.append(gap_ms)
+                        gap_warned = self._note_stream_gap(gap_ms, gap_warned)
+                    previous_frame_at = frame_at
+
+                if i < repeat_count - 1:
+                    if pace_to_cadence:
+                        remainder = stream_start + (i + 1) * (repeat_delay_ms / 1000) - clock()
+                        if remainder > 0:
+                            await asyncio.sleep(remainder)
+                        # Otherwise the round trip already ran past the tick, so
+                        # the next frame goes out immediately. The gap it
+                        # produces is measured above; nothing is logged per
+                        # frame, because the drift from the original schedule
+                        # accumulates and the bed does not care about it.
+                    else:
+                        await asyncio.sleep(repeat_delay_ms / 1000)
+        finally:
+            if pace_to_cadence:
+                self._report_stream_cadence(char_uuid, repeat_delay_ms, gaps_ms)
+
+    def _note_stream_gap(self, gap_ms: float, already_warned: bool) -> bool:
+        """Warn once per stream that the keep-alive window was missed.
+
+        One line is enough to tell a user why the bed stuttered; the rest of
+        the story is the histogram in the diagnostics package, which is where a
+        per-frame log would have belonged in the first place.
+        """
+        if already_warned or gap_ms <= STREAM_GAP_WATCHDOG_MS:
+            return already_warned
+        _LOGGER.warning(
+            "Frame gap of %.0f ms on %s exceeded the %d ms keep-alive window; "
+            "the bed may stutter. Further gaps in this stream are counted in "
+            "diagnostics rather than logged",
+            gap_ms,
+            self._coordinator.address,
+            STREAM_GAP_WATCHDOG_MS,
+        )
+        return True
+
+    def _report_stream_cadence(
+        self, char_uuid: str, cadence_ms: int, gaps_ms: list[float]
+    ) -> None:
+        """Summarize one paced stream, for the log and for diagnostics.
+
+        Called however the stream ended - cancelled, capped or failed - because
+        a stream that died early is exactly the one whose cadence is worth
+        reading. A single-frame stream has no gaps and nothing to say.
+        """
+        if not gaps_ms:
+            return
+        summary = summarize_stream_gaps(gaps_ms)
+        self._coordinator.record_stream_cadence(
+            characteristic_uuid=char_uuid,
+            controller_class=type(self).__name__,
+            target_cadence_ms=cadence_ms,
+            summary=summary,
+        )
+        _LOGGER.log(
+            logging.WARNING if summary["breaches"] else logging.DEBUG,
+            "Stream of %d frames at a %d ms cadence: %d/%d gaps over %d ms, "
+            "median %.0f ms, max %.0f ms",
+            len(gaps_ms) + 1,
+            cadence_ms,
+            summary["breaches"],
+            summary["gap_count"],
+            summary["breach_threshold_ms"],
+            summary["median_gap_ms"],
+            summary["max_gap_ms"],
+        )
 
     async def write_command(
         self,
@@ -596,6 +690,46 @@ class BedController(ABC):
             repeat_delay_ms=repeat_delay_ms,
             cancel_event=cancel_event,
             response=self._write_with_response,
+        )
+
+    async def write_command_paced(
+        self,
+        command: bytes,
+        *,
+        repeat_count: int,
+        cadence_ms: int,
+        cancel_event: asyncio.Event | None = None,
+    ) -> None:
+        """Stream a command with repeats scheduled on a cadence clock.
+
+        write_command sleeps ``repeat_delay_ms`` after each write response, so
+        its real period is response round trip + delay. This variant schedules
+        write k at stream start + k * ``cadence_ms`` and sleeps only the
+        remainder after each response; a response arriving past its tick sends
+        the next write immediately. Use it for keycode streams where a
+        control-box keep-alive watchdog bounds the inter-frame gap, so the gap
+        must not grow with link latency.
+
+        The achieved gaps are measured and summarized: one warning the first
+        time a stream misses the keep-alive window, one summary line when it
+        ends, and a bucketed histogram in the diagnostics package.
+
+        Cancellation semantics are identical to write_command: the cancel
+        event (the coordinator's when none is given) is checked before every
+        write, and CancelledError propagates from any await point.
+
+        Raises:
+            ConnectionError: If not connected to the bed
+            BleakError: If the GATT write fails
+        """
+        await self._write_gatt_with_retry(
+            self.control_characteristic_uuid,
+            command,
+            repeat_count=repeat_count,
+            repeat_delay_ms=cadence_ms,
+            cancel_event=cancel_event,
+            response=self._write_with_response,
+            pace_to_cadence=True,
         )
 
     async def start_notify(self, callback: Callable[[str, float], None] | None = None) -> None:
