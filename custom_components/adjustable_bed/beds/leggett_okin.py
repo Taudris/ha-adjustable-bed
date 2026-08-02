@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING
 from bleak.exc import BleakError
 
 from ..const import LEGGETT_OKIN_CHAR_UUID, LEGGETT_OKIN_NOTIFY_CHAR_UUID
-from .base import BedController
+from .base import BedController, MotorControlSpec
 from .okin_protocol import build_okin_command
 
 if TYPE_CHECKING:
@@ -61,13 +61,15 @@ class LeggettOkinCommands:
     # recall: sending it alone and then a slot code reprograms that slot.
     MEMORY_STORE = 0x10000
 
-    # Motor controls
+    # Motor controls. The frame has exactly these four motors, and the physical
+    # remote labels its sections HEAD, PILLOW, LUMBAR, FOOT - the app's slider
+    # tags carry the same keycodes.
     MOTOR_HEAD_UP = 0x1
     MOTOR_HEAD_DOWN = 0x2
     MOTOR_FEET_UP = 0x4
     MOTOR_FEET_DOWN = 0x8
-    MOTOR_TILT_UP = 0x10
-    MOTOR_TILT_DOWN = 0x20
+    MOTOR_PILLOW_UP = 0x10
+    MOTOR_PILLOW_DOWN = 0x20
     MOTOR_LUMBAR_UP = 0x40
     MOTOR_LUMBAR_DOWN = 0x80
 
@@ -224,14 +226,72 @@ class LeggettOkinController(BedController):
         return True
 
     @property
-    def has_tilt_support(self) -> bool:
-        """Return True - Okin beds have tilt (pillow) motor control."""
+    def has_pillow_support(self) -> bool:
+        """Return True - Okin beds have a pillow motor (0x10/0x20)."""
         return True
 
     @property
     def has_lumbar_support(self) -> bool:
         """Return True - Okin beds have lumbar motor control."""
         return True
+
+    @property
+    def motor_control_specs(self) -> tuple[MotorControlSpec, ...]:
+        """Expose the four motors this frame has, in remote order.
+
+        The base layout is Linak-shaped: back and legs unconditionally, head and
+        feet gated on motor_count, plus whatever the has_*_support flags add. On
+        this protocol that produced six covers for four motors, because
+        move_back_* and move_legs_* are pure aliases of move_head_* and
+        move_feet_*: "back" duplicated "head" (0x1/0x2), "legs" duplicated
+        "feet" (0x4/0x8), and the pillow motor (0x10/0x20) was labelled "tilt".
+
+        motor_count is deliberately not consulted. Every frame on this protocol
+        drives all four keycodes, and the count is a user-entered value that
+        cannot tell us otherwise.
+        """
+        return (
+            MotorControlSpec(
+                key="head",
+                translation_key="head",
+                open_fn=lambda ctrl: ctrl.move_head_up(),
+                close_fn=lambda ctrl: ctrl.move_head_down(),
+                stop_fn=lambda ctrl: ctrl.move_head_stop(),
+            ),
+            MotorControlSpec(
+                key="pillow",
+                translation_key="pillow",
+                open_fn=lambda ctrl: ctrl.move_pillow_up(),
+                close_fn=lambda ctrl: ctrl.move_pillow_down(),
+                stop_fn=lambda ctrl: ctrl.move_pillow_stop(),
+            ),
+            MotorControlSpec(
+                key="lumbar",
+                translation_key="lumbar",
+                open_fn=lambda ctrl: ctrl.move_lumbar_up(),
+                close_fn=lambda ctrl: ctrl.move_lumbar_down(),
+                stop_fn=lambda ctrl: ctrl.move_lumbar_stop(),
+                max_angle=30,
+            ),
+            MotorControlSpec(
+                key="feet",
+                translation_key="feet",
+                open_fn=lambda ctrl: ctrl.move_feet_up(),
+                close_fn=lambda ctrl: ctrl.move_feet_down(),
+                stop_fn=lambda ctrl: ctrl.move_feet_stop(),
+                max_angle=45,
+            ),
+        )
+
+    @property
+    def stale_motor_entity_keys(self) -> frozenset[str]:
+        """Remove the duplicate back/legs covers and the mislabelled tilt cover.
+
+        Without this the three orphaned registry entries survive the upgrade as
+        permanently unavailable "restored" entities that only the user can
+        delete.
+        """
+        return frozenset({"back", "legs", "tilt"})
 
     def _build_command(self, command_value: int) -> bytes:
         """Build Okin binary command by delegating to build_okin_command.
@@ -256,9 +316,9 @@ class LeggettOkinController(BedController):
             MotorDirection.UP: LeggettOkinCommands.MOTOR_FEET_UP,
             MotorDirection.DOWN: LeggettOkinCommands.MOTOR_FEET_DOWN,
         },
-        "tilt": {
-            MotorDirection.UP: LeggettOkinCommands.MOTOR_TILT_UP,
-            MotorDirection.DOWN: LeggettOkinCommands.MOTOR_TILT_DOWN,
+        "pillow": {
+            MotorDirection.UP: LeggettOkinCommands.MOTOR_PILLOW_UP,
+            MotorDirection.DOWN: LeggettOkinCommands.MOTOR_PILLOW_DOWN,
         },
         "lumbar": {
             MotorDirection.UP: LeggettOkinCommands.MOTOR_LUMBAR_UP,
@@ -758,17 +818,17 @@ class LeggettOkinController(BedController):
         """Step through massage wave patterns."""
         await self._tap_keycode(LeggettOkinCommands.MASSAGE_WAVE_STEP, "massage_wave_step")
 
-    # Tilt motor control
-    async def move_tilt_up(self) -> None:
-        """Move tilt (pillow) motor up."""
-        await self._move_motor("tilt", MotorDirection.UP)
+    # Pillow motor control
+    async def move_pillow_up(self) -> None:
+        """Move pillow motor up."""
+        await self._move_motor("pillow", MotorDirection.UP)
 
-    async def move_tilt_down(self) -> None:
-        """Move tilt (pillow) motor down."""
-        await self._move_motor("tilt", MotorDirection.DOWN)
+    async def move_pillow_down(self) -> None:
+        """Move pillow motor down."""
+        await self._move_motor("pillow", MotorDirection.DOWN)
 
-    async def move_tilt_stop(self) -> None:
-        """Stop tilt motor."""
+    async def move_pillow_stop(self) -> None:
+        """Stop pillow motor."""
         await self._move_motor(None, MotorDirection.STOP)
 
     # Lumbar motor control

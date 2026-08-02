@@ -18,6 +18,8 @@ from custom_components.adjustable_bed.const import (
     BED_TYPE_BEDTECH,
     BED_TYPE_KAIDI,
     BED_TYPE_LEGGETT_GEN2,
+    BED_TYPE_LEGGETT_OKIN,
+    BED_TYPE_LINAK,
     BED_TYPE_MALOUF_LEGACY_OKIN,
     BED_TYPE_MALOUF_NEW_OKIN,
     BED_TYPE_MOTOSLEEP,
@@ -377,6 +379,129 @@ class TestCoverEntities:
 
         assert registry.async_get_entity_id("cover", DOMAIN, "AA:BB:CC:DD:EE:26_back") is None
         assert registry.async_get_entity_id("cover", DOMAIN, "AA:BB:CC:DD:EE:26_legs") is None
+
+    @staticmethod
+    def _leggett_okin_entry(hass: HomeAssistant, address: str, entry_id: str) -> MockConfigEntry:
+        """Return a Leggett & Platt Okin entry added to hass."""
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="L&P Okin Bed",
+            data={
+                CONF_ADDRESS: address,
+                CONF_NAME: "L&P Okin Bed",
+                CONF_BED_TYPE: BED_TYPE_LEGGETT_OKIN,
+                CONF_MOTOR_COUNT: 4,
+                CONF_HAS_MASSAGE: True,
+                CONF_DISABLE_ANGLE_SENSING: True,
+                CONF_PREFERRED_ADAPTER: "auto",
+            },
+            unique_id=address,
+            entry_id=entry_id,
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    async def test_leggett_okin_exposes_only_its_four_motors(
+        self,
+        hass: HomeAssistant,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """The frame has four motors, so it gets four covers - not six.
+
+        move_back_*/move_legs_* are aliases of move_head_*/move_feet_* on this
+        protocol, so the base layout duplicated both and labelled the pillow
+        motor "tilt".
+        """
+        address = "AA:BB:CC:DD:EE:70"
+        entry = self._leggett_okin_entry(hass, address, "leggett_okin_cover_entry")
+
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        from homeassistant.helpers import entity_registry as er
+
+        registry = er.async_get(hass)
+        covers = {
+            registry.async_get(entity_id).unique_id.removeprefix(f"{address}_")
+            for entity_id in (
+                state.entity_id
+                for state in hass.states.async_all()
+                if state.entity_id.startswith("cover.")
+            )
+        }
+
+        assert covers == {"head", "pillow", "lumbar", "feet"}
+
+    async def test_leggett_okin_setup_removes_the_duplicate_and_tilt_covers(
+        self,
+        hass: HomeAssistant,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """Upgrading removes the orphans rather than leaving them unavailable."""
+        address = "AA:BB:CC:DD:EE:71"
+        entry = self._leggett_okin_entry(hass, address, "leggett_okin_stale_cover_entry")
+
+        from homeassistant.helpers import entity_registry as er
+
+        registry = er.async_get(hass)
+        for key in ("back", "legs", "tilt"):
+            registry.async_get_or_create(
+                "cover",
+                DOMAIN,
+                f"{address}_{key}",
+                config_entry=entry,
+                suggested_object_id=f"lp_okin_bed_{key}",
+            )
+
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        for key in ("back", "legs", "tilt"):
+            assert registry.async_get_entity_id("cover", DOMAIN, f"{address}_{key}") is None
+
+    async def test_four_motor_linak_keeps_the_standard_layout(
+        self,
+        hass: HomeAssistant,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """Beds on the base layout are untouched by the Leggett Okin override."""
+        address = "AA:BB:CC:DD:EE:72"
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="Linak Bed",
+            data={
+                CONF_ADDRESS: address,
+                CONF_NAME: "Linak Bed",
+                CONF_BED_TYPE: BED_TYPE_LINAK,
+                CONF_MOTOR_COUNT: 4,
+                CONF_HAS_MASSAGE: False,
+                CONF_DISABLE_ANGLE_SENSING: True,
+                CONF_PREFERRED_ADAPTER: "auto",
+            },
+            unique_id=address,
+            entry_id="linak_four_motor_cover_entry",
+        )
+        entry.add_to_hass(hass)
+
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        from homeassistant.helpers import entity_registry as er
+
+        registry = er.async_get(hass)
+        covers = {
+            registry.async_get(entity_id).unique_id.removeprefix(f"{address}_")
+            for entity_id in (
+                state.entity_id
+                for state in hass.states.async_all()
+                if state.entity_id.startswith("cover.")
+            )
+        }
+
+        assert covers == {"back", "legs", "head", "feet"}
 
     async def test_cover_open_close(
         self,

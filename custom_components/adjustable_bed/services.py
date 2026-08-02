@@ -68,6 +68,7 @@ TIMED_MOVE_MOTOR_OPTIONS = (
     "feet",
     "tilt",
     "lumbar",
+    "pillow",
     "bed_height",
     "stair",
 )

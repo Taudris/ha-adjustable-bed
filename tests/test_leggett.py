@@ -293,7 +293,7 @@ class TestLeggettOkinController:
             "move_back_stop",
             "move_legs_stop",
             "move_feet_stop",
-            "move_tilt_stop",
+            "move_pillow_stop",
             "move_lumbar_stop",
         ):
             controller = _okin_controller()
@@ -353,8 +353,8 @@ class TestLeggettOkinController:
             "move_feet_down",
             "move_back_up",
             "move_back_down",
-            "move_tilt_up",
-            "move_tilt_down",
+            "move_pillow_up",
+            "move_pillow_down",
             "move_lumbar_up",
             "move_lumbar_down",
         ):
@@ -957,6 +957,81 @@ class TestLeggettOkinController:
         assert not hasattr(LeggettOkinCommands, "MASSAGE_TIMER_STEP")
         assert not hasattr(controller, "massage_timer_step")
 
+    # key, translation_key, up keycode, down keycode. The physical remote labels
+    # its four sections HEAD, PILLOW, LUMBAR, FOOT, in this order.
+    _MOTORS = (
+        ("head", "head", 0x1, 0x2),
+        ("pillow", "pillow", 0x10, 0x20),
+        ("lumbar", "lumbar", 0x40, 0x80),
+        ("feet", "feet", 0x4, 0x8),
+    )
+
+    async def test_motor_specs_are_the_four_motors_on_the_remote(self):
+        """Four motors, four covers, named as the remote names them.
+
+        The base layout is Linak-shaped, and move_back_*/move_legs_* are pure
+        aliases of move_head_*/move_feet_* here, so it produced six covers for
+        four motors: back duplicating head, legs duplicating feet, and the
+        pillow motor labelled "tilt".
+        """
+        controller = LeggettOkinController(MagicMock())
+
+        specs = controller.motor_control_specs
+        assert [(spec.key, spec.translation_key) for spec in specs] == [
+            (key, translation_key) for key, translation_key, _, _ in self._MOTORS
+        ]
+        assert not {"back", "legs", "tilt"} & {spec.key for spec in specs}
+
+    @pytest.mark.parametrize(("key", "translation_key", "up_code", "down_code"), _MOTORS)
+    async def test_motor_spec_drives_its_documented_keycode(
+        self, key: str, translation_key: str, up_code: int, down_code: int
+    ):
+        """Each cover's up/down reaches the keycode the app's slider tag carries."""
+        controller = _okin_controller()
+        spec = next(spec for spec in controller.motor_control_specs if spec.key == key)
+
+        await spec.open_fn(controller)
+        assert controller.write_command_paced.await_args_list[0].args == (
+            bytes.fromhex(f"0402{up_code:08x}"),
+        )
+
+        controller.write_command_paced.reset_mock()
+        await spec.close_fn(controller)
+        assert controller.write_command_paced.await_args_list[0].args == (
+            bytes.fromhex(f"0402{down_code:08x}"),
+        )
+
+    @pytest.mark.parametrize("motor_count", [2, 3, 4, 6])
+    async def test_motor_specs_ignore_the_configured_motor_count(self, motor_count: int):
+        """Every frame on this protocol drives all four keycodes.
+
+        motor_count is user-entered and cannot tell us otherwise, so gating on
+        it only ever hid a motor the bed has.
+        """
+        coordinator = MagicMock()
+        coordinator.motor_count = motor_count
+        controller = LeggettOkinController(coordinator)
+
+        assert [spec.key for spec in controller.motor_control_specs] == [
+            "head",
+            "pillow",
+            "lumbar",
+            "feet",
+        ]
+
+    async def test_stale_motor_keys_cover_the_removed_and_renamed_entities(self):
+        """The three orphaned covers are removed rather than left unavailable."""
+        controller = LeggettOkinController(MagicMock())
+
+        assert controller.stale_motor_entity_keys == frozenset({"back", "legs", "tilt"})
+
+    async def test_tilt_surface_is_gone(self):
+        """The 0x10/0x20 motor is the pillow, so it is not offered as a tilt."""
+        controller = LeggettOkinController(MagicMock())
+
+        assert controller.has_pillow_support is True
+        assert controller.has_tilt_support is False
+
 
 class TestLeggettOkinTimedMove:
     """The timed_move service against a hold that streams until it is stopped."""
@@ -998,7 +1073,9 @@ class TestLeggettOkinTimedMove:
             SERVICE_TIMED_MOVE,
             {
                 "device_id": [devices[0].id],
-                "motor": "back",
+                # This bed declares four motors, and "back" is not one of them:
+                # it was an alias of head that the motor entities dropped.
+                "motor": "head",
                 "direction": "up",
                 # One cadence interval, so the frame budget is a single frame
                 # and no wall clock decides the outcome.

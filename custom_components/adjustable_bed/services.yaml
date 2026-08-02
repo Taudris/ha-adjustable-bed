@@ -120,6 +120,8 @@ timed_move:
               value: tilt
             - label: Lumbar
               value: lumbar
+            - label: Pillow
+              value: pillow
             - label: Bed Height
               value: bed_height
             - label: Stair

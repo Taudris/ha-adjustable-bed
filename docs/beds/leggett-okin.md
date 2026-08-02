@@ -52,7 +52,7 @@ buttons, so multiple simultaneous actions are one frame with several bits set.
 |---|---|
 | Head up / down | `0x00000001` / `0x00000002` |
 | Feet up / down | `0x00000004` / `0x00000008` |
-| Tilt (pillow) up / down | `0x00000010` / `0x00000020` |
+| Pillow up / down | `0x00000010` / `0x00000020` |
 | Lumbar up / down | `0x00000040` / `0x00000080` |
 | Release / stop | `0x00000000` |
 
