@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 
 from bleak.exc import BleakError
 
-from ..const import LEGGETT_OKIN_CHAR_UUID, LEGGETT_OKIN_PULSE_DEFAULTS
+from ..const import LEGGETT_OKIN_CHAR_UUID
 from .base import BedController
 from .okin_protocol import build_okin_command
 
@@ -48,8 +48,8 @@ class LeggettOkinCommands:
     docs/beds/leggett-okin.md.
     """
 
-    # Presets. FLAT is a held button rather than a one-shot recall; the memory
-    # slots and SNORE are one-shot recalls the control box completes on its own.
+    # Presets. FLAT, the memory slots and SNORE are all latched recalls: the
+    # control box completes the move on its own once the keycode arrives.
     PRESET_FLAT = 0x8000000
     PRESET_ZERO_G = 0x1000  # Deliberate alias of memory 1
     PRESET_MEMORY_1 = 0x1000
@@ -92,9 +92,9 @@ RELEASE_FRAME_COUNT = 4
 # one must not silently retune the other.
 RELEASE_FRAME_DELAY_MS = 100
 
-# A memory recall is a fixed 10-frame burst with no terminator at all. The
-# control box drives the move to completion by itself, so appending a release
-# frame here could cancel the motion the recall just started.
+# A recall is a fixed 10-frame burst with no terminator at all. The control box
+# drives the move to completion by itself, so appending a release frame here
+# could cancel the motion the recall just started.
 RECALL_FRAME_COUNT = 10
 RECALL_FRAME_DELAY_MS = 100
 
@@ -103,11 +103,6 @@ RECALL_FRAME_DELAY_MS = 100
 MEMORY_STORE_HOLD_S = 5.0
 MEMORY_SLOT_HOLD_S = 2.0
 MEMORY_PROGRAM_FRAME_DELAY_MS = 100
-
-# FLAT is a held button with no app-defined duration - the user holds it until
-# the bed is down. This is how long the integration streams it for; it is a
-# usability choice, not a protocol constant.
-FLAT_HOLD_S = 30.0
 
 
 class MotorDirection(Enum):
@@ -349,12 +344,12 @@ class LeggettOkinController(BedController):
     }
 
     async def _recall(self, command: int) -> None:
-        """Send a one-shot recall burst.
+        """Send a latched recall burst.
 
-        Recall is 10 frames at 100ms and then silence: the control box drives
-        the move to completion on its own. This is the one command family the
-        app deliberately leaves unterminated, so no release frames follow -
-        they could cancel the motion the recall just started.
+        Recall is 10 frames at 100ms and then silence: the control box latches
+        the keycode and drives the move to completion on its own. This is the
+        one command family the app deliberately leaves unterminated, so no
+        release frames follow - they could cancel the motion it just started.
         """
         await self.write_command(
             self._build_command(command),
@@ -365,29 +360,15 @@ class LeggettOkinController(BedController):
     async def preset_flat(self) -> None:
         """Go to flat position.
 
-        Unlike the memory slots, FLAT is a held button rather than an
-        autonomous recall: the bed moves only while frames keep arriving, so
-        this streams for roughly the time a full recline takes and then
-        releases.
+        The control box latches FLAT and flattens on its own, exactly like a
+        memory recall, so this is a bounded burst and not a hold. LP Control
+        2.11.0 ships a press-and-release mode whose whole FLAT command is a
+        single frame, and its Okin implementation of ``setPressAndHoldMode`` is
+        empty - it never tells the box which mode it is in, so the box has to
+        be doing the work. Repeating the frame only guards against a dropped
+        packet; a lost single frame would silently do nothing.
         """
-        # The setup flows accept any integer for the pulse delay, and this hold
-        # is a fixed duration, so a small or nonpositive value would expand it
-        # into tens of thousands of sequential writes and flood the proxy (a
-        # stored 0 would divide by zero outright). Streaming faster than the
-        # protocol's proven cadence buys nothing here, so floor it at that.
-        _, pulse_delay_ms = self.motor_pulse_settings()
-        pulse_delay_ms = max(pulse_delay_ms, LEGGETT_OKIN_PULSE_DEFAULTS[1])
-        repeat_count = max(1, round(FLAT_HOLD_S * 1000 / pulse_delay_ms))
-        completed = False
-        try:
-            await self.write_command(
-                self._build_command(LeggettOkinCommands.PRESET_FLAT),
-                repeat_count=repeat_count,
-                repeat_delay_ms=pulse_delay_ms,
-            )
-            completed = True
-        finally:
-            await self._send_release_frames("preset_flat", raise_on_error=completed)
+        await self._recall(LeggettOkinCommands.PRESET_FLAT)
 
     async def preset_memory(self, memory_num: int) -> None:
         """Go to memory preset."""

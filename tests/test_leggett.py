@@ -10,6 +10,7 @@ from homeassistant.const import CONF_ADDRESS, CONF_NAME
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.adjustable_bed.beds import leggett_okin
 from custom_components.adjustable_bed.beds.leggett_gen2 import (
     LeggettGen2Commands,
     LeggettGen2Controller,
@@ -20,6 +21,7 @@ from custom_components.adjustable_bed.beds.leggett_okin import (
 )
 from custom_components.adjustable_bed.const import (
     BED_TYPE_LEGGETT_GEN2,
+    BED_TYPE_LEGGETT_OKIN,
     BED_TYPE_LEGGETT_PLATT,
     BED_TYPE_OKIMAT,
     CONF_BED_TYPE,
@@ -30,7 +32,6 @@ from custom_components.adjustable_bed.const import (
     CONF_PROTOCOL_VARIANT,
     DOMAIN,
     LEGGETT_GEN2_WRITE_CHAR_UUID,
-    LEGGETT_OKIN_PULSE_DEFAULTS,
     LEGGETT_VARIANT_GEN2,
     LEGGETT_VARIANT_MLRM,
     LEGGETT_VARIANT_OKIN,
@@ -39,6 +40,7 @@ from custom_components.adjustable_bed.const import (
     requires_pairing,
     requires_pairing_after_service_discovery,
 )
+from custom_components.adjustable_bed.controller_factory import _SIMPLE_CONTROLLERS
 from custom_components.adjustable_bed.coordinator import AdjustableBedCoordinator
 
 
@@ -248,27 +250,82 @@ class TestLeggettOkinController:
 
         assert controller.write_command.await_count == 2
 
-    async def test_preset_flat_floors_an_unsafe_pulse_delay(self):
-        """Flat is a fixed-duration hold, so the cadence has a floor.
+    async def test_preset_flat_is_a_bounded_recall_burst(self):
+        """Flat is latched by the box, so it is a recall burst and not a hold.
 
-        The setup and options flows accept any integer. 0 would divide by zero,
-        a negative would collapse the hold to one frame, and a small positive
-        like 1ms would expand the 30s hold into 30,000 sequential writes and
-        saturate the link. All three floor to the proven cadence.
+        LP Control ships a press-and-release mode whose entire flat command is
+        one frame, and never tells an Okin box which mode it is in, so the box
+        completes the flatten itself. The burst only guards against a dropped
+        packet. It also takes no terminator: zero frames could cancel the move
+        the box just started, exactly as for a memory recall.
         """
-        for stored_delay in (0, -50, 1):
-            coordinator = MagicMock()
-            coordinator.motor_pulse_count = 10
-            coordinator.motor_pulse_delay_ms = stored_delay
-            controller = LeggettOkinController(coordinator)
-            controller.write_command = AsyncMock()
+        controller = LeggettOkinController(MagicMock())
+        controller.write_command = AsyncMock()
 
-            await controller.preset_flat()
+        await controller.preset_flat()
 
-            flat_call = controller.write_command.await_args_list[0]
-            assert flat_call.args == (bytes.fromhex("040208000000"),)
-            assert flat_call.kwargs["repeat_delay_ms"] == LEGGETT_OKIN_PULSE_DEFAULTS[1]
-            assert flat_call.kwargs["repeat_count"] == 300
+        controller.write_command.assert_awaited_once()
+        call = controller.write_command.await_args
+        assert call.args == (bytes.fromhex("040208000000"),)
+        assert call.kwargs == {"repeat_count": 10, "repeat_delay_ms": 100}
+
+    async def test_preset_flat_matches_the_memory_recall_path(self):
+        """Flat and a memory recall are the same burst, so retuning one moves both.
+
+        A parallel copy of the recall constants would let the two drift apart
+        the next time the burst is retuned.
+        """
+        controller = LeggettOkinController(MagicMock())
+        controller.write_command = AsyncMock()
+
+        await controller.preset_flat()
+        await controller.preset_memory(1)
+
+        flat_call, recall_call = controller.write_command.await_args_list
+        assert flat_call.kwargs == recall_call.kwargs
+        assert flat_call.kwargs["repeat_count"] == leggett_okin.RECALL_FRAME_COUNT
+        assert flat_call.kwargs["repeat_delay_ms"] == leggett_okin.RECALL_FRAME_DELAY_MS
+
+    @pytest.mark.parametrize("stored_delay", [0, -50, 1, 250])
+    async def test_preset_flat_ignores_the_configured_pulse_delay(self, stored_delay: int):
+        """Flat no longer scales a hold by the pulse delay, so no value can distort it.
+
+        While flat was a 30s hold the setup flows' unvalidated delay decided the
+        frame count: 0 divided by zero, a negative collapsed the hold to one
+        frame, and 1ms expanded it into 30,000 sequential writes. A recall burst
+        has neither the duration nor the division.
+        """
+        coordinator = MagicMock()
+        coordinator.motor_pulse_count = 10
+        coordinator.motor_pulse_delay_ms = stored_delay
+        controller = LeggettOkinController(coordinator)
+        controller.write_command = AsyncMock()
+
+        await controller.preset_flat()
+
+        call = controller.write_command.await_args
+        assert call.kwargs == {"repeat_count": 10, "repeat_delay_ms": 100}
+
+    async def test_no_flat_hold_duration_remains(self):
+        """The fixed hold duration is gone, not merely bypassed.
+
+        It existed only to stream flat as a held key, and leaving it behind
+        would invite a future change to reinstate the hold.
+        """
+        assert not hasattr(leggett_okin, "FLAT_HOLD_S")
+
+    async def test_flat_change_is_confined_to_the_okin_controller(self):
+        """No other bed type can inherit this flat behaviour.
+
+        The controller is subclassed by nothing and reachable from exactly one
+        bed type, so a latched flat cannot leak into another protocol.
+        """
+        assert LeggettOkinController.__subclasses__() == []
+        assert [
+            bed_type
+            for bed_type, spec in _SIMPLE_CONTROLLERS.items()
+            if spec.class_name == "LeggettOkinController"
+        ] == [BED_TYPE_LEGGETT_OKIN]
 
     async def test_program_memory_aborts_when_the_stage_release_fails(self):
         """The arm-to-slot release is a stage boundary, not best-effort cleanup.
@@ -332,7 +389,6 @@ class TestLeggettOkinController:
         ("action", "primary_frame"),
         [
             ("move_head_up", "040200000001"),
-            ("preset_flat", "040208000000"),
             ("lights_toggle", "040200020000"),
             ("massage_toggle", "040200000100"),
         ],
@@ -344,7 +400,8 @@ class TestLeggettOkinController:
 
         The release burst is this protocol's stop, so losing it can leave the
         bed moving or a keycode asserted. Every command family that ends in one
-        has to surface that, not just log it.
+        has to surface that, not just log it. Flat and the memory recalls are
+        deliberately absent: they end in silence, not a release.
         """
         coordinator = MagicMock()
         coordinator.motor_pulse_count = 10
