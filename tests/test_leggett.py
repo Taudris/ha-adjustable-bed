@@ -20,6 +20,7 @@ from custom_components.adjustable_bed.beds.leggett_okin import (
     LeggettOkinController,
 )
 from custom_components.adjustable_bed.const import (
+    BED_MOTOR_PULSE_DEFAULTS,
     BED_TYPE_LEGGETT_GEN2,
     BED_TYPE_LEGGETT_OKIN,
     BED_TYPE_LEGGETT_PLATT,
@@ -32,6 +33,7 @@ from custom_components.adjustable_bed.const import (
     CONF_PROTOCOL_VARIANT,
     DOMAIN,
     LEGGETT_GEN2_WRITE_CHAR_UUID,
+    LEGGETT_OKIN_PULSE_DEFAULTS,
     LEGGETT_VARIANT_GEN2,
     LEGGETT_VARIANT_MLRM,
     LEGGETT_VARIANT_OKIN,
@@ -108,6 +110,23 @@ class TestLeggettGen2Controller:
         )
 
 
+def _recall_okin_controller(
+    pulse_count: int = LEGGETT_OKIN_PULSE_DEFAULTS[0],
+    pulse_delay_ms: int = LEGGETT_OKIN_PULSE_DEFAULTS[1],
+) -> LeggettOkinController:
+    """Return an Okin controller whose recall burst reads concrete pulse settings.
+
+    A recall now sizes itself from the device's motor pulse options, so a bare
+    MagicMock coordinator would hand the burst two mocks instead of numbers.
+    """
+    coordinator = MagicMock()
+    coordinator.motor_pulse_count = pulse_count
+    coordinator.motor_pulse_delay_ms = pulse_delay_ms
+    controller = LeggettOkinController(coordinator)
+    controller.write_command = AsyncMock()
+    return controller
+
+
 class TestLeggettOkinController:
     """Test Leggett & Platt Okin controller variant."""
 
@@ -180,8 +199,7 @@ class TestLeggettOkinController:
         (issue #368). Recall is also autonomous: appending a release frame could
         cancel the move the box just started.
         """
-        controller = LeggettOkinController(MagicMock())
-        controller.write_command = AsyncMock()
+        controller = _recall_okin_controller()
 
         await controller.preset_memory(slot)
 
@@ -259,8 +277,7 @@ class TestLeggettOkinController:
         packet. It also takes no terminator: zero frames could cancel the move
         the box just started, exactly as for a memory recall.
         """
-        controller = LeggettOkinController(MagicMock())
-        controller.write_command = AsyncMock()
+        controller = _recall_okin_controller()
 
         await controller.preset_flat()
 
@@ -269,42 +286,70 @@ class TestLeggettOkinController:
         assert call.args == (bytes.fromhex("040208000000"),)
         assert call.kwargs == {"repeat_count": 10, "repeat_delay_ms": 100}
 
+    async def test_preset_flat_at_this_bed_type_defaults_is_the_protocol_burst(self):
+        """A device nobody has tuned must still send the app's exact burst.
+
+        Sizing the burst from the pulse options only stays honest while the
+        shipped defaults for this bed type reproduce the 10 frames at 100ms the
+        app sends. Reading them out of the per-bed-type table rather than
+        restating the numbers is what makes a drifted default fail here instead
+        of silently retuning every recall in the field.
+        """
+        pulse_count, pulse_delay_ms = BED_MOTOR_PULSE_DEFAULTS[BED_TYPE_LEGGETT_OKIN]
+        assert (pulse_count, pulse_delay_ms) == (10, 100)
+        controller = _recall_okin_controller(pulse_count, pulse_delay_ms)
+
+        await controller.preset_flat()
+
+        call = controller.write_command.await_args
+        assert call.args == (bytes.fromhex("040208000000"),)
+        assert call.kwargs == {"repeat_count": 10, "repeat_delay_ms": 100}
+
     async def test_preset_flat_matches_the_memory_recall_path(self):
         """Flat and a memory recall are the same burst, so retuning one moves both.
 
-        A parallel copy of the recall constants would let the two drift apart
-        the next time the burst is retuned.
+        A parallel copy of the burst sizing would let the two drift apart the
+        next time it is retuned, and the user tuning redundancy on hardware has
+        no reason to expect flat to answer differently from a memory slot.
         """
-        controller = LeggettOkinController(MagicMock())
-        controller.write_command = AsyncMock()
+        controller = _recall_okin_controller(pulse_count=3, pulse_delay_ms=250)
 
         await controller.preset_flat()
         await controller.preset_memory(1)
 
         flat_call, recall_call = controller.write_command.await_args_list
         assert flat_call.kwargs == recall_call.kwargs
-        assert flat_call.kwargs["repeat_count"] == leggett_okin.RECALL_FRAME_COUNT
-        assert flat_call.kwargs["repeat_delay_ms"] == leggett_okin.RECALL_FRAME_DELAY_MS
+        assert flat_call.kwargs == {"repeat_count": 3, "repeat_delay_ms": 250}
 
-    @pytest.mark.parametrize("stored_delay", [0, -50, 1, 250])
-    async def test_preset_flat_ignores_the_configured_pulse_delay(self, stored_delay: int):
-        """Flat no longer scales a hold by the pulse delay, so no value can distort it.
+    @pytest.mark.parametrize(
+        ("pulse_count", "pulse_delay_ms", "expected"),
+        [
+            (10, 100, {"repeat_count": 10, "repeat_delay_ms": 100}),
+            (25, 100, {"repeat_count": 25, "repeat_delay_ms": 100}),
+            (10, 200, {"repeat_count": 10, "repeat_delay_ms": 200}),
+            (0, 100, {"repeat_count": 1, "repeat_delay_ms": 100}),
+            (-5, 100, {"repeat_count": 1, "repeat_delay_ms": 100}),
+            (10, 0, {"repeat_count": 10, "repeat_delay_ms": 1}),
+            (10, -50, {"repeat_count": 10, "repeat_delay_ms": 1}),
+        ],
+    )
+    async def test_preset_flat_tracks_the_pulse_settings_within_floors(
+        self, pulse_count: int, pulse_delay_ms: int, expected: dict[str, int]
+    ):
+        """The burst is a redundancy knob the user can sweep, floored at sanity.
 
-        While flat was a 30s hold the setup flows' unvalidated delay decided the
-        frame count: 0 divided by zero, a negative collapsed the hold to one
-        frame, and 1ms expanded it into 30,000 sequential writes. A recall burst
-        has neither the duration nor the division.
+        A latched command's run time belongs to the control box, so the frame
+        count only decides how many chances the keycode gets to arrive. The
+        setup flows accept any integer: a count of 0 would drop the command
+        entirely and a nonpositive delay is meaningless, so both floor at 1. No
+        floor beyond that is needed - the count bounds the burst and every
+        frame still waits for its write response.
         """
-        coordinator = MagicMock()
-        coordinator.motor_pulse_count = 10
-        coordinator.motor_pulse_delay_ms = stored_delay
-        controller = LeggettOkinController(coordinator)
-        controller.write_command = AsyncMock()
+        controller = _recall_okin_controller(pulse_count, pulse_delay_ms)
 
         await controller.preset_flat()
 
-        call = controller.write_command.await_args
-        assert call.kwargs == {"repeat_count": 10, "repeat_delay_ms": 100}
+        assert controller.write_command.await_args.kwargs == expected
 
     async def test_no_flat_hold_duration_remains(self):
         """The fixed hold duration is gone, not merely bypassed.

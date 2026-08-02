@@ -103,11 +103,22 @@ button is down. On release the app emits **exactly four** keycode-`0` frames and
 then goes silent. There is no distinct stop opcode; the release frame is an
 ordinary frame carrying zero.
 
-**Recalls** (the memory slots and flat) are a burst of **exactly 10 frames at
-~100 ms**, with **no terminator at all**. The control box latches the keycode
-and drives the move to completion by itself. Appending a release frame here
-risks cancelling the motion the recall just started, so the integration
-deliberately does not.
+**Recalls** (the memory slots and flat) are a burst of **10 frames at ~100 ms**,
+with **no terminator at all**. The control box latches the keycode and drives
+the move to completion by itself. Appending a release frame here risks
+cancelling the motion the recall just started, so the integration deliberately
+does not.
+
+Because the box owns the motion, a recall's burst length is **redundancy, not
+duration**: the first frame that lands does the work and the rest only cover a
+dropped RF packet. Sending more frames cannot make the bed travel further or
+longer, and sending fewer cannot cut a move short - it can only lose the whole
+command. The integration therefore takes the burst from the device's
+`motor_pulse_count` / `motor_pulse_delay_ms` options, which default to 10 and
+100 ms for this bed, so the redundancy is tunable per device without a code
+change. Both are floored at 1. This does not make any *movement* depend on the
+cadence setting: held keycodes are still wall-clock bounded, and a latched
+command has no run time of its own.
 
 Flat looks like a held button in `com.leggett.prodigy4`, but only because that
 app streams *every* key the same way and never special-cases flat. LP Control

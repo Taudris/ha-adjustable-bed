@@ -87,16 +87,19 @@ class LeggettOkinCommands:
 # keycode-0 frames (OutputThread.runNormal, MaxZeroCount = 3). There is no
 # distinct stop opcode: the release frame is an ordinary frame carrying 0.
 RELEASE_FRAME_COUNT = 4
-# Same 100ms as the recall cadence today, but deliberately a separate constant:
-# these are independent findings about different command families, and retuning
-# one must not silently retune the other.
+# Same 100ms as this bed's default recall cadence, but deliberately a separate
+# constant: these are independent findings about different command families, and
+# retuning one must not silently retune the other. The release burst is also not
+# configurable - it is the protocol's only stop, so it is not a knob to sweep.
 RELEASE_FRAME_DELAY_MS = 100
 
-# A recall is a fixed 10-frame burst with no terminator at all. The control box
-# drives the move to completion by itself, so appending a release frame here
-# could cancel the motion the recall just started.
-RECALL_FRAME_COUNT = 10
-RECALL_FRAME_DELAY_MS = 100
+# A recall is a burst with no terminator at all. The control box latches the
+# keycode and drives the move to completion by itself, so appending a release
+# frame could cancel the motion the recall just started - and the burst size is
+# redundancy against a dropped packet rather than a duration. The burst is
+# therefore sized by the device's motor pulse options, which for this bed
+# default to the app's 10 frames at 100ms (LEGGETT_OKIN_PULSE_DEFAULTS). See
+# _recall.
 
 # Programming a slot is a two-stage hold, not an opcode: arm with MEMORY_STORE
 # for ~5s, release, then hold the slot keycode for ~2s.
@@ -346,15 +349,32 @@ class LeggettOkinController(BedController):
     async def _recall(self, command: int) -> None:
         """Send a latched recall burst.
 
-        Recall is 10 frames at 100ms and then silence: the control box latches
-        the keycode and drives the move to completion on its own. This is the
-        one command family the app deliberately leaves unterminated, so no
-        release frames follow - they could cancel the motion it just started.
+        A recall is a burst and then silence: the control box latches the
+        keycode and drives the move to completion on its own. This is the one
+        command family the app deliberately leaves unterminated, so no release
+        frames follow - they could cancel the motion it just started.
+
+        Because the box owns the motion, the burst size decides nothing about
+        how far or how long the bed moves. The frames are pure redundancy
+        against a dropped RF packet: the first one that lands does the work and
+        the rest are insurance. That makes the burst the device's motor pulse
+        options - ``motor_pulse_count`` frames at ``motor_pulse_delay_ms`` -
+        rather than a protocol constant, so the redundancy can be tuned per
+        device. They default to the app's 10 frames at 100ms for this bed. A
+        movement's run time still never depends on these settings; a latched
+        command simply has no run time of its own to depend on them.
+
+        Both are floored at 1. The setup flows accept any integer, a count of 0
+        would drop the recall entirely, and a nonpositive cadence has no
+        meaning. No floor beyond that is needed: every frame still waits for
+        its write response, and the count bounds the burst, so a small cadence
+        cannot flood the link the way it could a duration-derived hold.
         """
+        pulse_count, pulse_delay_ms = self.motor_pulse_settings()
         await self.write_command(
             self._build_command(command),
-            repeat_count=RECALL_FRAME_COUNT,
-            repeat_delay_ms=RECALL_FRAME_DELAY_MS,
+            repeat_count=max(1, pulse_count),
+            repeat_delay_ms=max(1, pulse_delay_ms),
         )
 
     async def preset_flat(self) -> None:
@@ -367,6 +387,12 @@ class LeggettOkinController(BedController):
         empty - it never tells the box which mode it is in, so the box has to
         be doing the work. Repeating the frame only guards against a dropped
         packet; a lost single frame would silently do nothing.
+
+        How many times to repeat it is therefore the device's
+        ``motor_pulse_count``, at ``motor_pulse_delay_ms``, read as redundancy
+        and not as duration - see ``_recall``. Flat and the memory slots stay
+        one burst shape on purpose: they are the same command family, and a
+        sweep that tuned only one of them would leave the other unexplained.
         """
         await self._recall(LeggettOkinCommands.PRESET_FLAT)
 
