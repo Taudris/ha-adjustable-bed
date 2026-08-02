@@ -112,6 +112,17 @@ MEMORY_PROGRAM_FRAME_DELAY_MS = 100
 # usability choice, not a protocol constant.
 FLAT_HOLD_S = 30.0
 
+# A movement hold has no protocol-defined end: the box moves while the keycode
+# keeps arriving. The stream therefore ends only when the next serialized
+# command preempts it (a stop, a new direction) or when this cap expires. The
+# cap exists so a lost stop can never run a motor forever; full recline takes
+# about FLAT_HOLD_S, so this covers full travel on any actuator with margin. A
+# hold outlasting the cap restarts cleanly: the capped call returns and the
+# card re-issues the movement while the button stays pressed. No existing
+# option models a hold duration (the pulse options describe burst cadence), so
+# this is a constant rather than configuration.
+MOVEMENT_HOLD_CAP_S = 60.0
+
 
 class MotorDirection(Enum):
     """Direction for motor movement."""
@@ -195,53 +206,180 @@ class LeggettOkinController(BedController):
         """
         return build_okin_command(command_value)
 
+    # The motors this frame carries, and the keycode each direction asserts.
+    # This table is what "a known motor" means here: _move_motor rejects any
+    # name it does not list, so _motor_state can only ever hold these.
+    _MOTOR_KEYCODES: dict[str, dict[MotorDirection, int]] = {
+        "head": {
+            MotorDirection.UP: LeggettOkinCommands.MOTOR_HEAD_UP,
+            MotorDirection.DOWN: LeggettOkinCommands.MOTOR_HEAD_DOWN,
+        },
+        "feet": {
+            MotorDirection.UP: LeggettOkinCommands.MOTOR_FEET_UP,
+            MotorDirection.DOWN: LeggettOkinCommands.MOTOR_FEET_DOWN,
+        },
+        "tilt": {
+            MotorDirection.UP: LeggettOkinCommands.MOTOR_TILT_UP,
+            MotorDirection.DOWN: LeggettOkinCommands.MOTOR_TILT_DOWN,
+        },
+        "lumbar": {
+            MotorDirection.UP: LeggettOkinCommands.MOTOR_LUMBAR_UP,
+            MotorDirection.DOWN: LeggettOkinCommands.MOTOR_LUMBAR_DOWN,
+        },
+    }
+
     def _get_move_command(self) -> int:
-        """Calculate the combined motor movement command."""
+        """Combine the currently held motor keycodes into one frame.
+
+        No motors held is the resting state, not an error: it yields 0, which
+        is this protocol's release frame, and that is exactly what the stop
+        path has already cleared the state to mean.
+        """
         command = 0
-        state = self._motor_state
-        if state.get("head") == MotorDirection.UP:
-            command += LeggettOkinCommands.MOTOR_HEAD_UP
-        elif state.get("head") == MotorDirection.DOWN:
-            command += LeggettOkinCommands.MOTOR_HEAD_DOWN
-        if state.get("feet") == MotorDirection.UP:
-            command += LeggettOkinCommands.MOTOR_FEET_UP
-        elif state.get("feet") == MotorDirection.DOWN:
-            command += LeggettOkinCommands.MOTOR_FEET_DOWN
-        if state.get("tilt") == MotorDirection.UP:
-            command += LeggettOkinCommands.MOTOR_TILT_UP
-        elif state.get("tilt") == MotorDirection.DOWN:
-            command += LeggettOkinCommands.MOTOR_TILT_DOWN
-        if state.get("lumbar") == MotorDirection.UP:
-            command += LeggettOkinCommands.MOTOR_LUMBAR_UP
-        elif state.get("lumbar") == MotorDirection.DOWN:
-            command += LeggettOkinCommands.MOTOR_LUMBAR_DOWN
+        for motor, direction in self._motor_state.items():
+            command |= self._MOTOR_KEYCODES[motor][direction]
         return command
 
-    async def _move_motor(self, motor: str, direction: MotorDirection) -> None:
-        """Move a motor in a direction or stop it."""
-        if direction == MotorDirection.STOP:
-            self._motor_state.pop(motor, None)
-        else:
-            self._motor_state[motor] = direction
-        command = self._get_move_command()
+    async def _move_motor(self, motor: str | None, direction: MotorDirection) -> None:
+        """Start holding a motor keycode, or stop the active hold.
 
-        completed = False
+        The coordinator serializes commands, so at most one hold exists at a
+        time: a new movement replaces whatever was held rather than combining
+        with it, and a stop ends whichever hold is active (the preempted
+        hold's stream is already gone by the time the stop runs, so
+        re-streaming a different motor here would restart it).
+
+        A stop therefore has no motor, and says so by passing ``None``. This
+        protocol has no per-motor stop to name: the release burst clears the
+        whole key buffer, so a name here could only mislead a reader of the
+        log into thinking one motor was singled out.
+
+        Validation is total, which is what naming the absence buys. A motor
+        that is present must be one of ``_MOTOR_KEYCODES``: an unknown name is
+        a wiring mistake in this module, not a device condition, and its
+        keycode would be 0 - the release frame - so the stream would push stop
+        frames for the full hold cap rather than doing nothing. A motor that is
+        absent is only meaningful for a stop; a movement without one has
+        nothing to move.
+
+        Raises:
+            ValueError: If ``motor`` is not one of this bed's motors, or if a
+                movement was asked for without one.
+        """
+        if motor is not None and motor not in self._MOTOR_KEYCODES:
+            raise ValueError(
+                f"Unknown Leggett Okin motor: {motor!r}; "
+                f"expected one of {sorted(self._MOTOR_KEYCODES)}"
+            )
+        if direction == MotorDirection.STOP:
+            await self._stop_movement("motor stop")
+            return
+        if motor is None:
+            raise ValueError(
+                f"A Leggett Okin {direction.value} movement needs a motor; "
+                "only a stop has none"
+            )
+        self._motor_state = {motor: direction}
+        await self._stream_movement(self._get_move_command())
+
+    async def _stop_movement(self, context: str) -> None:
+        """End the movement lifecycle with the protocol's release burst.
+
+        An explicit stop must not report success when it never reached the
+        bed, so failures propagate.
+        """
+        self._motor_state = {}
+        await self._send_release_frames(context, raise_on_error=True)
+
+    async def _stream_movement(self, command: int) -> None:
+        """Stream a movement keycode like a held button until the hold ends.
+
+        The box moves a motor only while its keycode keeps arriving, so this
+        keeps writing frames instead of sending a finite burst. Exactly one
+        release burst ends each movement lifecycle, sent by whichever path
+        ends it:
+
+        - Preemption by the next serialized command (the coordinator sets its
+          cancel event, which makes write_command return between frames, and
+          cancels this task). No release is sent here: the successor owns the
+          bed from this point - a stop sends the release, a movement streams
+          its own keycode (the box swaps its key buffer between frames, the
+          same way the app switches store->slot without a release), and the
+          other command families end with their own terminators. Sending
+          zeros here as well is the double-release defect, and on a
+          same-direction re-trigger it would stop the bed mid-hold.
+        - A caller-bounded hold (``caller_bounded_hold``): the caller ends the
+          movement with its own stop, so that stop is the release and none is
+          sent here on any path out.
+        - The safety cap, for a stop that never arrives: release sent here.
+        - A write failure: release attempted as cleanup, error propagates.
+        - External cancellation (shutdown or unload, recognizable because the
+          coordinator's cancel event is not set): no successor exists, so the
+          release is sent before the cancellation propagates.
+        """
+        frame = self._build_command(command)
+        _, pulse_delay_ms = self.motor_pulse_settings()
+        # Unlike preset_flat's fixed-duration hold, the frame budget here is
+        # bounded by a wall clock rather than by the count, and each frame is
+        # paced by a write-with-response round trip on top of the sleep - so a
+        # small delay cannot flood the link and needs no floor beyond keeping
+        # the arithmetic sane.
+        pulse_delay_ms = max(1, pulse_delay_ms)
+        hold_s = self._hold_seconds()
+        frame_budget = max(1, round(hold_s * 1000 / pulse_delay_ms))
         try:
-            if command:
-                pulse_count, pulse_delay_ms = self.motor_pulse_settings()
+            async with asyncio.timeout(hold_s):
                 await self.write_command(
-                    self._build_command(command),
-                    repeat_count=pulse_count,
+                    frame,
+                    repeat_count=frame_budget,
                     repeat_delay_ms=pulse_delay_ms,
                 )
-            completed = True
-        finally:
-            self._motor_state = {}
-            # The release burst is this protocol's stop. If the movement itself
-            # succeeded, losing the release can leave the bed running, so it has
-            # to surface. If we are already unwinding it is cleanup and must not
-            # mask the original error.
-            await self._send_release_frames("motor movement", raise_on_error=completed)
+        except TimeoutError:
+            # The hold ran to its limit; fall through to the release.
+            pass
+        except asyncio.CancelledError:
+            if self._coordinator.cancel_command.is_set():
+                raise  # Preempted: the successor command owns the release.
+            await self._end_hold(raise_on_release_error=False)
+            raise
+        except (BleakError, ConnectionError):
+            await self._end_hold(raise_on_release_error=False)
+            raise
+        else:
+            if self._coordinator.cancel_command.is_set():
+                # write_command exits between frames when the cancel event is
+                # set: preemption again, just observed before the task
+                # cancellation landed.
+                return
+        # The lifecycle ended without a successor, so this release is the
+        # operation's stop: losing it can leave the bed running and must
+        # surface.
+        await self._end_hold(raise_on_release_error=True)
+
+    def _hold_seconds(self) -> float:
+        """Return how long this movement may stream for.
+
+        A caller that bounded the movement decides its duration; the safety cap
+        still applies over it, because the cap exists so a lost stop can never
+        run a motor forever and a caller-supplied duration is not a stop.
+        """
+        bounded_ms = self.caller_bounded_hold_ms
+        if bounded_ms is None:
+            return MOVEMENT_HOLD_CAP_S
+        return min(bounded_ms / 1000, MOVEMENT_HOLD_CAP_S)
+
+    async def _end_hold(self, *, raise_on_release_error: bool) -> None:
+        """Drop the held keycode and release it, unless the caller does that.
+
+        Under a caller-bounded hold the caller's own stop is the movement's
+        single release burst. Adding one here would double it, and the second
+        burst would land after the coordinator handed the bed to whatever ran
+        next.
+        """
+        self._motor_state = {}
+        if self.caller_bounded_hold_ms is not None:
+            return
+        await self._send_release_frames("movement stream", raise_on_error=raise_on_release_error)
 
     async def _send_release_frames(self, context: str, *, raise_on_error: bool = False) -> None:
         """Send the release burst that ends a held keycode.
@@ -296,7 +434,7 @@ class LeggettOkinController(BedController):
 
     async def move_head_stop(self) -> None:
         """Stop head motor."""
-        await self._move_motor("head", MotorDirection.STOP)
+        await self._move_motor(None, MotorDirection.STOP)
 
     async def move_back_up(self) -> None:
         """Move back up (same as head)."""
@@ -320,7 +458,7 @@ class LeggettOkinController(BedController):
 
     async def move_legs_stop(self) -> None:
         """Stop legs motor."""
-        await self._move_motor("feet", MotorDirection.STOP)
+        await self._move_motor(None, MotorDirection.STOP)
 
     async def move_feet_up(self) -> None:
         """Move feet up."""
@@ -340,8 +478,7 @@ class LeggettOkinController(BedController):
         An explicit stop must not report success when it never reached the bed,
         so failures propagate here rather than being logged and swallowed.
         """
-        self._motor_state = {}
-        await self._send_release_frames("stop_all", raise_on_error=True)
+        await self._stop_movement("stop_all")
 
     # Preset methods
     _MEMORY_SLOTS = {
@@ -515,7 +652,7 @@ class LeggettOkinController(BedController):
 
     async def move_tilt_stop(self) -> None:
         """Stop tilt motor."""
-        await self._move_motor("tilt", MotorDirection.STOP)
+        await self._move_motor(None, MotorDirection.STOP)
 
     # Lumbar motor control
     async def move_lumbar_up(self) -> None:
@@ -528,4 +665,4 @@ class LeggettOkinController(BedController):
 
     async def move_lumbar_stop(self) -> None:
         """Stop lumbar motor."""
-        await self._move_motor("lumbar", MotorDirection.STOP)
+        await self._move_motor(None, MotorDirection.STOP)

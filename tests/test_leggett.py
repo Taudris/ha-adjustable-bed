@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -10,16 +11,21 @@ from homeassistant.const import CONF_ADDRESS, CONF_NAME
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.adjustable_bed import SERVICE_TIMED_MOVE
+from custom_components.adjustable_bed.beds import leggett_okin as leggett_okin_module
+from custom_components.adjustable_bed.beds.base import caller_bounded_hold
 from custom_components.adjustable_bed.beds.leggett_gen2 import (
     LeggettGen2Commands,
     LeggettGen2Controller,
 )
 from custom_components.adjustable_bed.beds.leggett_okin import (
+    RELEASE_FRAME_COUNT,
     LeggettOkinCommands,
     LeggettOkinController,
 )
 from custom_components.adjustable_bed.const import (
     BED_TYPE_LEGGETT_GEN2,
+    BED_TYPE_LEGGETT_OKIN,
     BED_TYPE_LEGGETT_PLATT,
     BED_TYPE_OKIMAT,
     CONF_BED_TYPE,
@@ -67,6 +73,51 @@ def mock_leggett_gen2_config_entry(
         data=mock_leggett_gen2_config_entry_data,
         unique_id="AA:BB:CC:DD:EE:FF",
         entry_id="leggett_gen2_test_entry",
+    )
+    entry.add_to_hass(hass)
+    return entry
+
+
+OKIN_TEST_ADDRESS = "AA:BB:CC:DD:EE:FF"
+
+ZERO_FRAME = bytes.fromhex("040200000000")
+
+
+def _streaming_okin_controller(
+    pulse_count: int = 10, pulse_delay_ms: int = 100
+) -> LeggettOkinController:
+    """Return an Okin controller on a stub coordinator shaped for movement.
+
+    The movement stream does cadence arithmetic on the pulse settings and
+    reads the coordinator's cancel event to tell preemption from external
+    cancellation, so both need concrete values rather than bare MagicMocks.
+    """
+    coordinator = MagicMock()
+    coordinator.motor_pulse_count = pulse_count
+    coordinator.motor_pulse_delay_ms = pulse_delay_ms
+    coordinator.cancel_command.is_set.return_value = False
+    controller = LeggettOkinController(coordinator)
+    controller.write_command = AsyncMock()
+    return controller
+
+
+@pytest.fixture
+def mock_leggett_okin_config_entry(hass: HomeAssistant) -> MockConfigEntry:
+    """Return a mock config entry for a Leggett & Platt Okin bed."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Leggett Okin Test Bed",
+        data={
+            CONF_ADDRESS: OKIN_TEST_ADDRESS,
+            CONF_NAME: "Leggett Okin Test Bed",
+            CONF_BED_TYPE: BED_TYPE_LEGGETT_OKIN,
+            CONF_MOTOR_COUNT: 2,
+            CONF_HAS_MASSAGE: True,
+            CONF_DISABLE_ANGLE_SENSING: True,
+            CONF_PREFERRED_ADAPTER: "auto",
+        },
+        unique_id=OKIN_TEST_ADDRESS,
+        entry_id="leggett_okin_test_entry",
     )
     entry.add_to_hass(hass)
     return entry
@@ -141,30 +192,327 @@ class TestLeggettOkinController:
 
         assert controller.supports_massage_off_control is False
 
-    async def test_motor_streams_then_sends_four_release_frames(self):
-        """Held keycodes stream at the configured cadence, then release with four zeros.
+    async def test_hold_streams_continuously_with_one_terminating_release(self):
+        """A movement is one continuous keycode stream ending in one release burst.
 
-        The app's output thread writes the held keycode every 100ms and emits
-        exactly four keycode-0 frames on release (MaxZeroCount = 3). There is no
-        distinct stop opcode; the release frame is an ordinary frame carrying 0.
+        The box moves only while the keycode keeps arriving (the app streams
+        every 100ms until the button is released), so a hold must not be a
+        short burst that stops itself: the frame budget covers the whole
+        safety cap, no zeros appear mid-stream, and exactly four keycode-0
+        frames follow when the hold ends (MaxZeroCount = 3 in the app; there
+        is no distinct stop opcode).
         """
-        coordinator = MagicMock()
-        coordinator.motor_pulse_count = 10
-        coordinator.motor_pulse_delay_ms = 100
-        controller = LeggettOkinController(coordinator)
-        controller.write_command = AsyncMock()
+        controller = _streaming_okin_controller()
 
         await controller.move_head_up()
 
         move_call, release_call = controller.write_command.await_args_list
         assert move_call.args == (bytes.fromhex("040200000001"),)
+        # 60s cap at the 100ms cadence.
         assert move_call.kwargs == {
-            "repeat_count": 10,
+            "repeat_count": 600,
             "repeat_delay_ms": 100,
         }
-        assert release_call.args == (bytes.fromhex("040200000000"),)
+        assert release_call.args == (ZERO_FRAME,)
         assert release_call.kwargs["repeat_count"] == 4
         assert release_call.kwargs["cancel_event"].is_set() is False
+
+    async def test_an_unknown_motor_raises_before_any_frame(self):
+        """An unroutable motor name must fail loudly, not stream release frames.
+
+        Its combined keycode is 0, and 0 is the release frame on this protocol,
+        so streaming it would push stop frames for the whole safety cap while
+        reporting success. The name comes from this module's own move_* methods,
+        so a miss is a programming error and belongs in the caller's face.
+        """
+        controller = _streaming_okin_controller()
+
+        with pytest.raises(ValueError, match="Unknown Leggett Okin motor: 'neck'"):
+            await controller._move_motor("neck", leggett_okin_module.MotorDirection.UP)
+
+        controller.write_command.assert_not_awaited()
+        assert controller._motor_state == {}
+
+    async def test_a_stop_carries_no_motor(self):
+        """A stop asserts no keycode, so it names no motor and passes None.
+
+        The release burst clears the whole key buffer: there is no per-motor
+        stop to name, and a name here could only suggest one motor had been
+        singled out.
+        """
+        controller = _streaming_okin_controller()
+
+        await controller._move_motor(None, leggett_okin_module.MotorDirection.STOP)
+
+        controller.write_command.assert_awaited_once()
+        assert controller.write_command.await_args.args == (ZERO_FRAME,)
+
+    async def test_every_stop_entry_point_passes_no_motor(self):
+        """The contract's per-motor stops all resolve to the same motorless stop.
+
+        Each one is reachable from a cover entity and from timed_move's stop
+        callable, so a stop that still carried a label would put that label
+        back into the log by the back door.
+        """
+        for method in (
+            "move_head_stop",
+            "move_back_stop",
+            "move_legs_stop",
+            "move_feet_stop",
+            "move_tilt_stop",
+            "move_lumbar_stop",
+        ):
+            controller = _streaming_okin_controller()
+            with patch.object(
+                controller, "_move_motor", new_callable=AsyncMock
+            ) as mock_move:
+                await getattr(controller, method)()
+
+            assert mock_move.await_args.args == (
+                None,
+                leggett_okin_module.MotorDirection.STOP,
+            ), method
+
+    async def test_a_movement_without_a_motor_raises(self):
+        """Absent is only valid for a stop; a movement has nothing to move.
+
+        Making the motor optional is what lets a stop say "no motor" instead of
+        naming one it does not act on, so the same signature has to keep
+        rejecting a movement that names none.
+        """
+        controller = _streaming_okin_controller()
+
+        with pytest.raises(ValueError, match="needs a motor"):
+            await controller._move_motor(None, leggett_okin_module.MotorDirection.UP)
+
+        controller.write_command.assert_not_awaited()
+        assert controller._motor_state == {}
+
+    async def test_an_unknown_motor_is_rejected_on_a_stop_too(self):
+        """Validation is total: a supplied motor is checked whatever it is for.
+
+        The old stop path skipped the check because the name was only a log
+        label. Now that a stop passes None, a name arriving here at all is a
+        caller mistake worth the same refusal as on a movement.
+        """
+        controller = _streaming_okin_controller()
+
+        with pytest.raises(ValueError, match="Unknown Leggett Okin motor: 'neck'"):
+            await controller._move_motor("neck", leggett_okin_module.MotorDirection.STOP)
+
+        controller.write_command.assert_not_awaited()
+
+    async def test_every_movement_method_names_a_known_motor(self):
+        """The keycode table has to cover every motor the move_* methods use.
+
+        The raise only helps if it can never fire for shipped code, so drive
+        each movement entry point and assert none of them is unroutable.
+        """
+        for method in (
+            "move_head_up",
+            "move_head_down",
+            "move_legs_up",
+            "move_legs_down",
+            "move_feet_up",
+            "move_feet_down",
+            "move_back_up",
+            "move_back_down",
+            "move_tilt_up",
+            "move_tilt_down",
+            "move_lumbar_up",
+            "move_lumbar_down",
+        ):
+            controller = _streaming_okin_controller()
+            controller._coordinator.cancel_command.is_set.return_value = True
+
+            await getattr(controller, method)()
+
+            frame = controller.write_command.await_args.args[0]
+            assert frame != ZERO_FRAME, f"{method} streamed the release frame"
+
+    async def test_preempted_hold_hands_off_without_zeros(self):
+        """A hold preempted by the next command must not send release frames.
+
+        The coordinator sets its cancel event when the next serialized command
+        arrives, which makes the stream's write loop return early. Zeros here
+        would stop whatever the successor starts; the successor owns the
+        release (a stop sends it, a movement streams its own keycode).
+        """
+        controller = _streaming_okin_controller()
+        controller._coordinator.cancel_command.is_set.return_value = True
+
+        await controller.move_head_down()
+
+        controller.write_command.assert_awaited_once()
+        assert controller.write_command.await_args.args == (bytes.fromhex("040200000002"),)
+
+    async def test_stop_after_a_cancelled_hold_releases_exactly_once(self):
+        """Stop during movement ends with one release burst, not two.
+
+        The observed defect: the cancelled movement's cleanup sent four zeros
+        and the stop handler sent four more. The cancelled stream now defers
+        to the stop command, which sends the protocol's single release.
+        """
+        controller = _streaming_okin_controller()
+        controller._coordinator.cancel_command.is_set.return_value = True
+        controller.write_command.side_effect = asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await controller.move_head_down()
+
+        controller._coordinator.cancel_command.is_set.return_value = False
+        controller.write_command.side_effect = None
+        await controller.move_head_stop()
+
+        zero_calls = [
+            call
+            for call in controller.write_command.await_args_list
+            if call.args == (ZERO_FRAME,)
+        ]
+        assert len(zero_calls) == 1
+        assert zero_calls[0].kwargs["repeat_count"] == 4
+
+    async def test_retriggered_hold_streams_the_same_keycode_without_zeros(self):
+        """A repeat of the same movement extends the hold instead of glitching.
+
+        The card re-calls the movement service while the button stays held.
+        The replacement stream sends the same keycode again with no zeros in
+        between, so the box sees one uninterrupted hold.
+        """
+        controller = _streaming_okin_controller()
+        controller._coordinator.cancel_command.is_set.return_value = True
+        await controller.move_head_down()  # preempted by the re-trigger
+
+        controller._coordinator.cancel_command.is_set.return_value = False
+        await controller.move_head_down()  # the re-trigger, runs to its own end
+
+        frames = [call.args[0] for call in controller.write_command.await_args_list]
+        assert frames == [
+            bytes.fromhex("040200000002"),
+            bytes.fromhex("040200000002"),
+            ZERO_FRAME,
+        ]
+
+    async def test_externally_cancelled_hold_still_releases(self):
+        """Cancellation with no successor command must still stop the bed.
+
+        Shutdown or unload cancels the operation without setting the
+        coordinator's cancel event, and nothing runs afterwards, so the
+        stream sends the release itself before the cancellation propagates.
+        """
+        controller = _streaming_okin_controller()
+        controller.write_command.side_effect = [asyncio.CancelledError, None]
+
+        with pytest.raises(asyncio.CancelledError):
+            await controller.move_head_up()
+
+        release_call = controller.write_command.await_args_list[-1]
+        assert release_call.args == (ZERO_FRAME,)
+        assert release_call.kwargs["repeat_count"] == 4
+
+    async def test_safety_cap_expiry_sends_release(self, monkeypatch: pytest.MonkeyPatch):
+        """A lost stop must never run a motor forever: the cap ends the hold.
+
+        The stream is wall-clock bounded rather than count bounded (proxy
+        round trips stretch a frame count arbitrarily). Zeroing the cap makes
+        the timeout fire at the stream's first suspension, and the hold must
+        end with the release burst without raising.
+        """
+        monkeypatch.setattr(leggett_okin_module, "MOVEMENT_HOLD_CAP_S", 0)
+        controller = _streaming_okin_controller()
+
+        async def _write(command: bytes, **kwargs: object) -> None:
+            if command != ZERO_FRAME:
+                await asyncio.sleep(60)
+
+        controller.write_command = AsyncMock(side_effect=_write)
+
+        await controller.move_head_up()
+
+        release_call = controller.write_command.await_args_list[-1]
+        assert release_call.args == (ZERO_FRAME,)
+        assert release_call.kwargs["repeat_count"] == 4
+
+    async def test_caller_bounded_hold_streams_for_the_requested_duration(self):
+        """A caller that asks for a duration gets that hold, not the safety cap.
+
+        The pulse count cannot carry this: it means "frames in a burst" for
+        every bed that sends one, and a hold deliberately ignores it. So the
+        duration arrives as its own value and sizes the stream, here twenty
+        frames of the 100ms cadence rather than the cap's six hundred.
+        """
+        controller = _streaming_okin_controller(pulse_count=99)
+
+        with caller_bounded_hold(2000):
+            await controller.move_head_up()
+
+        controller.write_command.assert_awaited_once()
+        assert controller.write_command.await_args.kwargs == {
+            "repeat_count": 20,
+            "repeat_delay_ms": 100,
+        }
+
+    async def test_caller_bounded_hold_leaves_the_release_to_its_caller(self):
+        """The caller's stop is the bounded hold's one release burst.
+
+        A bounded caller always follows the movement with its own stop, so a
+        release from the stream as well would be the double-release defect
+        again - and the second burst would land after the coordinator had
+        already handed the bed to whatever ran next.
+        """
+        controller = _streaming_okin_controller()
+
+        with caller_bounded_hold(2000):
+            await controller.move_head_up()
+        await controller.move_head_stop()
+
+        frames = [call.args[0] for call in controller.write_command.await_args_list]
+        assert frames == [bytes.fromhex("040200000001"), ZERO_FRAME]
+
+    async def test_a_failed_bounded_hold_still_leaves_the_release_to_its_caller(self):
+        """A write failure inside a bounded hold must not release either.
+
+        The caller sends its stop from a finally, so it runs on the failure
+        path too. Releasing here as cleanup would double it.
+        """
+        controller = _streaming_okin_controller()
+        controller.write_command.side_effect = BleakError("write failed")
+
+        with pytest.raises(BleakError, match="write failed"), caller_bounded_hold(2000):
+            await controller.move_head_up()
+
+        controller.write_command.assert_awaited_once()
+
+    async def test_the_safety_cap_outranks_a_longer_caller_bound(self):
+        """A caller may shorten a hold but never extend it past the cap.
+
+        The cap exists so a lost stop can never run a motor forever, and a
+        requested duration is not a stop.
+        """
+        controller = _streaming_okin_controller()
+
+        with caller_bounded_hold(int(leggett_okin_module.MOVEMENT_HOLD_CAP_S * 1000) * 2):
+            await controller.move_head_up()
+
+        assert controller.write_command.await_args.kwargs["repeat_count"] == 600
+
+    async def test_an_ordinary_hold_after_a_bounded_one_runs_to_the_cap(self):
+        """The bound covers one call and does not linger for the next.
+
+        Cover open/close and the card's motor buttons hold until stopped; a
+        duration left behind by an earlier timed move would silently cut them
+        short.
+        """
+        controller = _streaming_okin_controller()
+        with caller_bounded_hold(2000):
+            await controller.move_head_up()
+        controller.write_command.reset_mock()
+
+        await controller.move_head_up()
+
+        move_call, release_call = controller.write_command.await_args_list
+        assert move_call.kwargs["repeat_count"] == 600
+        assert release_call.args == (ZERO_FRAME,)
 
     @pytest.mark.parametrize(
         ("slot", "keycode"),
@@ -244,10 +592,11 @@ class TestLeggettOkinController:
         which one propagated: with a shared message it would pass even if the
         cleanup failure replaced the movement failure.
         """
-        controller = LeggettOkinController(MagicMock())
-        controller.write_command = AsyncMock(
-            side_effect=[BleakError("movement failed"), BleakError("release failed")]
-        )
+        controller = _streaming_okin_controller()
+        controller.write_command.side_effect = [
+            BleakError("movement failed"),
+            BleakError("release failed"),
+        ]
 
         with pytest.raises(BleakError, match="movement failed"):
             await controller.move_head_up()
@@ -352,13 +701,8 @@ class TestLeggettOkinController:
         bed moving or a keycode asserted. Every command family that ends in one
         has to surface that, not just log it.
         """
-        coordinator = MagicMock()
-        coordinator.motor_pulse_count = 10
-        coordinator.motor_pulse_delay_ms = 100
-        controller = LeggettOkinController(coordinator)
-        controller.write_command = AsyncMock(
-            side_effect=[None, BleakError("release failed")]
-        )
+        controller = _streaming_okin_controller()
+        controller.write_command.side_effect = [None, BleakError("release failed")]
 
         with pytest.raises(BleakError, match="release failed"):
             await getattr(controller, action)()
@@ -372,6 +716,59 @@ class TestLeggettOkinController:
 
         assert not hasattr(LeggettOkinCommands, "MASSAGE_TIMER_STEP")
         assert not hasattr(controller, "massage_timer_step")
+
+
+class TestLeggettOkinTimedMove:
+    """The timed_move service against a hold that streams until it is stopped."""
+
+    async def test_timed_move_streams_for_its_duration_and_releases_once(
+        self,
+        hass: HomeAssistant,
+        mock_leggett_okin_config_entry: MockConfigEntry,
+        mock_coordinator_connected,
+        mock_bleak_client: MagicMock,
+        enable_custom_integrations,
+    ):
+        """A bounded move must end at its duration with a single release burst.
+
+        The service asks for a duration; the hold stream would otherwise run to
+        the safety cap because it sizes its own budget and never reads the
+        pulse count the service assigns. The service always sends its own stop,
+        so that stop is the lifecycle's one release burst and the stream must
+        not add a second.
+        """
+        entry = mock_leggett_okin_config_entry
+        with patch(
+            "custom_components.adjustable_bed.coordinator."
+            "AdjustableBedCoordinator.async_read_initial_positions",
+            new=AsyncMock(),
+        ):
+            await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done()
+
+        from homeassistant.helpers import device_registry as dr
+
+        device_registry = dr.async_get(hass)
+        devices = dr.async_entries_for_config_entry(device_registry, entry.entry_id)
+        assert len(devices) == 1
+        mock_bleak_client.write_gatt_char.reset_mock()
+
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_TIMED_MOVE,
+            {
+                "device_id": [devices[0].id],
+                "motor": "back",
+                "direction": "up",
+                # One cadence interval, so the frame budget is a single frame
+                # and no wall clock decides the outcome.
+                "duration_ms": 100,
+            },
+            blocking=True,
+        )
+
+        payloads = [call.args[1] for call in mock_bleak_client.write_gatt_char.call_args_list]
+        assert payloads == [bytes.fromhex("040200000001"), *[ZERO_FRAME] * RELEASE_FRAME_COUNT]
 
 
 class TestLeggettGen2CommandFormat:

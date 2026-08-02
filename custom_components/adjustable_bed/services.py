@@ -20,6 +20,7 @@ from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 
+from .beds.base import caller_bounded_hold
 from .const import (
     BED_TYPE_ERGOMOTION,
     BED_TYPE_KAIDI,
@@ -591,6 +592,7 @@ async def handle_timed_move(call: ServiceCall) -> None:
             _stop_fn: Callable[..., Coroutine[Any, Any, None]] = stop_fn,
             _calculated_repeat_count: int = calculated_repeat_count,
             _pulse_delay_ms: int = pulse_delay_ms,
+            _duration_ms: int = duration_ms,
             _original_pulse_count: int = original_pulse_count,
             _original_pulse_delay_ms: int = original_pulse_delay_ms,
         ) -> None:
@@ -601,8 +603,13 @@ async def handle_timed_move(call: ServiceCall) -> None:
                 _coordinator._motor_pulse_count = _calculated_repeat_count
                 _coordinator._motor_pulse_delay_ms = _pulse_delay_ms
 
-                # Call the movement function (uses coordinator's pulse settings)
-                await _move_fn(ctrl)
+                # A count of pulses is the whole movement for beds that send a
+                # finite burst, but says nothing to a controller that streams a
+                # held keycode until it is stopped: that one has to be told the
+                # duration, and that this call owns the stop ending it.
+                with caller_bounded_hold(_duration_ms):
+                    # Call the movement function (uses coordinator's pulse settings)
+                    await _move_fn(ctrl)
             finally:
                 # Restore original pulse settings
                 _coordinator._motor_pulse_count = _original_pulse_count
