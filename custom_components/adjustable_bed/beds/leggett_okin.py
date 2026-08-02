@@ -98,8 +98,11 @@ RELEASE_FRAME_DELAY_MS = 100
 RECALL_FRAME_COUNT = 10
 RECALL_FRAME_DELAY_MS = 100
 
-# Programming a slot is a two-stage hold, not an opcode: arm with MEMORY_STORE
-# for ~5s, release, then hold the slot keycode for ~2s.
+# Programming a slot is a two-stage hold, not an opcode: MEMORY_STORE for ~5s,
+# then the slot keycode for ~2s. The app switches between the stages directly -
+# it swaps its key buffer within one 100ms tick, so no release burst separates
+# them - and releases only once, after the slot hold. Decompile-derived
+# (MainActivityBase.onPositionSetMessage); not yet verified on hardware.
 MEMORY_STORE_HOLD_S = 5.0
 MEMORY_SLOT_HOLD_S = 2.0
 MEMORY_PROGRAM_FRAME_DELAY_MS = 100
@@ -402,8 +405,10 @@ class LeggettOkinController(BedController):
 
         There is no program opcode. The box is armed by holding MEMORY_STORE
         for ~5s, then records whichever slot keycode is held for the following
-        ~2s. Both stages are ordinary held keycodes, so each ends with the
-        normal release burst.
+        ~2s. The vendor app switches from the store keycode to the slot keycode
+        directly, with no release frames between the stages, and sends the
+        normal release burst only once the slot hold ends (decompile-derived;
+        hardware verification pending).
         """
         command = self._MEMORY_SLOTS.get(memory_num)
         if command is None:
@@ -414,10 +419,6 @@ class LeggettOkinController(BedController):
         completed = False
         try:
             await self._hold_keycode(LeggettOkinCommands.MEMORY_STORE, MEMORY_STORE_HOLD_S)
-            # This release is a stage boundary, not cleanup: without the zero
-            # frames the box never leaves the arm stage, so continuing to the
-            # slot hold would run an invalid sequence and still report success.
-            await self._send_release_frames("memory store arm", raise_on_error=True)
             await self._hold_keycode(command, MEMORY_SLOT_HOLD_S)
             completed = True
         finally:

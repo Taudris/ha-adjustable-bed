@@ -201,21 +201,27 @@ class TestLeggettOkinController:
         }
 
     async def test_program_memory_is_a_two_stage_hold(self):
-        """Programming arms with the store keycode, releases, then holds the slot."""
+        """Programming streams the store keycode, then the slot, then one release.
+
+        The app switches from store to slot directly - no release frames
+        between the stages - and releases only after the slot hold
+        (decompile-derived; hardware verification pending).
+        """
         controller = LeggettOkinController(MagicMock())
         controller.write_command = AsyncMock()
 
         await controller.program_memory(2)
 
-        arm, arm_release, slot, slot_release = controller.write_command.await_args_list
+        arm, slot, release = controller.write_command.await_args_list
         # ~5s of the store keycode...
         assert arm.args == (bytes.fromhex("040200010000"),)
         assert arm.kwargs == {"repeat_count": 50, "repeat_delay_ms": 100}
-        assert arm_release.args == (bytes.fromhex("040200000000"),)
-        # ...a release, then ~2s of the slot keycode, then a release.
+        # ...then ~2s of the slot keycode with no release between the stages...
         assert slot.args == (bytes.fromhex("040200002000"),)
         assert slot.kwargs == {"repeat_count": 20, "repeat_delay_ms": 100}
-        assert slot_release.args == (bytes.fromhex("040200000000"),)
+        # ...then exactly four zero frames.
+        assert release.args == (bytes.fromhex("040200000000"),)
+        assert release.kwargs["repeat_count"] == 4
 
     async def test_stop_all_propagates_write_failures(self):
         """An explicit stop must not report success when it never reached the bed.
@@ -270,20 +276,20 @@ class TestLeggettOkinController:
             assert flat_call.kwargs["repeat_delay_ms"] == LEGGETT_OKIN_PULSE_DEFAULTS[1]
             assert flat_call.kwargs["repeat_count"] == 300
 
-    async def test_program_memory_aborts_when_the_stage_release_fails(self):
-        """The arm-to-slot release is a stage boundary, not best-effort cleanup.
+    async def test_program_memory_aborts_when_the_arm_hold_fails(self):
+        """A failed arm hold must not be followed by the slot keycode.
 
-        Without those zero frames the control box never leaves the arm stage, so
-        continuing to the slot hold would run an invalid programming sequence
-        while the service still reported success.
+        Streaming the slot keycode without a completed arm stage would be a
+        plain recall of that slot, so the sequence stops and the failure
+        surfaces instead of reporting a successful save.
         """
         controller = LeggettOkinController(MagicMock())
-        # Stage 1 (arm hold) succeeds; the release burst that ends it fails.
+        # Stage 1 (arm hold) fails; the release burst in cleanup succeeds.
         controller.write_command = AsyncMock(
-            side_effect=[None, BleakError("release failed"), None]
+            side_effect=[BleakError("arm failed"), None]
         )
 
-        with pytest.raises(BleakError, match="release failed"):
+        with pytest.raises(BleakError, match="arm failed"):
             await controller.program_memory(2)
 
         # The slot keycode must never have been sent.
@@ -320,9 +326,9 @@ class TestLeggettOkinController:
         report success.
         """
         controller = LeggettOkinController(MagicMock())
-        # arm hold, arm release, slot hold all succeed; the final release fails.
+        # arm hold and slot hold succeed; the final release fails.
         controller.write_command = AsyncMock(
-            side_effect=[None, None, None, BleakError("final release failed")]
+            side_effect=[None, None, BleakError("final release failed")]
         )
 
         with pytest.raises(BleakError, match="final release failed"):
