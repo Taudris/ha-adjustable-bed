@@ -1725,6 +1725,54 @@ class TestSwitchEntities:
         # Should have under-bed lights switch
         assert len(switch_states) == 1
 
+    async def test_leggett_okin_light_is_a_switch_not_a_toggle_button(
+        self,
+        hass: HomeAssistant,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """Okin reads its light state, so the light is a stateful switch.
+
+        The toggle button has to go with it: it and the switch drive the same
+        light, and the button carries no state.
+        """
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="Leggett Okin Bed",
+            data={
+                CONF_ADDRESS: "AA:BB:CC:DD:EE:42",
+                CONF_NAME: "Leggett Okin Bed",
+                CONF_BED_TYPE: BED_TYPE_LEGGETT_OKIN,
+                CONF_MOTOR_COUNT: 2,
+                CONF_HAS_MASSAGE: True,
+                CONF_DISABLE_ANGLE_SENSING: True,
+                CONF_PREFERRED_ADAPTER: "auto",
+            },
+            unique_id="AA:BB:CC:DD:EE:42",
+            entry_id="leggett_okin_light_entry",
+        )
+        entry.add_to_hass(hass)
+
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        from homeassistant.helpers import entity_registry as er
+
+        registry = er.async_get(hass)
+
+        assert (
+            registry.async_get_entity_id("switch", DOMAIN, "AA:BB:CC:DD:EE:42_under_bed_lights")
+            is not None
+        )
+        assert (
+            registry.async_get_entity_id("button", DOMAIN, "AA:BB:CC:DD:EE:42_toggle_light") is None
+        )
+        # The light platform is for colour-capable beds; this one stays a switch.
+        assert (
+            registry.async_get_entity_id("light", DOMAIN, "AA:BB:CC:DD:EE:42_under_bed_lights")
+            is None
+        )
+
     async def test_failed_switch_turn_off_keeps_auto_off_timer(
         self,
         hass: HomeAssistant,

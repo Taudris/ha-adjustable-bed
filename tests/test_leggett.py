@@ -9,8 +9,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from bleak.exc import BleakError
-from homeassistant.const import CONF_ADDRESS, CONF_NAME
+from homeassistant.const import CONF_ADDRESS, CONF_NAME, STATE_OFF, STATE_ON, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.adjustable_bed import SERVICE_TIMED_MOVE
@@ -25,6 +26,7 @@ from custom_components.adjustable_bed.beds.leggett_okin import (
     RELEASE_FRAME_COUNT,
     LeggettOkinCommands,
     LeggettOkinController,
+    LeggettOkinStatus,
 )
 from custom_components.adjustable_bed.const import (
     BED_MOTOR_PULSE_DEFAULTS,
@@ -41,7 +43,6 @@ from custom_components.adjustable_bed.const import (
     DOMAIN,
     LEGGETT_GEN2_WRITE_CHAR_UUID,
     LEGGETT_OKIN_NOTIFY_CHAR_UUID,
-    LEGGETT_OKIN_PULSE_DEFAULTS,
     LEGGETT_VARIANT_GEN2,
     LEGGETT_VARIANT_MLRM,
     LEGGETT_VARIANT_OKIN,
@@ -1351,6 +1352,401 @@ class TestLeggettOkinCadencePacing:
         )
 
         assert writes["count"] == 2
+
+
+# Written out rather than taken from the source constant, so a change to the
+# parser's idea of the light bit fails here instead of agreeing with itself.
+_LIGHT_BIT = 0x20000
+
+
+def _okin_state_frame(mask: int) -> bytes:
+    """Build a state frame in the 20-byte layout captured from a CU170 box."""
+    body = mask.to_bytes(4, "big")
+    return bytes([0x09, 0x0B]) + body + body + b"\xff" + bytes(9)
+
+
+def _okin_connected_coordinator(read_value: bytes | None = None) -> MagicMock:
+    """Return a mock coordinator whose client is connected."""
+    coordinator = MagicMock()
+    client = MagicMock()
+    client.is_connected = True
+    client.start_notify = AsyncMock()
+    client.stop_notify = AsyncMock()
+    client.read_gatt_char = AsyncMock(return_value=bytearray(read_value or b""))
+    coordinator.client = client
+    return coordinator
+
+
+class TestLeggettOkinStateFeedback:
+    """Test Leggett & Platt Okin under-bed light state reading."""
+
+    def test_state_frame_carries_the_light_bit(self):
+        """Bytes 2-5 big-endian are the state mask; 0x20000 is the light, per capture."""
+        on = LeggettOkinStatus.from_frame(_okin_state_frame(_LIGHT_BIT))
+        off = LeggettOkinStatus.from_frame(_okin_state_frame(0))
+
+        assert on is not None
+        assert on.mask == 0x20000
+        assert on.light is True
+        assert off is not None
+        assert off.light is False
+
+    def test_bits_this_code_does_not_identify_are_kept_and_ignored(self):
+        """Unidentified bits must survive into the mask for diagnostics.
+
+        0x8000 is the app's sleep-timer indicator, and as a keycode it is the
+        memory-4 recall - which is why mask bits are not read as keycodes.
+        """
+        status = LeggettOkinStatus.from_frame(_okin_state_frame(0x8000))
+
+        assert status is not None
+        assert status.mask == 0x8000
+        assert status.light is False
+        assert "0x00008000" in repr(status)
+
+    @pytest.mark.parametrize("frame", [b"", b"\x09\x0b\x00\x02\x00"])
+    def test_frames_too_short_to_carry_a_mask_are_rejected(self, frame: bytes):
+        """A frame shorter than six bytes has no complete mask, so nothing is parsed."""
+        assert LeggettOkinStatus.from_frame(frame) is None
+
+    async def test_notification_publishes_the_light_state(self):
+        """Every state change is pushed by the box, so notifications drive the state."""
+        coordinator = MagicMock()
+        controller = LeggettOkinController(coordinator)
+
+        controller._handle_status_notification(
+            None, bytearray(_okin_state_frame(_LIGHT_BIT))
+        )
+
+        coordinator.handle_controller_state_updates.assert_called_once_with(
+            {"under_bed_lights_on": True}
+        )
+        assert controller.get_light_state() == {"is_on": True}
+
+        # An unchanged light bit must not republish; a change must.
+        coordinator.handle_controller_state_updates.reset_mock()
+        controller._handle_status_notification(
+            None, bytearray(_okin_state_frame(_LIGHT_BIT | 0x8000))
+        )
+        coordinator.handle_controller_state_updates.assert_not_called()
+
+        controller._handle_status_notification(None, bytearray(_okin_state_frame(0)))
+        coordinator.handle_controller_state_updates.assert_called_once_with(
+            {"under_bed_lights_on": False}
+        )
+
+    async def test_a_short_frame_leaves_the_last_known_state_alone(self):
+        """Unusable frames are logged and dropped, not treated as an all-clear."""
+        coordinator = MagicMock()
+        controller = LeggettOkinController(coordinator)
+        controller._handle_status_notification(
+            None, bytearray(_okin_state_frame(_LIGHT_BIT))
+        )
+        coordinator.handle_controller_state_updates.reset_mock()
+
+        controller._handle_status_notification(None, bytearray(b"\x09\x0b\x00"))
+
+        coordinator.handle_controller_state_updates.assert_not_called()
+        assert controller.get_light_state() == {"is_on": True}
+
+    async def test_state_is_unknown_before_the_first_frame(self):
+        """No frame yet means no claim about the light."""
+        controller = LeggettOkinController(MagicMock())
+
+        assert controller.get_light_state() == {}
+        assert controller.last_feedback_frame is None
+        assert controller.feedback_state_mask is None
+
+    async def test_start_notify_subscribes_to_the_state_characteristic(self):
+        """The state characteristic is both the notify source and the read source."""
+        coordinator = _okin_connected_coordinator()
+        controller = LeggettOkinController(coordinator)
+
+        await controller.start_notify(None)
+
+        assert coordinator.client.start_notify.await_args.args[0] == LEGGETT_OKIN_NOTIFY_CHAR_UUID
+        assert controller._notify_started is True
+
+        # A second call must not resubscribe.
+        coordinator.client.start_notify.reset_mock()
+        await controller.start_notify(None)
+        coordinator.client.start_notify.assert_not_called()
+
+    async def test_a_box_that_refuses_the_subscription_still_controls(self):
+        """State is a convenience: a box without the characteristic must still work."""
+        coordinator = _okin_connected_coordinator()
+        coordinator.client.start_notify = AsyncMock(side_effect=BleakError("no such char"))
+        controller = LeggettOkinController(coordinator)
+
+        await controller.start_notify(None)
+
+        assert controller._notify_started is False
+        assert controller.get_light_state() == {}
+
+    async def test_read_light_state_hydrates_from_the_state_characteristic(self):
+        """The initial read resolves the light state before any notification arrives."""
+        frame = _okin_state_frame(_LIGHT_BIT)
+        coordinator = _okin_connected_coordinator(frame)
+        controller = LeggettOkinController(coordinator)
+
+        state = await controller.read_light_state()
+
+        coordinator.client.read_gatt_char.assert_awaited_once_with(LEGGETT_OKIN_NOTIFY_CHAR_UUID)
+        assert state == {"is_on": True}
+        assert controller.last_feedback_frame == frame.hex()
+        assert controller.feedback_state_mask == 0x20000
+
+    async def test_read_light_state_tolerates_an_empty_read(self):
+        """An empty or truncated read must leave the state unknown, not crash."""
+        controller = LeggettOkinController(_okin_connected_coordinator(b""))
+
+        assert await controller.read_light_state() == {}
+
+    async def test_lights_on_and_off_are_state_aware(self):
+        """The toggle keycode is only sent when the reported state differs."""
+        controller = _okin_controller()
+        controller._handle_status_notification(
+            None, bytearray(_okin_state_frame(_LIGHT_BIT))
+        )
+
+        await controller.lights_on()
+        controller.write_command.assert_not_called()
+
+        await controller.lights_off()
+        # The tap is one frame; only its release burst is paced.
+        assert controller.write_command.await_args.args == (bytes.fromhex("040200020000"),)
+        assert controller.write_command_paced.await_args.args == (
+            bytes.fromhex("040200000000"),
+        )
+
+        # With the light reported off, the roles swap.
+        controller.write_command.reset_mock()
+        controller._handle_status_notification(None, bytearray(_okin_state_frame(0)))
+        await controller.lights_off()
+        controller.write_command.assert_not_called()
+        await controller.lights_on()
+        assert controller.write_command.await_args_list[0].args == (
+            bytes.fromhex("040200020000"),
+        )
+
+    async def test_an_empty_cache_is_resolved_by_a_read_before_deciding(self):
+        """With no frame yet, lights_on reads the state instead of blind-toggling."""
+        coordinator = _okin_connected_coordinator(_okin_state_frame(_LIGHT_BIT))
+        controller = LeggettOkinController(coordinator)
+        controller.write_command = AsyncMock()
+        controller.write_command_paced = AsyncMock()
+
+        await controller.lights_on()
+
+        coordinator.client.read_gatt_char.assert_awaited_once_with(LEGGETT_OKIN_NOTIFY_CHAR_UUID)
+        controller.write_command.assert_not_called()
+
+        # The read hydrated the cache, so the next decision does not read again.
+        coordinator.client.read_gatt_char.reset_mock()
+        await controller.lights_off()
+        coordinator.client.read_gatt_char.assert_not_called()
+        assert controller.write_command.await_args.args == (bytes.fromhex("040200020000"),)
+        assert controller.write_command_paced.await_args.args == (
+            bytes.fromhex("040200000000"),
+        )
+
+    async def test_a_failed_read_falls_back_to_a_blind_toggle(self):
+        """A box whose state characteristic refuses the read still gets the toggle."""
+        coordinator = _okin_connected_coordinator()
+        coordinator.client.read_gatt_char = AsyncMock(side_effect=BleakError("no such char"))
+        controller = LeggettOkinController(coordinator)
+        controller.write_command = AsyncMock()
+        controller.write_command_paced = AsyncMock()
+
+        await controller.lights_on()
+
+        sent = [call.args[0] for call in controller.write_command.await_args_list]
+        assert sent.count(bytes.fromhex("040200020000")) == 1
+
+    async def test_an_unusable_read_falls_back_to_a_blind_toggle(self):
+        """An empty read leaves the state unknown, so the toggle is still sent."""
+        controller = LeggettOkinController(_okin_connected_coordinator())
+        controller.write_command = AsyncMock()
+        controller.write_command_paced = AsyncMock()
+
+        await controller.lights_off()
+
+        sent = [call.args[0] for call in controller.write_command.await_args_list]
+        assert sent.count(bytes.fromhex("040200020000")) == 1
+
+
+class TestLeggettOkinDiscreteLightControl:
+    """Test the light capability that reported state makes honest."""
+
+    def test_light_control_is_declared_discrete(self):
+        """State-aware on/off is discrete control, whatever the wire primitive is."""
+        controller = LeggettOkinController(MagicMock())
+
+        assert controller.supports_discrete_light_control is True
+        assert controller.supports_under_bed_lights is True
+
+    def test_light_state_is_declared_feedback_driven(self):
+        """State feedback is what makes the switch pessimistic instead of optimistic."""
+        controller = LeggettOkinController(MagicMock())
+
+        assert controller.supports_light_state_feedback is True
+
+    async def test_light_state_joins_the_coordinator_hydration_keys(
+        self,
+        hass: HomeAssistant,
+        mock_leggett_okin_config_entry,
+        mock_coordinator_connected,
+    ):
+        """Discrete control is what puts under_bed_lights_on in the refresh gate.
+
+        Without it the key set is empty, and an initial read that fails is never
+        retried because the gate has nothing left to satisfy.
+        """
+        coordinator = AdjustableBedCoordinator(hass, mock_leggett_okin_config_entry)
+        await coordinator.async_connect()
+
+        assert coordinator._readable_light_state_required_keys() == {"under_bed_lights_on"}
+
+    async def test_the_switch_state_comes_only_from_the_bed(
+        self,
+        hass: HomeAssistant,
+        mock_leggett_okin_config_entry,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """Command success never flips the switch; only reported state drives it.
+
+        The box ACKs writes it silently ignores on an unbonded link, so an
+        optimistic flip could display a state the device never entered.
+        """
+        await hass.config_entries.async_setup(mock_leggett_okin_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+        coordinator = hass.data[DOMAIN][mock_leggett_okin_config_entry.entry_id]
+        entity_id = er.async_get(hass).async_get_entity_id(
+            "switch", DOMAIN, f"{OKIN_TEST_ADDRESS}_under_bed_lights"
+        )
+        assert entity_id is not None
+        # The connect-time read returned nothing, so no state has been claimed yet.
+        assert hass.states.get(entity_id).state == STATE_UNKNOWN
+
+        await hass.services.async_call("switch", "turn_on", {"entity_id": entity_id}, blocking=True)
+        await hass.async_block_till_done()
+        assert hass.states.get(entity_id).state == STATE_UNKNOWN
+
+        # Only the bed's own report drives the state - in either direction.
+        coordinator.controller._handle_status_notification(
+            None, bytearray(_okin_state_frame(_LIGHT_BIT))
+        )
+        await hass.async_block_till_done()
+        assert hass.states.get(entity_id).state == STATE_ON
+
+        coordinator.controller._handle_status_notification(None, bytearray(_okin_state_frame(0)))
+        await hass.async_block_till_done()
+        assert hass.states.get(entity_id).state == STATE_OFF
+
+    async def test_setup_hydrates_the_switch_from_the_connect_time_read(
+        self,
+        hass: HomeAssistant,
+        mock_leggett_okin_config_entry,
+        mock_coordinator_connected,
+        mock_bleak_client,
+        enable_custom_integrations,
+    ):
+        """The forced read at connect resolves the state before any user action."""
+        frame = _okin_state_frame(_LIGHT_BIT)
+
+        async def _read_gatt_char(target) -> bytes:
+            if str(target) == LEGGETT_OKIN_NOTIFY_CHAR_UUID:
+                return frame
+            return b""
+
+        mock_bleak_client.read_gatt_char = AsyncMock(side_effect=_read_gatt_char)
+
+        await hass.config_entries.async_setup(mock_leggett_okin_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+        entity_id = er.async_get(hass).async_get_entity_id(
+            "switch", DOMAIN, f"{OKIN_TEST_ADDRESS}_under_bed_lights"
+        )
+        assert entity_id is not None
+        assert hass.states.get(entity_id).state == STATE_ON
+
+    async def test_reconnect_rereads_the_light_state(
+        self,
+        hass: HomeAssistant,
+        mock_leggett_okin_config_entry,
+        mock_coordinator_connected,
+        mock_bleak_client,
+    ):
+        """Every (re)connect repeats the forced read, correcting state missed offline."""
+        coordinator = AdjustableBedCoordinator(hass, mock_leggett_okin_config_entry)
+        assert await coordinator.async_connect()
+        assert "under_bed_lights_on" not in coordinator.controller_state
+
+        await coordinator.async_disconnect()
+
+        frame = _okin_state_frame(_LIGHT_BIT)
+
+        async def _read_gatt_char(target) -> bytes:
+            if str(target) == LEGGETT_OKIN_NOTIFY_CHAR_UUID:
+                return frame
+            return b""
+
+        mock_bleak_client.read_gatt_char = AsyncMock(side_effect=_read_gatt_char)
+
+        assert await coordinator.async_connect()
+        assert coordinator.controller_state["under_bed_lights_on"] is True
+
+    async def test_explicit_disconnect_then_connect_corrects_state_changed_offline(
+        self,
+        hass: HomeAssistant,
+        mock_leggett_okin_config_entry,
+        mock_coordinator_connected,
+        mock_bleak_client,
+    ):
+        """The Connect button must hydrate even when the connect-time read fails.
+
+        Hardware sequence: Disconnect button, physical remote toggles the
+        light, Connect button. The connect-time read can fail while the link
+        is not yet re-encrypted (unbonded reads get ATT error 5); the retry
+        must not be suppressed by the stale value the previous connection left
+        in controller_state, or the switch freezes on the stale state.
+        """
+        state = {"frame": _okin_state_frame(_LIGHT_BIT), "failures": 0}
+
+        async def _read_gatt_char(target) -> bytes:
+            if str(target) != LEGGETT_OKIN_NOTIFY_CHAR_UUID:
+                return b""
+            if state["failures"] > 0:
+                state["failures"] -= 1
+                raise BleakError("ATT error: 0x05 (Insufficient Authentication)")
+            return state["frame"]
+
+        mock_bleak_client.read_gatt_char = AsyncMock(side_effect=_read_gatt_char)
+
+        coordinator = AdjustableBedCoordinator(hass, mock_leggett_okin_config_entry)
+        # The switch keeps its controller-state subscription across reconnects;
+        # the refresh-retry gate requires a subscriber.
+        coordinator.register_controller_state_callback(lambda _state: None)
+        assert await coordinator.async_connect()
+        assert coordinator.controller_state["under_bed_lights_on"] is True
+
+        # Disconnect button, then the remote turns the light off while offline.
+        await coordinator.async_disconnect(serialize_with_commands=True)
+        state["frame"] = _okin_state_frame(0)
+        state["failures"] = 1
+
+        with patch(
+            "custom_components.adjustable_bed.coordinator._READABLE_LIGHT_STATE_RETRY_DELAY",
+            0,
+        ):
+            # The Connect button calls async_ensure_connected.
+            assert await coordinator.async_ensure_connected()
+            await hass.async_block_till_done()
+            await hass.async_block_till_done()
+
+        assert coordinator.controller_state["under_bed_lights_on"] is False
 
 
 class TestLeggettGen2CommandFormat:

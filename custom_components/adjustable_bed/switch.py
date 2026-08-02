@@ -133,13 +133,21 @@ class AdjustableBedSwitch(AdjustableBedEntity, SwitchEntity):
         super().__init__(coordinator)
         self.entity_description = description
         self._attr_unique_id = f"{coordinator.address}_{description.key}"
-        self._attr_is_on = False  # We don't have state feedback
         # Cache discrete control capability at init (controller should exist at setup time)
         # Default to False for toggle-only beds when controller disconnects
         controller = coordinator.controller
         self._supports_discrete_light_control = (
             controller is not None and controller.supports_discrete_light_control
         )
+        # Feedback-driven lights take state only from the bed: unknown until the
+        # first frame or read arrives. Everything else keeps the optimistic
+        # default, because nothing would ever update it.
+        self._light_state_from_feedback = (
+            description.key == "under_bed_lights"
+            and controller is not None
+            and controller.supports_light_state_feedback
+        )
+        self._attr_is_on = None if self._light_state_from_feedback else False
         # Timer handle for auto-off state updates (e.g., Octo lights turn off after 5 min)
         self._auto_off_timer: asyncio.TimerHandle | None = None
         self._state_unregister_callback: Callable[[], None] | None = None
@@ -234,9 +242,17 @@ class AdjustableBedSwitch(AdjustableBedEntity, SwitchEntity):
                 self.entity_description.turn_on_fn,
                 cancel_running=False,
             )
+            if self._light_state_from_feedback:
+                # The bed reports the outcome itself; an optimistic flip could
+                # display a state the device never entered (the box ACKs writes
+                # it silently ignores on an unbonded link).
+                _LOGGER.debug(
+                    "Feedback-driven light - state follows the bed for %s",
+                    self.entity_description.key,
+                )
             # Only update assumed state if controller supports discrete on/off
             # Toggle-only controllers can't reliably track state
-            if self._supports_discrete_control():
+            elif self._supports_discrete_control():
                 self._attr_is_on = True
                 self.async_write_ha_state()
                 # Schedule auto-off timer if the bed has hardware auto-off
@@ -273,9 +289,15 @@ class AdjustableBedSwitch(AdjustableBedEntity, SwitchEntity):
                 self.entity_description.turn_off_fn,
                 cancel_running=False,
             )
+            if self._light_state_from_feedback:
+                # The bed reports the outcome itself; see async_turn_on.
+                _LOGGER.debug(
+                    "Feedback-driven light - state follows the bed for %s",
+                    self.entity_description.key,
+                )
             # Only update assumed state if controller supports discrete on/off
             # Toggle-only controllers can't reliably track state
-            if self._supports_discrete_control():
+            elif self._supports_discrete_control():
                 # Cancel any pending auto-off timer only after the command succeeds.
                 # If transport fails, keep the timer so HA can still reflect the
                 # hardware-enforced auto-off when it happens.

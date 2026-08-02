@@ -89,6 +89,13 @@ reprogram a slot with whatever position the bed happened to be in.
 Massage power is a **toggle** with no discrete off, so the integration exposes
 no massage-off button.
 
+The under-bed light is a toggle on the wire too, but the box reports its state
+(see [Notifications](#notifications)), so the integration turns it into discrete
+on/off: it sends the toggle only when the reported state differs, and exposes
+the light as a stateful **switch** rather than a toggle button. With no state
+reported yet - notify refused, nothing received - it falls back to a blind
+toggle.
+
 There is no massage timer. `0x00000200` appears in the app as a constant
 (`FBP_KEYCODE_M5_IN`, a fifth actuator channel) but is never bound to a control
 and never written; it must not be reconstructed as a command.
@@ -208,15 +215,50 @@ mirrors the app's byte stream exactly.
 
 ## Notifications
 
-The notify characteristic carries an LED/status bitmask, not positions. The
-vendor app parses it into exactly two live indicators - sleep timer (`0x8000`)
-and alarm (`0x4000`) - and no parsed value ever influences a later command.
+The notify characteristic carries a state bitmask, not positions. It is both
+readable and notify-capable, and needs the same encrypted link the write
+characteristic does - already satisfied, because this bed type pairs.
 
-There is **no position, angle, percentage, motor-state or error feedback of any
-kind** in either app. Under-bed light state is *not* among the bits either app
-reads, so the integration exposes the light as a blind toggle. Users have
-reported that the physical remote does show light state; confirming that would
-need a BLE capture of the notify characteristic while toggling the light.
+The box emits a frame on **every** state change regardless of what caused it,
+including the wired remote, and a GATT read returns the current frame. The
+integration therefore reads once after connect and subscribes for updates.
+
+Observed frame layout (20 bytes, captured from a CU170 box):
+
+| Bytes | Meaning |
+|---|---|
+| `0` | low nibble is the payload size (9 observed) |
+| `1` | wire opcode (`0x0b` observed) |
+| `2..5` | **state bitmask, big-endian** |
+| `6..9` | a second copy of bytes `2..5` |
+| `10` | `0xFF` observed |
+| `11+` | unknown |
+
+Every frame is a full-state replace on this hardware, so the integration does
+not implement the vendor app's opcode dispatch (6/7/8/9/11) and does not
+cross-check the duplicate copy. Frames shorter than 6 bytes are logged and
+dropped.
+
+Known mask bits:
+
+| Bit | Meaning | Evidence |
+|---|---|---|
+| `0x00020000` | under-bed light on | hardware capture on this bed |
+| `0x00008000` | sleep timer armed | vendor app only (`activity_main.xml` `ledMask` tags); not confirmed on this bed |
+| `0x00004000` | alarm armed | vendor app only (same source); not confirmed on this bed |
+
+**Mask bits do not mirror keycode values.** The light bit happening to equal the
+light toggle keycode (`0x00020000`) is a coincidence, not a rule: `0x4000` and
+`0x8000` are alarm and sleep-timer *indicators* in this mask, while the same two
+values as *keycodes* recall memory slots 3 and 4. Every state bit therefore needs
+its own evidence, and the integration writes each identified bit out as a literal
+rather than deriving it from a keycode constant. No value the app parses from
+this mask ever influences a later command.
+
+There is still **no position, angle, percentage, motor-state or error feedback
+of any kind**. Diagnostics include the last raw frame and the parsed mask, so
+captures from other boxes sharing this characteristic (Okimat, Nectar) can
+identify further bits.
 
 ## Provenance
 

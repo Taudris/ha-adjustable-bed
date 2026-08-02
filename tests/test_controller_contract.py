@@ -49,6 +49,7 @@ SHARED_CAPABILITY_FLAGS: tuple[str, ...] = (
     "supports_light",
     "supports_under_bed_lights",
     "supports_discrete_light_control",
+    "supports_light_state_feedback",
     "supports_light_color_control",
     "supports_light_cycle",
     "supports_position_feedback",

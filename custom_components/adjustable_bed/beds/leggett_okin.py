@@ -7,9 +7,11 @@ This controller handles Leggett & Platt beds using the Okin binary protocol.
 Protocol details:
     Service UUID: 62741523-52f9-8864-b1ab-3b3a8d65950b (shared with Okimat/Nectar)
     Write characteristic: 62741525-52f9-8864-b1ab-3b3a8d65950b
+    State characteristic: 62741625-52f9-8864-b1ab-3b3a8d65950b (read + notify)
     Command format: 6-byte binary [0x04, 0x02, <4-byte-command-big-endian>]
     Motor timing: held keycodes stream every 100ms, released with four zero frames
-    Position feedback: Not supported
+    Position feedback: Not supported; the state characteristic carries a bitmask
+        of latched functions (under-bed light today)
     Pairing: Required before first use; handled by coordinator
 
 Note: This shares the same BLE service UUID with Okimat and Nectar beds.
@@ -23,16 +25,22 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from bleak.exc import BleakError
 
-from ..const import LEGGETT_OKIN_CHAR_UUID, LEGGETT_OKIN_NOTIFY_CHAR_UUID
+from ..const import (
+    LEGGETT_OKIN_CHAR_UUID,
+    LEGGETT_OKIN_NOTIFY_CHAR_UUID,
+)
 from .base import BedController, MotorControlSpec
 from .okin_protocol import build_okin_command
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..coordinator import AdjustableBedCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -143,6 +151,53 @@ MEMORY_PROGRAM_FRAME_CADENCE_MS = 100
 MOVEMENT_HOLD_CAP_S = 60.0
 
 
+# Feedback frame layout, from a capture of a CU170 box (frames were 20 bytes):
+#   byte[0] & 0x0F  payload size (9 observed)
+#   byte[1]         wire opcode (0x0b observed)
+#   bytes[2..5]     state bitmask, big-endian
+#   bytes[6..9]     a second copy of bytes[2..5]
+#   byte[10]        0xFF observed
+# Bytes past 10 are unknown, and the second copy is not cross-checked: on this
+# hardware every frame is a full-state replace, so the first copy is the state.
+STATUS_FRAME_MIN_LENGTH = 6
+_STATUS_MASK_BYTES = slice(2, 6)
+
+# Under-bed light, confirmed on hardware. It happens to equal TOGGLE_LIGHTS, but
+# it is written out here because mask bits do NOT generally mirror keycodes: the
+# app renders mask bits 0x4000 and 0x8000 as the alarm-armed and sleep-timer-armed
+# indicators (activity_main.xml ledMask tags), while those same values as keycodes
+# recall memory slots 3 and 4. Each state bit needs its own evidence.
+STATUS_LIGHT = 0x20000
+
+
+@dataclass(frozen=True, slots=True)
+class LeggettOkinStatus:
+    """State bitmask reported by the control box.
+
+    Only the under-bed light bit is identified here. The raw mask is kept intact
+    so unidentified bits reach diagnostics, and further bits get named as
+    evidence for each one arrives.
+    """
+
+    mask: int
+
+    @classmethod
+    def from_frame(cls, data: bytes) -> LeggettOkinStatus | None:
+        """Parse a feedback frame, or return None if it is too short to carry a mask."""
+        if len(data) < STATUS_FRAME_MIN_LENGTH:
+            return None
+        return cls(int.from_bytes(data[_STATUS_MASK_BYTES], "big"))
+
+    @property
+    def light(self) -> bool:
+        """Return True when the under-bed light is on."""
+        return bool(self.mask & STATUS_LIGHT)
+
+    def __repr__(self) -> str:
+        """Return the raw mask in hex, so unnamed bits survive into logs."""
+        return f"LeggettOkinStatus(0x{self.mask:08x})"
+
+
 class MotorDirection(Enum):
     """Direction for motor movement."""
 
@@ -170,6 +225,10 @@ class LeggettOkinController(BedController):
         # without the feedback characteristic never answer at all, and on those
         # an unanswered frame is no evidence that anything was lost.
         self._status_receipt_channel_proven = False
+        # Live state from the feedback characteristic; None until a frame arrives.
+        self._status: LeggettOkinStatus | None = None
+        self._last_status_frame: bytes | None = None
+        self._notify_started = False
         _LOGGER.debug("LeggettOkinController initialized")
 
     def forward_raw_notification(self, characteristic_uuid: str, data: bytes) -> None:
@@ -190,6 +249,14 @@ class LeggettOkinController(BedController):
         """Return the UUID of the control characteristic."""
         return LEGGETT_OKIN_CHAR_UUID
 
+    @property
+    def requires_notification_channel(self) -> bool:
+        """Keep the feedback subscription up even with angle sensing disabled.
+
+        It carries no angles to disable - it is the only source of light state.
+        """
+        return True
+
     # Capability properties
     @property
     def supports_preset_zero_g(self) -> bool:
@@ -207,8 +274,28 @@ class LeggettOkinController(BedController):
 
     @property
     def supports_discrete_light_control(self) -> bool:
-        """Return False - Okin only supports toggle, not discrete on/off."""
-        return False
+        """Return True - the wire primitive is a toggle, but on/off are discrete.
+
+        lights_on and lights_off decide against the state the bed reports, so
+        they are idempotent in the way a discrete control has to be. This is
+        what puts the under-bed light on a switch instead of a toggle button.
+        """
+        return True
+
+    @property
+    def supports_under_bed_lights(self) -> bool:
+        """Return True - the light has its own keycode and its own state bit."""
+        return True
+
+    @property
+    def supports_light_state_feedback(self) -> bool:
+        """Return True - the state characteristic reports every light change.
+
+        This is what keeps the switch entity pessimistic: the box ACKs writes
+        it silently ignores on an unbonded link, so command success proves
+        nothing and only reported state may drive the displayed state.
+        """
+        return True
 
     @property
     def supports_memory_presets(self) -> bool:
@@ -774,17 +861,130 @@ class LeggettOkinController(BedController):
         finally:
             await self._send_release_frames(context, raise_on_error=completed)
 
+    # State feedback
+    #
+    # The box emits a frame on every state change whatever caused it - BLE or the
+    # wired remote - and a read of the same characteristic returns the current
+    # frame. So: read once on connect, then let notifications keep it current.
+    async def start_notify(self, callback: Callable[[str, float], None] | None = None) -> None:
+        """Subscribe to the state characteristic.
+
+        The position callback is unused; this bed reports no motor angles.
+        """
+        client = self.client
+        if client is None or not client.is_connected:
+            raise ConnectionError("Not connected to bed")
+        if self._notify_started:
+            return
+        try:
+            async with self._ble_lock:
+                await client.start_notify(
+                    LEGGETT_OKIN_NOTIFY_CHAR_UUID, self._handle_status_notification
+                )
+        except BleakError as err:
+            # State is a convenience here, not a prerequisite for control: a box
+            # without this characteristic must still drive its motors, and the
+            # light falls back to a read before each command, then a blind toggle.
+            _LOGGER.debug(
+                "Could not subscribe to Okin state notifications for %s: %s",
+                self._coordinator.address,
+                err,
+            )
+            return
+        self._notify_started = True
+        _LOGGER.debug("Started Okin state notifications for %s", self._coordinator.address)
+
+    async def stop_notify(self) -> None:
+        """Unsubscribe from the state characteristic."""
+        client = self.client
+        if client is not None and client.is_connected and self._notify_started:
+            with contextlib.suppress(Exception):
+                async with self._ble_lock:
+                    await client.stop_notify(LEGGETT_OKIN_NOTIFY_CHAR_UUID)
+        self._notify_started = False
+
+    def _handle_status_notification(self, _sender: Any, data: bytearray) -> None:
+        """Handle a state frame pushed by the control box."""
+        self._apply_status_frame(bytes(data))
+
+    def _apply_status_frame(self, data: bytes) -> None:
+        """Parse a state frame and publish any light-state change."""
+        self.forward_raw_notification(LEGGETT_OKIN_NOTIFY_CHAR_UUID, data)
+        status = LeggettOkinStatus.from_frame(data)
+        if status is None:
+            _LOGGER.debug("Ignoring unusable Okin state frame: %s", data.hex())
+            return
+        previous = self._status
+        self._status = status
+        self._last_status_frame = data
+        if previous is None or previous.light != status.light:
+            self.forward_controller_state_updates({"under_bed_lights_on": status.light})
+
+    async def read_light_state(self) -> dict[str, Any]:
+        """Read the state characteristic and return the light state it carries."""
+        client = self.client
+        if client is None or not client.is_connected:
+            raise ConnectionError("Not connected to bed")
+        async with self._ble_lock:
+            data = bytes(await client.read_gatt_char(LEGGETT_OKIN_NOTIFY_CHAR_UUID))
+        self._apply_status_frame(data)
+        return self.get_light_state()
+
+    def get_light_state(self) -> dict[str, Any]:
+        """Return the cached light state, or nothing while it is still unknown."""
+        if self._status is None:
+            return {}
+        return {"is_on": self._status.light}
+
+    @property
+    def last_feedback_frame(self) -> str | None:
+        """Return the last state frame as hex, for diagnostics captures."""
+        if self._last_status_frame is None:
+            return None
+        return self._last_status_frame.hex()
+
+    @property
+    def feedback_state_mask(self) -> int | None:
+        """Return the bitmask parsed from the last state frame."""
+        return None if self._status is None else self._status.mask
+
     # Light methods
     async def lights_toggle(self) -> None:
         """Toggle lights."""
         await self._tap_keycode(LeggettOkinCommands.TOGGLE_LIGHTS, "lights_toggle")
 
+    async def _resolve_light_state(self) -> bool | None:
+        """Return the reported light state, reading it when the cache is empty.
+
+        The cache is not updated optimistically anywhere: the box reports every
+        state change itself, whereas a toggle that never reached the light would
+        leave an optimistic cache inverted with no later frame to correct it.
+        Right after connect no frame has arrived yet, and a blind toggle sent
+        then can physically invert the light - so an empty cache is resolved
+        with a read first. A box without the state characteristic fails the
+        read and keeps the pre-state-feedback blind toggle as its only option.
+        """
+        if self._status is None:
+            try:
+                await self.read_light_state()
+            except (BleakError, ConnectionError, TimeoutError) as err:
+                _LOGGER.debug(
+                    "Could not read Okin light state before deciding for %s: %s",
+                    self._coordinator.address,
+                    err,
+                )
+        return None if self._status is None else self._status.light
+
     async def lights_on(self) -> None:
-        """Turn on lights (via toggle - no discrete control)."""
+        """Turn on lights, skipping the toggle when the bed already reports them on."""
+        if await self._resolve_light_state() is True:
+            return
         await self.lights_toggle()
 
     async def lights_off(self) -> None:
-        """Turn off lights (via toggle - no discrete control)."""
+        """Turn off lights, skipping the toggle when the bed already reports them off."""
+        if await self._resolve_light_state() is False:
+            return
         await self.lights_toggle()
 
     # Massage methods
