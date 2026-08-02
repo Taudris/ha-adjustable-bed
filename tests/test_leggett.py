@@ -233,19 +233,74 @@ class TestLeggettOkinController:
         controller.write_command.assert_not_awaited()
         assert controller._motor_state == {}
 
-    async def test_stop_stays_silent_for_any_motor_name(self):
-        """A stop asserts no keycode, so its name cannot be wrong enough to matter.
+    async def test_a_stop_carries_no_motor(self):
+        """A stop asserts no keycode, so it names no motor and passes None.
 
-        Stop clears the held state and sends the release burst whatever motor
-        it names; refusing to stop the bed over a label would be the worse
-        failure.
+        The release burst clears the whole key buffer: there is no per-motor
+        stop to name, and a name here could only suggest one motor had been
+        singled out.
         """
         controller = _streaming_okin_controller()
 
-        await controller._move_motor("neck", leggett_okin_module.MotorDirection.STOP)
+        await controller._move_motor(None, leggett_okin_module.MotorDirection.STOP)
 
         controller.write_command.assert_awaited_once()
         assert controller.write_command.await_args.args == (ZERO_FRAME,)
+
+    async def test_every_stop_entry_point_passes_no_motor(self):
+        """The contract's per-motor stops all resolve to the same motorless stop.
+
+        Each one is reachable from a cover entity and from timed_move's stop
+        callable, so a stop that still carried a label would put that label
+        back into the log by the back door.
+        """
+        for method in (
+            "move_head_stop",
+            "move_back_stop",
+            "move_legs_stop",
+            "move_feet_stop",
+            "move_tilt_stop",
+            "move_lumbar_stop",
+        ):
+            controller = _streaming_okin_controller()
+            with patch.object(
+                controller, "_move_motor", new_callable=AsyncMock
+            ) as mock_move:
+                await getattr(controller, method)()
+
+            assert mock_move.await_args.args == (
+                None,
+                leggett_okin_module.MotorDirection.STOP,
+            ), method
+
+    async def test_a_movement_without_a_motor_raises(self):
+        """Absent is only valid for a stop; a movement has nothing to move.
+
+        Making the motor optional is what lets a stop say "no motor" instead of
+        naming one it does not act on, so the same signature has to keep
+        rejecting a movement that names none.
+        """
+        controller = _streaming_okin_controller()
+
+        with pytest.raises(ValueError, match="needs a motor"):
+            await controller._move_motor(None, leggett_okin_module.MotorDirection.UP)
+
+        controller.write_command.assert_not_awaited()
+        assert controller._motor_state == {}
+
+    async def test_an_unknown_motor_is_rejected_on_a_stop_too(self):
+        """Validation is total: a supplied motor is checked whatever it is for.
+
+        The old stop path skipped the check because the name was only a log
+        label. Now that a stop passes None, a name arriving here at all is a
+        caller mistake worth the same refusal as on a movement.
+        """
+        controller = _streaming_okin_controller()
+
+        with pytest.raises(ValueError, match="Unknown Leggett Okin motor: 'neck'"):
+            await controller._move_motor("neck", leggett_okin_module.MotorDirection.STOP)
+
+        controller.write_command.assert_not_awaited()
 
     async def test_every_movement_method_names_a_known_motor(self):
         """The keycode table has to cover every motor the move_* methods use.

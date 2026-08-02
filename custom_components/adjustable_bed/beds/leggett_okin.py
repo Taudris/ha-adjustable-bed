@@ -237,33 +237,44 @@ class LeggettOkinController(BedController):
             command |= self._MOTOR_KEYCODES[motor][direction]
         return command
 
-    async def _move_motor(self, motor: str, direction: MotorDirection) -> None:
+    async def _move_motor(self, motor: str | None, direction: MotorDirection) -> None:
         """Start holding a motor keycode, or stop the active hold.
 
         The coordinator serializes commands, so at most one hold exists at a
         time: a new movement replaces whatever was held rather than combining
-        with it, and a stop ends the active hold whichever motor it names
-        (the preempted hold's stream is already gone by the time the stop
-        runs, so re-streaming a different motor here would restart it).
+        with it, and a stop ends whichever hold is active (the preempted
+        hold's stream is already gone by the time the stop runs, so
+        re-streaming a different motor here would restart it).
 
-        A motor name absent from ``_MOTOR_KEYCODES`` is a wiring mistake in
-        this module, not a device condition, so it raises before the state is
-        recorded and before a single frame goes out. Its keycode would be 0,
-        and 0 is the release frame: the stream would push stop frames for the
-        full hold cap rather than doing nothing. The stop branch needs no such
-        check - it asserts no keycode, the name only labels a log line, and a
-        stop must reach the bed whatever it is called.
+        A stop therefore has no motor, and says so by passing ``None``. This
+        protocol has no per-motor stop to name: the release burst clears the
+        whole key buffer, so a name here could only mislead a reader of the
+        log into thinking one motor was singled out.
+
+        Validation is total, which is what naming the absence buys. A motor
+        that is present must be one of ``_MOTOR_KEYCODES``: an unknown name is
+        a wiring mistake in this module, not a device condition, and its
+        keycode would be 0 - the release frame - so the stream would push stop
+        frames for the full hold cap rather than doing nothing. A motor that is
+        absent is only meaningful for a stop; a movement without one has
+        nothing to move.
 
         Raises:
-            ValueError: If ``motor`` is not one of this bed's motors.
+            ValueError: If ``motor`` is not one of this bed's motors, or if a
+                movement was asked for without one.
         """
-        if direction == MotorDirection.STOP:
-            await self._stop_movement(f"{motor} stop")
-            return
-        if motor not in self._MOTOR_KEYCODES:
+        if motor is not None and motor not in self._MOTOR_KEYCODES:
             raise ValueError(
                 f"Unknown Leggett Okin motor: {motor!r}; "
                 f"expected one of {sorted(self._MOTOR_KEYCODES)}"
+            )
+        if direction == MotorDirection.STOP:
+            await self._stop_movement("motor stop")
+            return
+        if motor is None:
+            raise ValueError(
+                f"A Leggett Okin {direction.value} movement needs a motor; "
+                "only a stop has none"
             )
         self._motor_state = {motor: direction}
         await self._stream_movement(self._get_move_command())
@@ -420,7 +431,7 @@ class LeggettOkinController(BedController):
 
     async def move_head_stop(self) -> None:
         """Stop head motor."""
-        await self._move_motor("head", MotorDirection.STOP)
+        await self._move_motor(None, MotorDirection.STOP)
 
     async def move_back_up(self) -> None:
         """Move back up (same as head)."""
@@ -444,7 +455,7 @@ class LeggettOkinController(BedController):
 
     async def move_legs_stop(self) -> None:
         """Stop legs motor."""
-        await self._move_motor("feet", MotorDirection.STOP)
+        await self._move_motor(None, MotorDirection.STOP)
 
     async def move_feet_up(self) -> None:
         """Move feet up."""
@@ -640,7 +651,7 @@ class LeggettOkinController(BedController):
 
     async def move_tilt_stop(self) -> None:
         """Stop tilt motor."""
-        await self._move_motor("tilt", MotorDirection.STOP)
+        await self._move_motor(None, MotorDirection.STOP)
 
     # Lumbar motor control
     async def move_lumbar_up(self) -> None:
@@ -653,4 +664,4 @@ class LeggettOkinController(BedController):
 
     async def move_lumbar_stop(self) -> None:
         """Stop lumbar motor."""
-        await self._move_motor("lumbar", MotorDirection.STOP)
+        await self._move_motor(None, MotorDirection.STOP)
