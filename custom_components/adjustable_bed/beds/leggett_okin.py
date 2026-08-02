@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 
 from bleak.exc import BleakError
 
-from ..const import LEGGETT_OKIN_CHAR_UUID
+from ..const import LEGGETT_OKIN_CHAR_UUID, LEGGETT_OKIN_NOTIFY_CHAR_UUID
 from .base import BedController
 from .okin_protocol import build_okin_command
 
@@ -87,19 +87,25 @@ class LeggettOkinCommands:
 # keycode-0 frames (OutputThread.runNormal, MaxZeroCount = 3). There is no
 # distinct stop opcode: the release frame is an ordinary frame carrying 0.
 RELEASE_FRAME_COUNT = 4
-# Same 100ms as this bed's default recall cadence, but deliberately a separate
-# constant: these are independent findings about different command families, and
-# retuning one must not silently retune the other. The release burst is also not
+# Same 100ms as the held-key cadence, but deliberately a separate constant:
+# these are independent findings about different command families, and retuning
+# one must not silently retune the other. The release burst is also not
 # configurable - it is the protocol's only stop, so it is not a knob to sweep.
 RELEASE_FRAME_DELAY_MS = 100
 
-# A recall is a burst with no terminator at all. The control box latches the
+# A recall is one frame with no terminator at all. The control box latches the
 # keycode and drives the move to completion by itself, so appending a release
-# frame could cancel the motion the recall just started - and the burst size is
-# redundancy against a dropped packet rather than a duration. The burst is
-# therefore sized by the device's motor pulse options, which for this bed
-# default to the app's 10 frames at 100ms (LEGGETT_OKIN_PULSE_DEFAULTS). See
-# _recall.
+# frame could cancel the motion the recall just started - and so could a second
+# copy of the keycode: once the box's ~235ms hold watchdog has expired, another
+# frame is a second press, and a second press during preset motion stops the
+# bed. Delivery is therefore confirmed rather than repeated; see _recall.
+#
+# How long to wait for that confirmation. A write round trip through an ESPHome
+# proxy to this box measured ~180ms with a tail past 250ms, and the receipt is
+# pushed back over the same link, so this is ~2x the measured tail: long enough
+# that a slow-but-fine frame is never retried, short enough that a command which
+# genuinely never landed is retried while the user is still watching.
+RECALL_RECEIPT_TIMEOUT_S = 0.5
 
 # Programming a slot is a two-stage hold, not an opcode: arm with MEMORY_STORE
 # for ~5s, release, then hold the slot keycode for ~2s.
@@ -127,7 +133,28 @@ class LeggettOkinController(BedController):
         """Initialize the Leggett & Platt Okin controller."""
         super().__init__(coordinator)
         self._motor_state: dict[str, MotorDirection] = {}
+        # Set by every status frame the box pushes. _recall arms it before a
+        # write and waits on it afterwards, so it means "the box answered
+        # something we sent since we armed it".
+        self._status_receipt = asyncio.Event()
+        # Whether a status frame has ever reached us on this connection. Boxes
+        # without the feedback characteristic never answer at all, and on those
+        # an unanswered frame is no evidence that anything was lost.
+        self._status_receipt_channel_proven = False
         _LOGGER.debug("LeggettOkinController initialized")
+
+    def forward_raw_notification(self, characteristic_uuid: str, data: bytes) -> None:
+        """Note the box's receipt for a sent frame, then forward as usual.
+
+        The box answers every command frame it receives with a state frame, so
+        this is where a confirmed send learns that its frame landed. Every path
+        that observes a state frame already funnels through this call, so
+        hooking it here needs no second subscription and no second parser.
+        """
+        if characteristic_uuid == LEGGETT_OKIN_NOTIFY_CHAR_UUID:
+            self._status_receipt_channel_proven = True
+            self._status_receipt.set()
+        super().forward_raw_notification(characteristic_uuid, data)
 
     @property
     def control_characteristic_uuid(self) -> str:
@@ -347,52 +374,99 @@ class LeggettOkinController(BedController):
     }
 
     async def _recall(self, command: int) -> None:
-        """Send a latched recall burst.
+        """Send a latched command once and confirm the box received it.
 
-        A recall is a burst and then silence: the control box latches the
+        A recall is one frame and then silence: the control box latches the
         keycode and drives the move to completion on its own. This is the one
         command family the app deliberately leaves unterminated, so no release
         frames follow - they could cancel the motion it just started.
 
-        Because the box owns the motion, the burst size decides nothing about
-        how far or how long the bed moves. The frames are pure redundancy
-        against a dropped RF packet: the first one that lands does the work and
-        the rest are insurance. That makes the burst the device's motor pulse
-        options - ``motor_pulse_count`` frames at ``motor_pulse_delay_ms`` -
-        rather than a protocol constant, so the redundancy can be tuned per
-        device. They default to the app's 10 frames at 100ms for this bed. A
-        movement's run time still never depends on these settings; a latched
-        command simply has no run time of its own to depend on them.
+        Repeating the frame would do the same. The box retriggers a ~235ms hold
+        watchdog on each frame it receives; once that has expired it reads the
+        next copy as a *second press*, and a second press during preset motion
+        stops the bed. A ten-frame burst at a 100ms cadence was therefore ten
+        chances for a link hiccup to cancel the move that its own first frame
+        started - and every frame after the first was already redundant, since
+        the box had latched.
 
-        Both are floored at 1. The setup flows accept any integer, a count of 0
-        would drop the recall entirely, and a nonpositive cadence has no
-        meaning. No floor beyond that is needed: every frame still waits for
-        its write response, and the count bounds the burst, so a small cadence
-        cannot flood the link the way it could a duration-derived hold.
+        So the redundancy is confirmation instead of repetition. The box
+        answers every frame it receives with a status frame, which is a
+        receipt: if it arrives, the frame landed and there is nothing left to
+        do. Only when no receipt arrives - the one case where there is no
+        motion in progress to cancel - is another frame sent.
+
+        ``motor_pulse_count`` now bounds the number of *attempts*, not a burst
+        length: it is how many unanswered frames this command may spend before
+        it reports failure. ``motor_pulse_delay_ms`` no longer applies here;
+        retries are paced by ``RECALL_RECEIPT_TIMEOUT_S``, which is a property
+        of the link rather than a user preference. A recall's run time still
+        belongs entirely to the box.
+
+        Boxes without the feedback characteristic never answer anything. On
+        those, silence carries no information, so a single frame is sent and
+        trusted rather than retried into a cancellation. The channel counts as
+        proven once any status frame has been seen on this connection.
+
+        Raises:
+            BleakError: If every attempt went unanswered on a box that is
+                known to answer.
         """
-        pulse_count, pulse_delay_ms = self.motor_pulse_settings()
-        await self.write_command(
-            self._build_command(command),
-            repeat_count=max(1, pulse_count),
-            repeat_delay_ms=max(1, pulse_delay_ms),
+        attempts = max(1, self.motor_pulse_settings()[0])
+        frame = self._build_command(command)
+        channel_proven = self._status_receipt_channel_proven
+        for attempt in range(1, attempts + 1):
+            self._status_receipt.clear()
+            await self.write_command(frame)
+            if await self._status_receipt_arrived():
+                return
+            if not channel_proven:
+                _LOGGER.debug(
+                    "No status receipt for command %#x and this box has never "
+                    "sent one; treating the frame as delivered",
+                    command,
+                )
+                return
+            _LOGGER.debug(
+                "No status receipt for command %#x within %.0f ms (attempt %d/%d)",
+                command,
+                RECALL_RECEIPT_TIMEOUT_S * 1000,
+                attempt,
+                attempts,
+            )
+        raise BleakError(
+            f"Control box did not acknowledge command {command:#x} "
+            f"after {attempts} attempt(s)"
         )
+
+    async def _status_receipt_arrived(self) -> bool:
+        """Wait out the receipt window for the frame just written.
+
+        The event is armed before the write, so a receipt that arrives while
+        the write is still completing is already recorded here and costs no
+        wait at all.
+        """
+        if self._status_receipt.is_set():
+            return True
+        try:
+            async with asyncio.timeout(RECALL_RECEIPT_TIMEOUT_S):
+                await self._status_receipt.wait()
+        except TimeoutError:
+            return False
+        return True
 
     async def preset_flat(self) -> None:
         """Go to flat position.
 
         The control box latches FLAT and flattens on its own, exactly like a
-        memory recall, so this is a bounded burst and not a hold. LP Control
-        2.11.0 ships a press-and-release mode whose whole FLAT command is a
-        single frame, and its Okin implementation of ``setPressAndHoldMode`` is
-        empty - it never tells the box which mode it is in, so the box has to
-        be doing the work. Repeating the frame only guards against a dropped
-        packet; a lost single frame would silently do nothing.
+        memory recall, so this is a single confirmed frame and not a hold. LP
+        Control 2.11.0 ships a press-and-release mode whose whole FLAT command
+        is a single frame, and its Okin implementation of
+        ``setPressAndHoldMode`` is empty - it never tells the box which mode it
+        is in, so the box has to be doing the work.
 
-        How many times to repeat it is therefore the device's
-        ``motor_pulse_count``, at ``motor_pulse_delay_ms``, read as redundancy
-        and not as duration - see ``_recall``. Flat and the memory slots stay
-        one burst shape on purpose: they are the same command family, and a
-        sweep that tuned only one of them would leave the other unexplained.
+        Flat and the memory slots stay one delivery shape on purpose: they are
+        the same command family, and a change that treated only one of them as
+        latched would leave the other unexplained. See ``_recall``.
         """
         await self._recall(LeggettOkinCommands.PRESET_FLAT)
 

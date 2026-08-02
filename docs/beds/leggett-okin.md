@@ -103,22 +103,37 @@ button is down. On release the app emits **exactly four** keycode-`0` frames and
 then goes silent. There is no distinct stop opcode; the release frame is an
 ordinary frame carrying zero.
 
-**Recalls** (the memory slots and flat) are a burst of **10 frames at ~100 ms**,
-with **no terminator at all**. The control box latches the keycode and drives
-the move to completion by itself. Appending a release frame here risks
-cancelling the motion the recall just started, so the integration deliberately
-does not.
+**Recalls** (the memory slots and flat) are a **single frame** with **no
+terminator at all**. The control box latches the keycode and drives the move to
+completion by itself. Appending a release frame here risks cancelling the motion
+the recall just started, so the integration deliberately does not.
 
-Because the box owns the motion, a recall's burst length is **redundancy, not
-duration**: the first frame that lands does the work and the rest only cover a
-dropped RF packet. Sending more frames cannot make the bed travel further or
-longer, and sending fewer cannot cut a move short - it can only lose the whole
-command. The integration therefore takes the burst from the device's
-`motor_pulse_count` / `motor_pulse_delay_ms` options, which default to 10 and
-100 ms for this bed, so the redundancy is tunable per device without a code
-change. Both are floored at 1. This does not make any *movement* depend on the
-cadence setting: held keycodes are still wall-clock bounded, and a latched
-command has no run time of its own.
+Repeating the keycode is the same hazard. The box retriggers its hold watchdog
+(~235 ms, measured) on every frame it receives; once that has expired, another
+copy of the keycode is a **second press**, and a second press during preset
+motion stops the bed. The integration used to send ten frames at ~100 ms here,
+which on a link whose round trip measures ~180 ms with a tail past 250 ms was
+ten chances to cancel the move its own first frame had started.
+
+Because the box owns the motion, extra frames buy nothing anyway: the first
+frame that lands does the work, and sending more cannot make the bed travel
+further or longer. So delivery is **confirmed rather than repeated**. The box
+answers every frame it receives with a status frame on the feedback
+characteristic, and that answer is a receipt: one frame, wait for the receipt,
+done. Only when no receipt arrives - the one case where no motion is in progress
+to cancel - is another frame sent.
+
+`motor_pulse_count` therefore bounds the number of **attempts** for a latched
+command, not a burst length: how many unanswered frames it may spend before the
+command reports failure (default 10 for this bed). `motor_pulse_delay_ms` does
+not apply to recalls at all; a retry waits for the receipt window instead, which
+is a property of the link rather than a user preference. Held keycodes are
+unaffected: they are still wall-clock bounded and still paced by
+`motor_pulse_delay_ms`.
+
+A box that has never sent a status frame - one without the feedback
+characteristic - is never retried, because its silence carries no information.
+Such a box gets a single frame, exactly as the physical remote sends.
 
 Flat looks like a held button in `com.leggett.prodigy4`, but only because that
 app streams *every* key the same way and never special-cases flat. LP Control
@@ -168,8 +183,13 @@ independent analyst runs agreed on every value recorded here. The flat latching
 finding comes from a second app on the same wire protocol, LP Control 2.11.0
 (`com.leggett.lpbtsuitesdk.controlbox.OkinControlBoxInterface`).
 
+The per-frame status receipt, the hold watchdog and the second-press
+cancellation were measured on hardware (CU170 over an ESPHome proxy): a recall
+sent as a repeated burst was observed cancelling its own motion, and the
+physical remote reproduced the same stop with a second press mid-preset.
+
 Unverified against hardware, and worth a capture if you have the equipment:
-which frame revision real units use, whether preset recall truly ends without a
-terminator, whether a flat burst flattens fully on a box left in the older
-app's press-and-hold mode, and whether the `0x08010000` chord resets memory to
-factory defaults as the vendor guide states.
+which frame revision real units use, whether a single latched flat frame
+flattens fully on a box left in the older app's press-and-hold mode, and whether
+the `0x08010000` chord resets memory to factory defaults as the vendor guide
+states.

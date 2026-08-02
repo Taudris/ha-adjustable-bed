@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -33,6 +34,7 @@ from custom_components.adjustable_bed.const import (
     CONF_PROTOCOL_VARIANT,
     DOMAIN,
     LEGGETT_GEN2_WRITE_CHAR_UUID,
+    LEGGETT_OKIN_NOTIFY_CHAR_UUID,
     LEGGETT_OKIN_PULSE_DEFAULTS,
     LEGGETT_VARIANT_GEN2,
     LEGGETT_VARIANT_MLRM,
@@ -113,17 +115,37 @@ class TestLeggettGen2Controller:
 def _recall_okin_controller(
     pulse_count: int = LEGGETT_OKIN_PULSE_DEFAULTS[0],
     pulse_delay_ms: int = LEGGETT_OKIN_PULSE_DEFAULTS[1],
+    *,
+    receipts: Sequence[bool] = (),
 ) -> LeggettOkinController:
-    """Return an Okin controller whose recall burst reads concrete pulse settings.
+    """Return an Okin controller whose latched sends the box answers.
 
-    A recall now sizes itself from the device's motor pulse options, so a bare
-    MagicMock coordinator would hand the burst two mocks instead of numbers.
+    A latched command sends one frame and waits for the state frame the box
+    answers it with, so the fake write delivers that receipt exactly where the
+    notification callback would - synchronously, with no timer in the loop.
+
+    ``receipts`` says which attempts are answered; attempts past its end are
+    answered. Pass ``(False,)`` for a box that stays silent once, ``(False,) *
+    n`` for one that never answers. The channel counts as proven from the first
+    receipt, so a test that wants an unproven channel simply never delivers one.
+
+    ``pulse_count`` is the attempt budget and ``pulse_delay_ms`` no longer
+    reaches a recall at all, but a bare MagicMock coordinator would still hand
+    the controller mocks instead of numbers.
     """
     coordinator = MagicMock()
     coordinator.motor_pulse_count = pulse_count
     coordinator.motor_pulse_delay_ms = pulse_delay_ms
     controller = LeggettOkinController(coordinator)
-    controller.write_command = AsyncMock()
+    answers = iter(receipts)
+
+    async def _write(*_args: object, **_kwargs: object) -> None:
+        if next(answers, True):
+            controller.forward_raw_notification(
+                LEGGETT_OKIN_NOTIFY_CHAR_UUID, bytes.fromhex("040a00000000")
+            )
+
+    controller.write_command = AsyncMock(side_effect=_write)
     return controller
 
 
@@ -191,13 +213,14 @@ class TestLeggettOkinController:
         ("slot", "keycode"),
         [(1, "00001000"), (2, "00002000"), (3, "00004000"), (4, "00008000")],
     )
-    async def test_memory_recall_ladder_and_burst(self, slot: int, keycode: str):
-        """Recall is a 10-frame burst of the slot bit with no terminator.
+    async def test_memory_recall_ladder_and_single_frame(self, slot: int, keycode: str):
+        """Recall is one frame of the slot bit, with no terminator and no repeat.
 
         The ladder previously started at 0x2000 and ran to 0x10000, so every slot
         recalled its neighbour and "memory 4" actually sent the store-arm keycode
         (issue #368). Recall is also autonomous: appending a release frame could
-        cancel the move the box just started.
+        cancel the move the box just started, and so could a second copy of the
+        keycode once the box's hold watchdog has expired.
         """
         controller = _recall_okin_controller()
 
@@ -206,7 +229,7 @@ class TestLeggettOkinController:
         controller.write_command.assert_awaited_once()
         call = controller.write_command.await_args
         assert call.args == (bytes.fromhex(f"0402{keycode}"),)
-        assert call.kwargs == {"repeat_count": 10, "repeat_delay_ms": 100}
+        assert call.kwargs == {}
 
     async def test_store_keycode_is_never_a_recall(self):
         """0x10000 arms an overwrite and must not appear in the recall ladder."""
@@ -268,14 +291,15 @@ class TestLeggettOkinController:
 
         assert controller.write_command.await_count == 2
 
-    async def test_preset_flat_is_a_bounded_recall_burst(self):
-        """Flat is latched by the box, so it is a recall burst and not a hold.
+    async def test_preset_flat_is_one_confirmed_frame(self):
+        """Flat is latched by the box, so it is one frame and not a hold or burst.
 
         LP Control ships a press-and-release mode whose entire flat command is
         one frame, and never tells an Okin box which mode it is in, so the box
-        completes the flatten itself. The burst only guards against a dropped
-        packet. It also takes no terminator: zero frames could cancel the move
-        the box just started, exactly as for a memory recall.
+        completes the flatten itself. It takes no terminator either: zero frames
+        could cancel the move the box just started, exactly as for a memory
+        recall - and so could a repeat of the keycode, which the box reads as a
+        second press once its hold watchdog has expired.
         """
         controller = _recall_okin_controller()
 
@@ -284,33 +308,14 @@ class TestLeggettOkinController:
         controller.write_command.assert_awaited_once()
         call = controller.write_command.await_args
         assert call.args == (bytes.fromhex("040208000000"),)
-        assert call.kwargs == {"repeat_count": 10, "repeat_delay_ms": 100}
-
-    async def test_preset_flat_at_this_bed_type_defaults_is_the_protocol_burst(self):
-        """A device nobody has tuned must still send the app's exact burst.
-
-        Sizing the burst from the pulse options only stays honest while the
-        shipped defaults for this bed type reproduce the 10 frames at 100ms the
-        app sends. Reading them out of the per-bed-type table rather than
-        restating the numbers is what makes a drifted default fail here instead
-        of silently retuning every recall in the field.
-        """
-        pulse_count, pulse_delay_ms = BED_MOTOR_PULSE_DEFAULTS[BED_TYPE_LEGGETT_OKIN]
-        assert (pulse_count, pulse_delay_ms) == (10, 100)
-        controller = _recall_okin_controller(pulse_count, pulse_delay_ms)
-
-        await controller.preset_flat()
-
-        call = controller.write_command.await_args
-        assert call.args == (bytes.fromhex("040208000000"),)
-        assert call.kwargs == {"repeat_count": 10, "repeat_delay_ms": 100}
+        assert call.kwargs == {}
 
     async def test_preset_flat_matches_the_memory_recall_path(self):
-        """Flat and a memory recall are the same burst, so retuning one moves both.
+        """Flat and a memory recall are delivered identically.
 
-        A parallel copy of the burst sizing would let the two drift apart the
-        next time it is retuned, and the user tuning redundancy on hardware has
-        no reason to expect flat to answer differently from a memory slot.
+        A parallel copy of the delivery rules would let the two drift apart the
+        next time either is retuned, and a user has no reason to expect flat to
+        behave differently from a memory slot.
         """
         controller = _recall_okin_controller(pulse_count=3, pulse_delay_ms=250)
 
@@ -318,38 +323,119 @@ class TestLeggettOkinController:
         await controller.preset_memory(1)
 
         flat_call, recall_call = controller.write_command.await_args_list
-        assert flat_call.kwargs == recall_call.kwargs
-        assert flat_call.kwargs == {"repeat_count": 3, "repeat_delay_ms": 250}
+        assert flat_call.kwargs == recall_call.kwargs == {}
+        assert controller.write_command.await_count == 2
 
-    @pytest.mark.parametrize(
-        ("pulse_count", "pulse_delay_ms", "expected"),
-        [
-            (10, 100, {"repeat_count": 10, "repeat_delay_ms": 100}),
-            (25, 100, {"repeat_count": 25, "repeat_delay_ms": 100}),
-            (10, 200, {"repeat_count": 10, "repeat_delay_ms": 200}),
-            (0, 100, {"repeat_count": 1, "repeat_delay_ms": 100}),
-            (-5, 100, {"repeat_count": 1, "repeat_delay_ms": 100}),
-            (10, 0, {"repeat_count": 10, "repeat_delay_ms": 1}),
-            (10, -50, {"repeat_count": 10, "repeat_delay_ms": 1}),
-        ],
-    )
-    async def test_preset_flat_tracks_the_pulse_settings_within_floors(
-        self, pulse_count: int, pulse_delay_ms: int, expected: dict[str, int]
-    ):
-        """The burst is a redundancy knob the user can sweep, floored at sanity.
+    async def test_a_receipt_ends_the_recall_after_one_frame(self):
+        """The box's state frame is the receipt, and it is the whole redundancy.
 
-        A latched command's run time belongs to the control box, so the frame
-        count only decides how many chances the keycode gets to arrive. The
-        setup flows accept any integer: a count of 0 would drop the command
-        entirely and a nonpositive delay is meaningless, so both floor at 1. No
-        floor beyond that is needed - the count bounds the burst and every
-        frame still waits for its write response.
+        Every frame after the one the box answered is pure downside: the box has
+        already latched, and once its ~235ms hold watchdog expires the next copy
+        of the keycode is a second press, which stops a preset mid-move.
         """
-        controller = _recall_okin_controller(pulse_count, pulse_delay_ms)
+        controller = _recall_okin_controller(pulse_count=10)
+
+        await controller.preset_memory(2)
+
+        controller.write_command.assert_awaited_once()
+
+    async def test_an_unanswered_frame_is_retried_up_to_the_attempt_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Silence is the one safe moment to resend: nothing landed, so nothing cancels.
+
+        The first frame here is answered, which proves the box answers at all;
+        the second command's frame is not, so it is worth resending.
+        """
+        monkeypatch.setattr(leggett_okin, "RECALL_RECEIPT_TIMEOUT_S", 0)
+        controller = _recall_okin_controller(pulse_count=3, receipts=(True, False, True))
+
+        await controller.preset_flat()
+        controller.write_command.assert_awaited_once()
+
+        await controller.preset_memory(1)
+
+        assert controller.write_command.await_count == 3
+        resent = controller.write_command.await_args_list[1:]
+        assert [call.args for call in resent] == [(bytes.fromhex("040200001000"),)] * 2
+
+    async def test_an_unanswered_recall_fails_once_the_attempts_run_out(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A recall that was never acknowledged is a failed command, not a silent one.
+
+        Every other path in this controller that ends in an unconfirmed write -
+        stop_all, the memory-store stage releases - reports the failure rather
+        than logging it, because the caller's next decision depends on whether
+        the bed moved.
+        """
+        monkeypatch.setattr(leggett_okin, "RECALL_RECEIPT_TIMEOUT_S", 0)
+        controller = _recall_okin_controller(pulse_count=3, receipts=(True,) + (False,) * 9)
+
+        await controller.preset_flat()
+        controller.write_command.reset_mock()
+
+        with pytest.raises(BleakError, match="did not acknowledge"):
+            await controller.preset_memory(1)
+
+        assert controller.write_command.await_count == 3
+
+    async def test_a_box_that_never_answers_is_sent_one_frame_and_trusted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A box with no feedback characteristic must not be retried into a cancel.
+
+        Its silence carries no information at all, so resending would be a blind
+        second press on a bed that may well be mid-preset. One frame is what the
+        physical remote sends, and a write with response already reached the
+        box's GATT server.
+        """
+        monkeypatch.setattr(leggett_okin, "RECALL_RECEIPT_TIMEOUT_S", 0)
+        controller = _recall_okin_controller(pulse_count=10, receipts=(False,) * 10)
 
         await controller.preset_flat()
 
-        assert controller.write_command.await_args.kwargs == expected
+        controller.write_command.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        ("pulse_count", "expected_attempts"),
+        [(10, 10), (25, 25), (3, 3), (1, 1), (0, 1), (-5, 1)],
+    )
+    async def test_the_pulse_count_bounds_the_attempts(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        pulse_count: int,
+        expected_attempts: int,
+    ):
+        """motor_pulse_count now buys retries, not frames of one burst.
+
+        The setup flows accept any integer, and a count of 0 would drop the
+        command entirely, so it floors at 1. The delay is deliberately not read
+        here: retries are paced by the receipt window, which belongs to the link
+        rather than to a user preference.
+        """
+        monkeypatch.setattr(leggett_okin, "RECALL_RECEIPT_TIMEOUT_S", 0)
+        controller = _recall_okin_controller(
+            pulse_count, pulse_delay_ms=250, receipts=(True,) + (False,) * 30
+        )
+
+        await controller.preset_flat()
+        controller.write_command.reset_mock()
+
+        with pytest.raises(BleakError):
+            await controller.preset_memory(1)
+
+        assert controller.write_command.await_count == expected_attempts
+
+    async def test_this_bed_types_defaults_still_give_the_documented_budget(self):
+        """A device nobody has tuned gets the documented ten attempts.
+
+        Reading the shipped per-bed-type defaults rather than restating them is
+        what makes a drifted default fail here instead of silently retuning
+        every recall in the field.
+        """
+        pulse_count, pulse_delay_ms = BED_MOTOR_PULSE_DEFAULTS[BED_TYPE_LEGGETT_OKIN]
+        assert (pulse_count, pulse_delay_ms) == (10, 100)
 
     async def test_no_flat_hold_duration_remains(self):
         """The fixed hold duration is gone, not merely bypassed.
