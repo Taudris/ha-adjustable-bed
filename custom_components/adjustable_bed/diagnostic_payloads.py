@@ -114,6 +114,10 @@ def new_connection_attempt_details(attempt: int, preferred_adapter: str) -> dict
         "selected_connectable": None,
         "non_connectable_fallback_used": False,
         "visible_sources": [],
+        # What the Bluetooth stack had last heard from the bed when the attempt
+        # started and, if it failed, when it failed (see ble_availability).
+        "advertisement_at_start": None,
+        "advertisement_at_failure": None,
         "lookup_elapsed_seconds": None,
         "connect_elapsed_seconds": None,
         "total_elapsed_seconds": None,

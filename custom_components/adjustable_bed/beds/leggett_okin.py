@@ -31,10 +31,7 @@ from typing import TYPE_CHECKING, Any
 
 from bleak.exc import BleakError
 
-from ..const import (
-    LEGGETT_OKIN_CHAR_UUID,
-    LEGGETT_OKIN_NOTIFY_CHAR_UUID,
-)
+from ..const import LEGGETT_OKIN_CHAR_UUID, LEGGETT_OKIN_NOTIFY_CHAR_UUID
 from .base import BedController, MotorControlSpec
 from .okin_protocol import build_okin_command
 

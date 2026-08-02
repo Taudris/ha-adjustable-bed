@@ -316,6 +316,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = AdjustableBedCoordinator(hass, entry)
     _async_ensure_device_registry_entry(hass, entry, coordinator)
 
+    # Start BLE visibility telemetry before the first connect attempt: setup
+    # retries are exactly when knowing whether the bed is still advertising
+    # matters. Home Assistant also runs on-unload callbacks when setup raises
+    # ConfigEntryNotReady, so this stays balanced on the failure path.
+    entry.async_on_unload(coordinator.async_start_availability_tracking())
+
     def _bond_gated_unbonded() -> bool:
         """Return whether this entry still needs the bond-gated repair path.
 
