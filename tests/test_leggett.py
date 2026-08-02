@@ -229,8 +229,7 @@ class TestLeggettOkinController:
         measures its arm and record windows against: 50 frames on a 100ms
         cadence is the ~5s arm window and 20 is the ~2s record window. Unpaced,
         each frame also cost a write round trip, which stretched both stages
-        past the windows and put ~5% of the gaps past the ~300ms keep-alive
-        watchdog.
+        past the windows and pushed gaps past the ~235ms keep-alive watchdog.
         """
         controller = _okin_controller()
 
@@ -482,8 +481,9 @@ class TestLeggettOkinCadencePacing:
     """Cadence pacing of the movement stream's underlying write loop.
 
     The bed's control box halts motion when the inter-frame gap exceeds
-    roughly 300ms, and proxied write-with-response round trips reach that on
-    their own - so the stream schedules frame k at stream start + k * cadence
+    roughly 235ms - measured, at an achieved gap of p50 232 / max 237ms the
+    bed still moved - and proxied write-with-response round trips reach that on
+    their own, so the stream schedules frame k at stream start + k * cadence
     instead of sleeping the full delay after every response.
     """
 
@@ -532,13 +532,15 @@ class TestLeggettOkinCadencePacing:
         assert client.write_gatt_char.await_count == 4
         assert sleeps == pytest.approx([0.06, 0.06, 0.06])
 
-    async def test_overrun_sends_immediately_and_logs(
+    async def test_overrun_sends_immediately_and_warns_once(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ):
-        """A round trip past the tick must not add a sleep, and must be visible.
+        """A round trip past the tick must not add a sleep, and must be visible once.
 
-        The next frame goes out immediately so the watchdog gap stops growing,
-        and the debug log is the only trace that the link fell behind cadence.
+        The next frame goes out immediately so the watchdog gap stops growing.
+        Every frame of a stream this slow breaches, and a line each would bury
+        the fact in its own volume, so the stream warns on the first breach and
+        counts the rest.
         """
         controller, client = _paced_link_controller()
         clock, sleeps = self._install_fake_clock(monkeypatch)
@@ -550,13 +552,129 @@ class TestLeggettOkinCadencePacing:
 
         with caplog.at_level(logging.DEBUG, logger="custom_components.adjustable_bed.beds.base"):
             await controller.write_command_paced(
-                bytes.fromhex("040200000001"), repeat_count=3, cadence_ms=100
+                bytes.fromhex("040200000001"), repeat_count=4, cadence_ms=100
             )
 
-        assert client.write_gatt_char.await_count == 3
+        assert client.write_gatt_char.await_count == 4
         assert sleeps == []
-        assert "Frame 1 overran cadence by 150 ms" in caplog.text
-        assert "Frame 2 overran cadence by 300 ms" in caplog.text
+        assert caplog.text.count("exceeded the 235 ms keep-alive window") == 1
+        assert "Frame gap of 250 ms" in caplog.text
+
+    async def test_gaps_are_measured_between_packets_not_against_the_schedule(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The only figure the box reacts to is the gap since the last frame it got.
+
+        Drift from the schedule the stream started on accumulates whether or
+        not the link recovers: a real capture read 82, 85, 292, 296, 336, 608,
+        632, 714, 818ms of "overrun" while the gaps between packets were 104,
+        306, 103, 140, 373, 205, 52, 253, 103ms - a runaway against two
+        breaches in nine gaps. The watchdog retriggers on the last frame
+        received, so the second list is the one that describes the bed.
+        """
+        controller, client = _paced_link_controller()
+        clock, _ = self._install_fake_clock(monkeypatch)
+        # Round trips chosen so the stream never catches back up to its grid.
+        # By the last frame it is 900ms behind the schedule it started on,
+        # while no gap between packets ever exceeded 360ms.
+        round_trips = iter([0.04, 0.30, 0.30, 0.30, 0.30])
+
+        async def _write(char_uuid: str, command: bytes, response: bool = True) -> None:
+            clock["now"] += next(round_trips)
+
+        client.write_gatt_char = AsyncMock(side_effect=_write)
+
+        await controller.write_command_paced(
+            bytes.fromhex("040200000001"), repeat_count=5, cadence_ms=100
+        )
+
+        assert clock["now"] == pytest.approx(1.30)  # 900ms past the last tick
+        summary = controller._coordinator.record_stream_cadence.call_args.kwargs["summary"]
+        assert summary["gap_count"] == 4
+        assert summary["max_gap_ms"] == pytest.approx(360, abs=1)
+        assert summary["median_gap_ms"] == pytest.approx(300, abs=1)
+        assert summary["breaches"] == 4
+
+    async def test_a_clean_stream_files_its_cadence_without_warning(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ):
+        """A stream that held cadence is still worth a histogram, just not a warning.
+
+        The support bundle is where a cadence question gets answered, and "the
+        gaps were fine" only means something if the clean streams are in there
+        too.
+        """
+        controller, client = _paced_link_controller()
+        clock, _ = self._install_fake_clock(monkeypatch)
+
+        async def _write(char_uuid: str, command: bytes, response: bool = True) -> None:
+            clock["now"] += 0.040
+
+        client.write_gatt_char = AsyncMock(side_effect=_write)
+
+        with caplog.at_level(logging.DEBUG, logger="custom_components.adjustable_bed.beds.base"):
+            await controller.write_command_paced(
+                bytes.fromhex("040200000001"), repeat_count=4, cadence_ms=100
+            )
+
+        assert "keep-alive window" not in caplog.text
+        call = controller._coordinator.record_stream_cadence.call_args.kwargs
+        assert call["target_cadence_ms"] == 100
+        assert call["characteristic_uuid"] == controller.control_characteristic_uuid
+        summary = call["summary"]
+        assert summary["breaches"] == 0
+        assert summary["breach_threshold_ms"] == 235
+        assert summary["max_gap_ms"] == pytest.approx(100, abs=1)
+        assert sum(summary["histogram_ms"].values()) == summary["gap_count"] == 3
+
+    async def test_a_stream_cut_short_still_files_its_cadence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A stream that ended early is exactly the one whose gaps are worth reading.
+
+        Preemption, the safety cap and a write failure all leave the loop
+        without reaching its frame budget, and the cadence up to that point is
+        still the record of what the link did.
+        """
+        controller, client = _paced_link_controller()
+        clock, _ = self._install_fake_clock(monkeypatch)
+        cancel = controller._coordinator.cancel_command
+        writes = {"count": 0}
+
+        async def _write(char_uuid: str, command: bytes, response: bool = True) -> None:
+            clock["now"] += 0.040
+            writes["count"] += 1
+            if writes["count"] == 3:
+                cancel.set()
+
+        client.write_gatt_char = AsyncMock(side_effect=_write)
+
+        await controller.write_command_paced(
+            bytes.fromhex("040200000001"), repeat_count=50, cadence_ms=100
+        )
+
+        summary = controller._coordinator.record_stream_cadence.call_args.kwargs["summary"]
+        assert summary["gap_count"] == 2
+
+    async def test_unpaced_writes_file_no_cadence(self, monkeypatch: pytest.MonkeyPatch):
+        """Every other bed shares this loop and none of them paces, so none reports.
+
+        Their delay is a post-response sleep rather than a target, so a gap
+        histogram would describe a cadence they never asked for.
+        """
+        controller, client = _paced_link_controller()
+        clock, _ = self._install_fake_clock(monkeypatch)
+
+        async def _write(char_uuid: str, command: bytes, response: bool = True) -> None:
+            clock["now"] += 0.040
+
+        client.write_gatt_char = AsyncMock(side_effect=_write)
+
+        await controller.write_command(
+            bytes.fromhex("040200000001"), repeat_count=3, repeat_delay_ms=100
+        )
+
+        controller._coordinator.record_stream_cadence.assert_not_called()
 
     async def test_unpaced_writes_keep_the_fixed_sleep(self, monkeypatch: pytest.MonkeyPatch):
         """write_command's loop is untouched: the full delay follows every response.

@@ -117,10 +117,24 @@ Every one of these intervals is a **target cadence**, not a sleep between
 writes: frame *k* is scheduled at stream start + *k* × cadence, so the BLE
 write round trip is absorbed into the interval instead of added to it. This
 matters through a proxy: the control box halts motion when the inter-frame gap
-exceeds roughly 300 ms (measured), and proxied write-with-response round trips
-of 105-300 ms plus a fixed sleep would push gaps past that window. When a round
-trip overruns its tick the next frame is sent immediately and the overrun is
-logged at debug level ("Frame N overran cadence by X ms").
+exceeds roughly **235 ms**, and proxied write-with-response round trips of
+105-300 ms plus a fixed sleep would push gaps past that window. When a round
+trip overruns its tick the next frame is sent immediately.
+
+The 235 ms figure is measured: streaming at an achieved gap of p50 232 / max
+237 ms moved the bed smoothly apart from occasional stutter, so the box gives
+up just under ~237 ms. An earlier "~300 ms" figure recorded here was measuring
+when the bed *looked* stopped rather than when the hold broke.
+
+**Reading the cadence back.** The gap between consecutive frames is the only
+timing figure this hardware reacts to - the watchdog retriggers on the last
+frame received, so drift from the schedule a stream started on says nothing
+about whether the bed kept moving. A stream therefore measures the gaps
+between its own packets: it warns once, on the first gap past the window, logs
+one summary line when it ends, and files a bucketed histogram of the gaps under
+`stream_cadence` in the support bundle. The buckets put 235 ms on an edge, so
+"how many gaps could the box have noticed" is read off directly rather than
+interpolated, and `breaches` states it outright.
 
 Pacing applies to every repeated-frame path: motor movement, the memory-store
 arm and slot holds, flat, the release burst and the recall trigger. That

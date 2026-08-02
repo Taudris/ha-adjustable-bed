@@ -164,6 +164,7 @@ async def generate_support_bundle(
         "notifications": diagnostics_report.notifications,
         "notification_summary": diagnostics_report.notification_summary,
         "command_trace": diagnostics_report.command_trace if coordinator is not None else [],
+        "stream_cadence": diagnostics_report.stream_cadence if coordinator is not None else [],
         "recent_logs": recent_logs,
         "evidence": evidence,
         "supported_bed_types": list(SUPPORTED_BED_TYPES),

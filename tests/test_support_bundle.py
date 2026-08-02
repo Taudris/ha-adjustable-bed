@@ -38,6 +38,7 @@ from custom_components.adjustable_bed.const import (
     SOLACE_SERVICE_UUID,
 )
 from custom_components.adjustable_bed.coordinator import AdjustableBedCoordinator
+from custom_components.adjustable_bed.diagnostics_utils import summarize_stream_gaps
 from custom_components.adjustable_bed.support_bundle import (
     _build_evidence_summary,
     _build_nearby_device_inventory,
@@ -679,6 +680,7 @@ class TestBleDiagnosticsRunner:
         coordinator.connection_history = {}
         coordinator.connection_attempt_details = []
         coordinator.command_trace = []
+        coordinator.stream_cadence = []
 
         async def _read_gatt_char_1(target):
             target_uuid = getattr(target, "uuid", target)
@@ -759,6 +761,7 @@ class TestBleDiagnosticsRunner:
         coordinator.connection_history = {}
         coordinator.connection_attempt_details = []
         coordinator.command_trace = []
+        coordinator.stream_cadence = []
         coordinator.controller = MagicMock(requires_notification_channel=True)
         coordinator.async_start_notify_for_diagnostics = AsyncMock()
 
@@ -830,6 +833,7 @@ class TestBleDiagnosticsRunner:
             }
         ]
         coordinator.command_trace = []
+        coordinator.stream_cadence = []
         coordinator.async_ensure_connected = AsyncMock(return_value=False)
 
         with (
@@ -975,6 +979,7 @@ class TestSupportBundle:
             connection_history={},
             connection_attempt_details=[{"attempt": 1, "result": "connected"}],
             command_trace=[],
+            stream_cadence=[],
             errors=[],
         )
 
@@ -1006,6 +1011,7 @@ class TestSupportBundle:
         assert report["integration"]["kaidi_variant_source"] is None
         assert report["controller"]["initialized"] is False
         assert report["command_trace"] == []
+        assert report["stream_cadence"] == []
         assert report["bluetooth"]["advertisements_by_source"] == [{"source": "proxy_1"}]
         assert report["bluetooth"]["nearby_devices"]["limit"] == 30
         assert report["bluetooth"]["nearby_devices"]["devices"] == []
@@ -1041,6 +1047,7 @@ class TestSupportBundle:
             connection_history={},
             connection_attempt_details=[{"attempt": 1, "result": "connected"}],
             command_trace=[],
+            stream_cadence=[],
             errors=[],
         )
 
@@ -1074,6 +1081,7 @@ class TestSupportBundle:
         assert report["integration"]["address"] == mock_config_entry.data["address"]
         assert report["controller"]["initialized"] is False
         assert report["command_trace"] == []
+        assert report["stream_cadence"] == []
 
     async def test_pairing_section_distinguishes_marker_from_backend_bond(
         self,
@@ -1122,6 +1130,7 @@ class TestSupportBundle:
             connection_history={},
             connection_attempt_details=[{"attempt": 1, "result": "failed"}],
             command_trace=[],
+            stream_cadence=[],
             errors=["Failed to connect"],
         )
 
@@ -1369,6 +1378,36 @@ class TestSupportBundle:
 
         await coordinator.async_execute_controller_command(_user_command)
         assert coordinator.command_trace[-1]["operation_name"] == "command"
+
+    async def test_coordinator_records_stream_cadence(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """A paced stream's achieved cadence is buffered next to the writes it made.
+
+        The command trace says what was asked for. On a bed whose control box
+        drops a hold after a fixed silence, that is only half the question; the
+        other half is what the link actually delivered.
+        """
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        await coordinator.async_connect()
+
+        coordinator.record_stream_cadence(
+            characteristic_uuid="0000fee9-0000-1000-8000-00805f9b34fb",
+            controller_class="LeggettOkinController",
+            target_cadence_ms=100,
+            summary=summarize_stream_gaps([104.0, 306.0]),
+        )
+
+        recorded = coordinator.stream_cadence[-1]
+        assert recorded["target_cadence_ms"] == 100
+        assert recorded["controller_class"] == "LeggettOkinController"
+        assert recorded["breaches"] == 1
+        assert recorded["histogram_ms"]["301-500"] == 1
+        assert recorded["timestamp"]
 
 
 class TestSupportBundleLoggingWarning:

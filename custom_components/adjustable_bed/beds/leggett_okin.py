@@ -241,9 +241,9 @@ class LeggettOkinController(BedController):
                 # cadence: frame k is scheduled at stream start + k * cadence,
                 # so a write round trip is absorbed into the interval instead
                 # of added to it. The box's keep-alive watchdog halts motion
-                # when the inter-frame gap exceeds roughly 300ms, and proxy
-                # round trips alone can approach that - a post-response sleep
-                # would push every gap past it. A small cadence cannot flood
+                # when the inter-frame gap exceeds roughly 235ms (measured), and
+                # proxy round trips alone can approach that - a post-response
+                # sleep would push every gap past it. A small cadence cannot flood
                 # the link (each frame still waits for its write response), so
                 # the floor only keeps the arithmetic sane.
                 pulse_count, cadence_ms = self.motor_pulse_settings()
@@ -473,7 +473,7 @@ class LeggettOkinController(BedController):
         ``hold_seconds`` mean seconds: unpaced, each frame cost a write round
         trip on top of the cadence, and the box measures its arm and record
         windows itself. Both stages are also long enough that an unpaced stream
-        would almost certainly hit at least one gap past the ~300ms keep-alive
+        would almost certainly hit at least one gap past the ~235ms keep-alive
         watchdog, which drops the hold and makes the store look like the box
         rejected it - and nothing here parses acknowledgements, so a dropped
         hold is invisible.

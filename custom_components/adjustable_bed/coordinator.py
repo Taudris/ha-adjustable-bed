@@ -180,6 +180,10 @@ _PASSIVE_POSITION_RECONCILIATION_IDLE_MARGIN = 15.0
 
 MAX_COMMAND_TRACE_ENTRIES = 100
 
+# One entry per paced stream rather than per frame, so a session's worth of
+# movement fits in far fewer entries than the command trace needs.
+MAX_STREAM_CADENCE_ENTRIES = 50
+
 # How many successful paired connections to make while the always-pair latch is
 # set before dropping it to re-test whether the bond persists again. Small
 # enough that a bed moved to a bond-keeping adapter recovers quickly, large
@@ -392,6 +396,7 @@ class AdjustableBedCoordinator:
         self._actual_adapter: str | None = None
         self._available_adapters: list[str] = []
         self._command_trace: deque[dict[str, Any]] = deque(maxlen=MAX_COMMAND_TRACE_ENTRIES)
+        self._stream_cadence: deque[dict[str, Any]] = deque(maxlen=MAX_STREAM_CADENCE_ENTRIES)
         self._connection_attempt_details: deque[dict[str, Any]] = deque(
             maxlen=MAX_CONNECTION_ATTEMPT_DETAILS
         )
@@ -1289,6 +1294,11 @@ class AdjustableBedCoordinator:
         return list(self._command_trace)
 
     @property
+    def stream_cadence(self) -> list[dict[str, Any]]:
+        """Return the achieved frame cadence of recent paced streams."""
+        return list(self._stream_cadence)
+
+    @property
     def connection_attempt_details(self) -> list[dict[str, Any]]:
         """Return detailed recent connection attempts."""
         return list(self._connection_attempt_details)
@@ -1484,6 +1494,31 @@ class AdjustableBedCoordinator:
                 "repeat_delay_ms": repeat_delay_ms,
                 "command_origin": command_origin,
                 "operation_name": self._active_operation_name,
+            }
+        )
+
+    def record_stream_cadence(
+        self,
+        *,
+        characteristic_uuid: str,
+        controller_class: str,
+        target_cadence_ms: int,
+        summary: dict[str, Any],
+    ) -> None:
+        """Record the achieved frame cadence of one paced stream.
+
+        The command trace says what was asked for; this says what the link
+        delivered. Beds whose control box drops a hold after a fixed silence
+        cannot be diagnosed from the request alone.
+        """
+        self._stream_cadence.append(
+            {
+                "timestamp": datetime.now(UTC).isoformat(),
+                "controller_class": controller_class,
+                "characteristic_uuid": characteristic_uuid,
+                "target_cadence_ms": target_cadence_ms,
+                "operation_name": self._active_operation_name,
+                **summary,
             }
         )
 

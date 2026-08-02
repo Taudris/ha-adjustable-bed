@@ -27,6 +27,10 @@ from custom_components.adjustable_bed.const import (
     DOMAIN,
 )
 from custom_components.adjustable_bed.diagnostics import async_get_config_entry_diagnostics
+from custom_components.adjustable_bed.diagnostics_utils import (
+    STREAM_GAP_WATCHDOG_MS,
+    summarize_stream_gaps,
+)
 from custom_components.adjustable_bed.discovery_log import async_get_discovery_log
 from custom_components.adjustable_bed.redaction import (
     KEYS_TO_REDACT,
@@ -374,3 +378,59 @@ class TestDiagnosticsOutput:
         assert result["advertisement"]["kaidi"]["product_id"] == 136
         assert result["advertisement"]["kaidi"]["seat_1_bars"] == 4
         assert result["advertisement"]["source"] == "proxy_kaidi"
+
+
+class TestStreamGapSummary:
+    """The gap histogram that paced streams file in the support bundle."""
+
+    def test_the_watchdog_is_a_bucket_edge(self):
+        """The reader's question is how many gaps the control box could notice.
+
+        A bucket straddling the keep-alive window would answer that only by
+        interpolation, so the last safe millisecond and the first breaching one
+        land in different buckets.
+        """
+        summary = summarize_stream_gaps([235.0, 236.0])
+
+        assert summary["histogram_ms"]["201-235"] == 1
+        assert summary["histogram_ms"]["236-300"] == 1
+        assert summary["breaches"] == 1
+        assert summary["breach_threshold_ms"] == STREAM_GAP_WATCHDOG_MS
+
+    def test_every_gap_lands_in_exactly_one_bucket(self):
+        """A histogram that loses or double-counts a gap is worse than none.
+
+        The buckets have to tile the whole range, including a gap of nothing
+        and one far past the last bound.
+        """
+        gaps = [0.0, 100.0, 100.4, 150.0, 200.0, 235.0, 300.0, 500.0, 5000.0]
+
+        summary = summarize_stream_gaps(gaps)
+
+        assert sum(summary["histogram_ms"].values()) == len(gaps)
+        assert summary["histogram_ms"][">500"] == 1
+        assert summary["histogram_ms"]["<=100"] == 2
+
+    def test_the_captured_stream_reads_as_three_breaches_in_nine(self):
+        """The gaps from the capture that prompted this, summarized as they read.
+
+        The old per-frame line reported these as overruns of 82, 85, 292, 296,
+        336, 608, 632, 714 and 818ms - a monotonically growing figure that reads
+        as a link falling apart. The gaps between packets say three of the nine
+        ran long enough for the box to have dropped the hold, and the median
+        stream frame arrived comfortably inside the window.
+        """
+        summary = summarize_stream_gaps([104, 306, 103, 140, 373, 205, 52, 253, 103])
+
+        assert summary["breaches"] == 3
+        assert summary["median_gap_ms"] == 140
+        assert summary["max_gap_ms"] == 373
+
+    def test_a_stream_with_no_gaps_summarizes_to_nothing_rather_than_zero(self):
+        """A single-frame stream has no cadence, and zero would read as a fast one."""
+        summary = summarize_stream_gaps([])
+
+        assert summary["gap_count"] == 0
+        assert summary["median_gap_ms"] is None
+        assert summary["max_gap_ms"] is None
+        assert summary["breaches"] == 0

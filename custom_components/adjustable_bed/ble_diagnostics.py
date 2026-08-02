@@ -144,6 +144,7 @@ class DiagnosticReport:
     connection_history: dict[str, Any]
     connection_attempt_details: list[dict[str, Any]]
     command_trace: list[dict[str, Any]]
+    stream_cadence: list[dict[str, Any]]
     errors: list[str]
 
     def to_dict(self) -> dict[str, Any]:
@@ -163,6 +164,7 @@ class DiagnosticReport:
             "connection_history": self.connection_history,
             "connection_attempt_details": self.connection_attempt_details,
             "command_trace": self.command_trace,
+            "stream_cadence": self.stream_cadence,
             "errors": self.errors,
         }
 
@@ -301,6 +303,7 @@ class BLEDiagnosticRunner:
             connection_attempt_details = self.coordinator.connection_attempt_details
 
         command_trace = self.coordinator.command_trace if self.coordinator else []
+        stream_cadence = self.coordinator.stream_cadence if self.coordinator else []
 
         return DiagnosticReport(
             metadata={
@@ -330,6 +333,7 @@ class BLEDiagnosticRunner:
             connection_history=connection_history,
             connection_attempt_details=connection_attempt_details,
             command_trace=command_trace,
+            stream_cadence=stream_cadence,
             errors=self._errors,
         )
 
