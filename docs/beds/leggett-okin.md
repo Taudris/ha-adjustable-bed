@@ -64,7 +64,7 @@ buttons, so multiple simultaneous actions are one frame with several bits set.
 | Memory 2 | `0x00002000` | recall |
 | Memory 3 / Anti-snore | `0x00004000` | recall |
 | Memory 4 | `0x00008000` | recall |
-| Flat | `0x08000000` | **held button**, not a recall |
+| Flat | `0x08000000` | recall (latched by the box) |
 | Memory store (arm) | `0x00010000` | **not a recall** |
 
 Zero-G and anti-snore are genuine aliases: the vendor apps ship those positions
@@ -95,18 +95,56 @@ and never written; it must not be reconstructed as a command.
 
 ## Timing and release semantics
 
-This protocol treats held buttons and one-shot recalls very differently, and
-getting the distinction wrong is the main way to break it.
+This protocol treats held buttons and recalls very differently, and getting the
+distinction wrong is the main way to break it.
 
-**Held keycodes** (motors, flat, light, massage) stream every ~100 ms while the
+**Held keycodes** (motors, light, massage) stream every ~100 ms while the
 button is down. On release the app emits **exactly four** keycode-`0` frames and
 then goes silent. There is no distinct stop opcode; the release frame is an
 ordinary frame carrying zero.
 
-**One-shot recalls** (the memory slots) are a burst of **exactly 10 frames at
-~100 ms**, with **no terminator at all**. The control box drives the move to
+**Recalls** (the memory slots and flat) are a **single frame** with **no
+terminator at all**. The control box latches the keycode and drives the move to
 completion by itself. Appending a release frame here risks cancelling the motion
 the recall just started, so the integration deliberately does not.
+
+Repeating the keycode is the same hazard. The box retriggers its hold watchdog
+(~235 ms, measured) on every frame it receives; once that has expired, another
+copy of the keycode is a **second press**, and a second press during preset
+motion stops the bed. The integration used to send ten frames at ~100 ms here,
+which on a link whose round trip measures ~180 ms with a tail past 250 ms was
+ten chances to cancel the move its own first frame had started.
+
+Because the box owns the motion, extra frames buy nothing anyway: the first
+frame that lands does the work, and sending more cannot make the bed travel
+further or longer. So delivery is **confirmed rather than repeated**. The box
+answers every frame it receives with a status frame on the feedback
+characteristic, and that answer is a receipt: one frame, wait for the receipt,
+done. Only when no receipt arrives - the one case where no motion is in progress
+to cancel - is another frame sent.
+
+`motor_pulse_count` therefore bounds the number of **attempts** for a latched
+command, not a burst length: how many unanswered frames it may spend before the
+command reports failure (default 10 for this bed). `motor_pulse_delay_ms` does
+not apply to recalls at all; a retry waits for the receipt window instead, which
+is a property of the link rather than a user preference. Held keycodes are
+unaffected: they are still wall-clock bounded and still paced by
+`motor_pulse_delay_ms`.
+
+A box that has never sent a status frame - one without the feedback
+characteristic - is never retried, because its silence carries no information.
+Such a box gets a single frame, exactly as the physical remote sends.
+
+Flat looks like a held button in `com.leggett.prodigy4`, but only because that
+app streams *every* key the same way and never special-cases flat. LP Control
+2.11.0, a later app on the same wire protocol, settles it: its press-and-release
+mode sends flat as a **single frame**, and its Okin `setPressAndHoldMode` is an
+empty method, so it never tells the box which mode it is in. A shipped mode
+that sends one flat frame to an unmodified box can only work if the box
+latches. The physical remote emits one radio transmission for flat, and
+`smartbed-mqtt` sends it as a single frame. The residual uncertainty is whether
+a box left in the older app's press-and-hold mode still latches; nothing in
+either app can answer that.
 
 LP Control 2.9.0 uses a 200 ms cadence for held commands where Prodigy CE uses
 100 ms. The integration defaults to 100 ms: a shorter refresh cannot fall
@@ -185,9 +223,17 @@ need a BLE capture of the notify characteristic while toggling the light.
 Command values, framing, timing and release semantics come from a clean-room
 analysis of `com.leggett.prodigy4` 1.2.0 (versionCode 18, artifact SHA-256
 `f32978d8…`), traced from layout binding to the GATT write boundary. Two
-independent analyst runs agreed on every value recorded here.
+independent analyst runs agreed on every value recorded here. The flat latching
+finding comes from a second app on the same wire protocol, LP Control 2.11.0
+(`com.leggett.lpbtsuitesdk.controlbox.OkinControlBoxInterface`).
+
+The per-frame status receipt, the hold watchdog and the second-press
+cancellation were measured on hardware (CU170 over an ESPHome proxy): a recall
+sent as a repeated burst was observed cancelling its own motion, and the
+physical remote reproduced the same stop with a second press mid-preset.
 
 Unverified against hardware, and worth a capture if you have the equipment:
-which frame revision real units use, whether preset recall truly ends without a
-terminator, and whether the `0x08010000` chord resets memory to factory
-defaults as the vendor guide states.
+which frame revision real units use, whether a single latched flat frame
+flattens fully on a box left in the older app's press-and-hold mode, and whether
+the `0x08010000` chord resets memory to factory defaults as the vendor guide
+states.
