@@ -35,6 +35,7 @@ _INTERNAL_EVENT_TYPES = frozenset(
         "CLAIMED",
         "FINISHED",
         "LEASE_EXPIRED",
+        "REPAIR_REQUEUED",
         "RENEWED",
         "TRACKER_ALREADY_CURRENT",
         "TRACKER_PUBLISHED",
@@ -1373,6 +1374,85 @@ class Queue:
             raise QueueError(f"unknown work unit: {unit_id}")
         return WorkUnitStatus(row["status"])
 
+    def retry_repaired(
+        self,
+        unit_id: str,
+        *,
+        expected_input_digest: str,
+        reason: str,
+    ) -> None:
+        """Explicitly requeue repaired immutable input while preserving all attempts."""
+        _validate_identifier(unit_id, "unit_id")
+        _validate_digest(expected_input_digest, "expected_input_digest")
+        _validate_reason(reason)
+        self.verify_schema()
+        guard = self._try_acquire_publication_guard(wait=True)
+        if guard is None:
+            raise QueueConflictError("tracker publication prevented repair requeue")
+        try:
+            with self._immediate() as connection:
+                unit = connection.execute(
+                    """
+                    SELECT status, execution_mode, input_digest
+                    FROM work_units WHERE unit_id = ?
+                    """,
+                    (unit_id,),
+                ).fetchone()
+                if unit is None:
+                    raise QueueError(f"unknown work unit: {unit_id}")
+                if unit["status"] != WorkUnitStatus.REPAIR_REQUIRED.value:
+                    raise QueueConflictError(f"unit does not require repair: {unit_id}")
+                if unit["execution_mode"] != ExecutionMode.NORMAL.value:
+                    raise QueueConflictError(f"unit is not executable by v2: {unit_id}")
+                if unit["input_digest"] != expected_input_digest:
+                    raise InputDigestMismatchError(f"repaired input changed: {unit_id}")
+                if connection.execute(
+                    "SELECT 1 FROM leases WHERE unit_id = ?", (unit_id,)
+                ).fetchone() is not None:
+                    raise QueueConflictError(f"repaired unit still has a lease: {unit_id}")
+                if connection.execute(
+                    "SELECT 1 FROM formal_completions WHERE unit_id = ?", (unit_id,)
+                ).fetchone() is not None:
+                    raise QueueConflictError(f"repaired unit is already complete: {unit_id}")
+                latest = connection.execute(
+                    """
+                    SELECT attempt.attempt_id, terminal.outcome
+                    FROM attempts AS attempt
+                    JOIN attempt_terminals AS terminal
+                      ON terminal.attempt_id = attempt.attempt_id
+                    WHERE attempt.unit_id = ?
+                    ORDER BY attempt.fencing_token DESC
+                    LIMIT 1
+                    """,
+                    (unit_id,),
+                ).fetchone()
+                repairable = {
+                    TerminalOutcome.PARTIAL.value,
+                    TerminalOutcome.FAILED.value,
+                    TerminalOutcome.INPUT_MISMATCH.value,
+                }
+                if latest is None or latest["outcome"] not in repairable:
+                    raise QueueConflictError(
+                        f"unit has no repairable terminal attempt: {unit_id}"
+                    )
+                updated = connection.execute(
+                    """
+                    UPDATE work_units SET status = 'READY'
+                    WHERE unit_id = ? AND status = 'REPAIR_REQUIRED'
+                    """,
+                    (unit_id,),
+                )
+                if updated.rowcount != 1:
+                    raise QueueConflictError(f"repair state changed: {unit_id}")
+                self._append_event(
+                    connection,
+                    str(latest["attempt_id"]),
+                    "REPAIR_REQUEUED",
+                    {"reason": reason},
+                )
+        finally:
+            os.close(guard)
+
     def recover(self) -> int:
         """Fence expired leases and return the number of recovered attempts."""
         self.verify_schema()
@@ -2057,6 +2137,16 @@ def _validate_owner(owner: str) -> None:
 def _validate_ttl(ttl_seconds: int) -> None:
     if ttl_seconds < 1:
         raise ValueError("ttl_seconds must be positive")
+
+
+def _validate_reason(reason: str) -> None:
+    if (
+        type(reason) is not str
+        or not reason
+        or len(reason) > 1_024
+        or any(ord(character) < 0x20 for character in reason)
+    ):
+        raise ValueError("reason must be a non-empty bounded single-line string")
 
 
 def _bounded_materialization_values[PinT: (CapabilityPin, CompletionDependencyPin)](

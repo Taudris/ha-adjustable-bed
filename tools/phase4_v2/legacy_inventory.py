@@ -28,6 +28,9 @@ _CLUSTER = re.compile(r"cluster-\d+", re.IGNORECASE)
 _SHA256SUM = re.compile(r"^([0-9a-fA-F]{64})(?:\s+[*]?(.+?))?\s*$")
 _BSD_SHA256 = re.compile(r"^SHA256 \((.+)\) = ([0-9a-fA-F]{64})$")
 _HASH_MANIFEST_NAMES = frozenset({"sha256sums", "sha256sum"})
+_MAX_ANALYSIS_JSON_BYTES = 64 * 1024**2
+_MAX_ANALYSIS_JSON_DEPTH = 128
+_MAX_ANALYSIS_JSON_NODES = 2_000_000
 
 
 class InventoryError(RuntimeError):
@@ -478,8 +481,14 @@ def _open_observed_text(entry: Entry, path: Path) -> TextIO:
 
 
 def _report_record(entry: Entry, path: Path) -> ReportRecord:
+    if entry.size > _MAX_ANALYSIS_JSON_BYTES:
+        raise ValueError("analysis report exceeds the parse size limit")
     with _open_observed_text(entry, path) as report_file:
-        document = json.load(report_file)
+        try:
+            document = json.load(report_file)
+        except RecursionError as error:
+            raise ValueError("analysis report exceeds the nesting limit") from error
+    _validate_report_json_bounds(document)
     if not isinstance(document, dict):
         raise ValueError("top-level JSON value is not an object")
     artifact = document.get("artifact")
@@ -504,6 +513,23 @@ def _report_record(entry: Entry, path: Path) -> ReportRecord:
         roles=tuple(sorted(report_roles)),
         active_protected=entry.active_protected,
     )
+
+
+def _validate_report_json_bounds(value: object) -> None:
+    pending = [(value, 0)]
+    nodes = 0
+    while pending:
+        current, depth = pending.pop()
+        nodes += 1
+        if nodes > _MAX_ANALYSIS_JSON_NODES:
+            raise ValueError("analysis report exceeds the node limit")
+        if depth > _MAX_ANALYSIS_JSON_DEPTH:
+            raise ValueError("analysis report exceeds the nesting limit")
+        if isinstance(current, dict):
+            pending.extend((key, depth + 1) for key in current)
+            pending.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            pending.extend((item, depth + 1) for item in current)
 
 
 def _is_hash_manifest_name(name: str) -> bool:

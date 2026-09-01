@@ -117,8 +117,15 @@ def _read_external_lineage(
         parser.error(f"cannot open external evidence lineage: {error}")
     try:
         before = os.fstat(descriptor)
-        opened_path = Path(f"/proc/self/fd/{descriptor}").resolve()
-        report_path = report_root.resolve()
+        descriptor_path = Path(f"/proc/self/fd/{descriptor}")
+        try:
+            opened_path = descriptor_path.resolve(strict=True)
+            report_path = report_root.resolve(strict=True)
+        except OSError as error:
+            parser.error(
+                "cannot verify external evidence-lineage containment "
+                f"through procfs: {error}"
+            )
         if opened_path == report_path or opened_path.is_relative_to(report_path):
             parser.error("evidence lineage must be outside the report workspace")
         if not stat.S_ISREG(before.st_mode) or before.st_size > _MAX_LINEAGE_BYTES:

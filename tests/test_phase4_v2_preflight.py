@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import os
 import stat
@@ -365,7 +366,10 @@ def test_explicit_sealing_directory_and_result_cleanup(tmp_path: Path) -> None:
     assert not sealed.exists()
 
 
-@pytest.mark.parametrize("unsafe_name", ["../escape.apk", "/absolute.apk", "bad\\name.apk"])
+@pytest.mark.parametrize(
+    "unsafe_name",
+    ["../escape.apk", "/absolute.apk", "bad\\name.apk", "bad\rname.apk", "bad\nname.apk"],
+)
 def test_container_rejects_unsafe_member_names(tmp_path: Path, unsafe_name: str) -> None:
     inner = tmp_path / "inner.apk"
     _native_apk(inner)
@@ -480,12 +484,43 @@ def test_delivery_rejects_symlink_input(tmp_path: Path) -> None:
         preflight_delivery([alias])
 
 
-def test_delivery_rejects_unsafe_direct_apk_name(tmp_path: Path) -> None:
-    artifact = tmp_path / "unsafe\\name.apk"
+@pytest.mark.parametrize("name", ["unsafe\\name.apk", "unsafe\rname.apk", "unsafe\nname.apk"])
+def test_delivery_rejects_unsafe_direct_apk_name(tmp_path: Path, name: str) -> None:
+    artifact = tmp_path / name
     _native_apk(artifact)
 
     with pytest.raises(SafetyError, match="unsafe archive member name"):
         preflight_delivery([artifact])
+
+
+def test_delivery_open_retries_when_noatime_is_not_permitted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    artifact = tmp_path / "base.apk"
+    _native_apk(artifact)
+    original_open = os.open
+    noatime = getattr(os, "O_NOATIME", 0)
+    retries = 0
+
+    def reject_noatime(
+        path: str | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal retries
+        if noatime and flags & noatime:
+            retries += 1
+            raise OSError(errno.EPERM, "O_NOATIME requires file ownership")
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", reject_noatime)
+
+    result = preflight_delivery([artifact])
+
+    assert retries > 0
+    assert result.artifact_members[0].name == "base.apk"
 
 
 def test_one_unknown_member_blocks_an_otherwise_known_split_set(tmp_path: Path) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import os
 from dataclasses import replace
@@ -205,16 +206,96 @@ def _package_bound_bundle(
     tmp_path: Path,
 ) -> tuple[Path, dict[str, bytes], PackageDependencyPins, dict[str, object]]:
     report, members, pins, contract = _bound_bundle(tmp_path)
+    domains = [
+        "configuration",
+        "lifecycle",
+        "negative_closure",
+        "reachability",
+        "resources",
+        "selectors",
+    ]
+    artifact_digest = _preflight_digest(
+        "artifact", [{"name": "base.apk", "size": 1, "sha256": "f" * 64}]
+    )
+    local_results: list[dict[str, str]] = []
+    result_inputs: dict[str, bytes] = {}
+    for domain in domains:
+        member = f"results/package-local/{domain}.json"
+        payload = _json_bytes({"domain": domain, "status": "COMPLETE"})
+        result_inputs[member] = payload
+        local_results.append(
+            {
+                "domain": domain,
+                "member": member,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "status": "COMPLETE",
+            }
+        )
+    root_member = "results/roots/root-1.json"
+    root_payload = _json_bytes({"root": "1" * 64, "status": "COMPLETE"})
+    result_inputs[root_member] = root_payload
+    root_results = [
+        {
+            "member": root_member,
+            "route": "FULL_ANALYSIS",
+            "sha256": hashlib.sha256(root_payload).hexdigest(),
+            "status": "COMPLETE",
+            "target_occurrence_identity_sha256": "2" * 64,
+            "target_root_id": "1" * 64,
+        }
+    ]
+    execution_plan = {
+        "authoritative_occurrence_root_set_sha256": "3" * 64,
+        "authoritative_root_count": 1,
+        "package_local": {
+            "mandatory_domains": domains,
+            "package_name": "example.package",
+            "target_artifact_digest": artifact_digest,
+            "version_code": "123",
+            "version_name": "1.2.3",
+        },
+        "root_plans": [
+            {
+                "route": "FULL_ANALYSIS",
+                "target_occurrence_identity_sha256": "2" * 64,
+                "target_root_id": "1" * 64,
+            }
+        ],
+        "status": "EXECUTABLE",
+        "target_package_ref_id": "4" * 64,
+    }
+    report_schema = {
+        "package_report_member": "package-report.json",
+        "report_revision": "phase4-v2-package-report-v1",
+        "required_package_local_domains": domains,
+        "requires_authoritative_root_result_set": True,
+        "requires_target_package_identity": True,
+        "result_reference_format": "member-sha256-v1",
+        "schema_revision": "phase4-v2-package-report-schema-v1",
+    }
     package_inputs = {
-        "inputs/execution_plan.json": _json_bytes(
-            {"schema": "phase4-v2-execution-plan-v1", "steps": []}
+        "inputs/execution_plan.json": _json_bytes(execution_plan),
+        "inputs/report_schema.json": _json_bytes(report_schema),
+        "package-report.json": _json_bytes(
+            {
+                "authoritative_occurrence_root_set_sha256": "3" * 64,
+                "package_local_results": local_results,
+                "revision": "phase4-v2-package-report-v1",
+                "root_results": root_results,
+                "target_package_identity": {
+                    "artifact_digest": artifact_digest,
+                    "package_name": "example.package",
+                    "version_code": "123",
+                    "version_name": "1.2.3",
+                },
+                "target_package_ref_id": "4" * 64,
+            }
         ),
-        "inputs/report_schema.json": _json_bytes(
-            {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object"}
-        ),
+        **result_inputs,
     }
     for relative, data in package_inputs.items():
         destination = report / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(data)
         members[relative] = data
     package_pins = PackageDependencyPins(
@@ -386,6 +467,42 @@ def test_package_output_profile_attests_exact_six_pin_contract(tmp_path: Path) -
     )
     assert dict(first.dependency_digests)["execution_plan"] == pins.execution_plan_sha256
     assert dict(first.dependency_digests)["report_schema"] == pins.report_schema_sha256
+
+
+def test_package_profile_requires_the_target_package_report(tmp_path: Path) -> None:
+    report, members, pins, contract = _package_bound_bundle(tmp_path)
+    del members["package-report.json"]
+    (report / "package-report.json").unlink()
+    _write_contract(report, members, contract)
+
+    receipt = _validate_package_bound(report, pins)
+
+    assert receipt.accepted is False
+    assert "PACKAGE_REPORT_MISSING" in {item.code for item in receipt.diagnostics}
+
+
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    [
+        ("package_local_results", "PACKAGE_LOCAL_RESULT_SET_INVALID"),
+        ("root_results", "PACKAGE_ROOT_RESULT_SET_INVALID"),
+    ],
+)
+def test_package_profile_requires_exact_complete_result_sets(
+    tmp_path: Path, field: str, expected: str
+) -> None:
+    report, members, pins, contract = _package_bound_bundle(tmp_path)
+    package_report = json.loads(members["package-report.json"])
+    package_report[field] = []
+    payload = _json_bytes(package_report)
+    members["package-report.json"] = payload
+    (report / "package-report.json").write_bytes(payload)
+    _write_contract(report, members, contract)
+
+    receipt = _validate_package_bound(report, pins)
+
+    assert receipt.accepted is False
+    assert expected in {item.code for item in receipt.diagnostics}
     assert first.validated_artifact_identity is not None
     assert first.validated_artifact_identity.package_name == "example.package"
     assert first.evidence_anchors_checked == 2

@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Protocol
 
-from .core import Lease, Queue
+from .core import Lease, Queue, QueueError
 from .tracker import (
     managed_block_generation,
     managed_block_sha256,
@@ -117,16 +117,21 @@ def publish_tracker(
         if after.body != updated:
             raise PublisherReadbackError("published tracker failed exact issue-body readback")
         _require_current(queue, lease, snapshot.generation_id, post_write=True)
-        queue._checkpoint_internal(
-            lease,
-            "TRACKER_PUBLISHED",
-            {
-                "after_body_sha256": after_digest,
-                "before_body_sha256": before_digest,
-                "generation": snapshot.generation_id,
-                "issue": issue_number,
-            },
-        )
+        try:
+            queue._checkpoint_internal(
+                lease,
+                "TRACKER_PUBLISHED",
+                {
+                    "after_body_sha256": after_digest,
+                    "before_body_sha256": before_digest,
+                    "generation": snapshot.generation_id,
+                    "issue": issue_number,
+                },
+            )
+        except QueueError as error:
+            raise PublisherPostWriteConflictError(
+                "tracker was written but its publication event could not be recorded"
+            ) from error
         _require_current(queue, lease, snapshot.generation_id, post_write=True)
         return PublishReceipt(
             issue_number,

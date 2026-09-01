@@ -44,6 +44,7 @@ _MAX_EVIDENCE_MEMBER_COUNT = 4_096
 _MAX_ANCHOR_BYTES = 64 * 1024**2
 _MAX_ANCHOR_ID_LENGTH = 256
 _MAX_JSON_POINTER_LENGTH = 8_192
+_MAX_PACKAGE_RESULTS = 250_000
 _STACK_ROUTES: dict[str, tuple[str, ...]] = {
     "air": ("ffdec",),
     "android": ("apktool",),
@@ -312,7 +313,14 @@ def validate_binding_contract(
         diagnostics,
     )
     if isinstance(expected_dependencies, PackageDependencyPins):
-        _validate_package_dependency_documents(dependencies, json_documents, diagnostics)
+        _validate_package_dependency_documents(
+            dependencies,
+            json_documents,
+            nodes,
+            path_is_safe,
+            artifact_identity,
+            diagnostics,
+        )
 
     owners, validated_members = _validate_evidence_members(
         document["evidence_members"],
@@ -817,8 +825,12 @@ def _validate_evidence_lineage(
 def _validate_package_dependency_documents(
     dependencies: object,
     json_documents: Mapping[str, object],
+    nodes: Mapping[str, MemberNode],
+    path_is_safe: PathValidator,
+    artifact_identity: ArtifactIdentityAttestation | None,
     diagnostics: list[BindingDiagnostic],
 ) -> None:
+    documents: dict[str, object] = {}
     for name, code in (
         ("execution_plan", "PINNED_EXECUTION_PLAN_INVALID"),
         ("report_schema", "PINNED_REPORT_SCHEMA_INVALID"),
@@ -826,6 +838,247 @@ def _validate_package_dependency_documents(
         member = _dependency_member(dependencies, name)
         if member not in json_documents:
             diagnostics.append(BindingDiagnostic(code, member))
+        else:
+            documents[name] = json_documents[member]
+    if set(documents) != {"execution_plan", "report_schema"}:
+        return
+    _validate_package_report(
+        documents["execution_plan"],
+        documents["report_schema"],
+        json_documents,
+        nodes,
+        path_is_safe,
+        artifact_identity,
+        diagnostics,
+    )
+
+
+def _validate_package_report(
+    execution_plan: object,
+    report_schema: object,
+    json_documents: Mapping[str, object],
+    nodes: Mapping[str, MemberNode],
+    path_is_safe: PathValidator,
+    artifact_identity: ArtifactIdentityAttestation | None,
+    diagnostics: list[BindingDiagnostic],
+) -> None:
+    schema_keys = {
+        "package_report_member",
+        "report_revision",
+        "required_package_local_domains",
+        "requires_authoritative_root_result_set",
+        "requires_target_package_identity",
+        "result_reference_format",
+        "schema_revision",
+    }
+    if not _is_exact_object(report_schema, schema_keys):
+        diagnostics.append(
+            BindingDiagnostic("PINNED_REPORT_SCHEMA_INVALID", "inputs/report_schema.json")
+        )
+        return
+    report_member = report_schema["package_report_member"]
+    report_revision = report_schema["report_revision"]
+    domains = report_schema["required_package_local_domains"]
+    if (
+        report_member != "package-report.json"
+        or not isinstance(report_revision, str)
+        or not report_revision
+        or not isinstance(report_schema["schema_revision"], str)
+        or not report_schema["schema_revision"]
+        or report_schema["result_reference_format"] != "member-sha256-v1"
+        or report_schema["requires_authoritative_root_result_set"] is not True
+        or report_schema["requires_target_package_identity"] is not True
+        or not isinstance(domains, list)
+        or not domains
+        or len(domains) > 256
+        or any(not isinstance(item, str) or not item for item in domains)
+        or domains != sorted(set(domains))
+    ):
+        diagnostics.append(
+            BindingDiagnostic("PINNED_REPORT_SCHEMA_INVALID", "inputs/report_schema.json")
+        )
+        return
+    if not isinstance(execution_plan, dict):
+        diagnostics.append(
+            BindingDiagnostic("PINNED_EXECUTION_PLAN_INVALID", "inputs/execution_plan.json")
+        )
+        return
+    package_local = execution_plan.get("package_local")
+    root_plans = execution_plan.get("root_plans")
+    if (
+        execution_plan.get("status") != "EXECUTABLE"
+        or not _is_digest(execution_plan.get("target_package_ref_id"))
+        or not _is_digest(execution_plan.get("authoritative_occurrence_root_set_sha256"))
+        or not isinstance(execution_plan.get("authoritative_root_count"), int)
+        or isinstance(execution_plan.get("authoritative_root_count"), bool)
+        or not isinstance(package_local, dict)
+        or artifact_identity is None
+        or (
+            package_local.get("package_name"),
+            package_local.get("version_code"),
+            package_local.get("version_name"),
+            package_local.get("target_artifact_digest"),
+        )
+        != (
+            artifact_identity.package_name,
+            artifact_identity.version_code,
+            artifact_identity.version_name,
+            artifact_identity.artifact_digest,
+        )
+        or package_local.get("mandatory_domains") != domains
+        or not isinstance(root_plans, list)
+        or not root_plans
+        or len(root_plans) > _MAX_PACKAGE_RESULTS
+        or execution_plan["authoritative_root_count"] != len(root_plans)
+    ):
+        diagnostics.append(
+            BindingDiagnostic("PINNED_EXECUTION_PLAN_INVALID", "inputs/execution_plan.json")
+        )
+        return
+    expected_roots = _package_plan_roots(root_plans)
+    if expected_roots is None:
+        diagnostics.append(
+            BindingDiagnostic("PINNED_EXECUTION_PLAN_INVALID", "inputs/execution_plan.json")
+        )
+        return
+    report = json_documents.get(report_member)
+    if report is None:
+        diagnostics.append(BindingDiagnostic("PACKAGE_REPORT_MISSING", report_member))
+        return
+    report_keys = {
+        "authoritative_occurrence_root_set_sha256",
+        "package_local_results",
+        "revision",
+        "root_results",
+        "target_package_identity",
+        "target_package_ref_id",
+    }
+    identity = report.get("target_package_identity") if isinstance(report, dict) else None
+    identity_keys = {"artifact_digest", "package_name", "version_code", "version_name"}
+    if (
+        not _is_exact_object(report, report_keys)
+        or report["revision"] != report_revision
+        or report["target_package_ref_id"] != execution_plan["target_package_ref_id"]
+        or report["authoritative_occurrence_root_set_sha256"]
+        != execution_plan["authoritative_occurrence_root_set_sha256"]
+        or not _is_exact_object(identity, identity_keys)
+        or identity
+        != {
+            "artifact_digest": package_local.get("target_artifact_digest"),
+            "package_name": package_local.get("package_name"),
+            "version_code": package_local.get("version_code"),
+            "version_name": package_local.get("version_name"),
+        }
+    ):
+        diagnostics.append(BindingDiagnostic("PACKAGE_REPORT_IDENTITY_INVALID", report_member))
+        return
+    local_results = report["package_local_results"]
+    root_results = report["root_results"]
+    if not isinstance(local_results, list) or len(local_results) != len(domains):
+        diagnostics.append(BindingDiagnostic("PACKAGE_LOCAL_RESULT_SET_INVALID", report_member))
+        return
+    if not isinstance(root_results, list) or len(root_results) != len(expected_roots):
+        diagnostics.append(BindingDiagnostic("PACKAGE_ROOT_RESULT_SET_INVALID", report_member))
+        return
+    result_members: set[str] = set()
+    observed_domains: list[str] = []
+    for entry in local_results:
+        required = {"domain", "member", "sha256", "status"}
+        if not _is_exact_object(entry, required) or entry["status"] != "COMPLETE":
+            diagnostics.append(
+                BindingDiagnostic("PACKAGE_LOCAL_RESULT_INVALID", report_member)
+            )
+            return
+        domain = entry["domain"]
+        if not isinstance(domain, str):
+            diagnostics.append(
+                BindingDiagnostic("PACKAGE_LOCAL_RESULT_INVALID", report_member)
+            )
+            return
+        observed_domains.append(domain)
+        if not _validate_package_result_member(
+            entry, "results/package-local/", json_documents, nodes, path_is_safe, result_members
+        ):
+            diagnostics.append(
+                BindingDiagnostic("PACKAGE_LOCAL_RESULT_INVALID", report_member)
+            )
+            return
+    if observed_domains != domains:
+        diagnostics.append(BindingDiagnostic("PACKAGE_LOCAL_RESULT_SET_INVALID", report_member))
+        return
+    observed_roots: list[tuple[str, str, str]] = []
+    for entry in root_results:
+        required = {
+            "member",
+            "route",
+            "sha256",
+            "status",
+            "target_occurrence_identity_sha256",
+            "target_root_id",
+        }
+        if not _is_exact_object(entry, required) or entry["status"] != "COMPLETE":
+            diagnostics.append(BindingDiagnostic("PACKAGE_ROOT_RESULT_INVALID", report_member))
+            return
+        root_tuple = (
+            entry["target_occurrence_identity_sha256"],
+            entry["target_root_id"],
+            entry["route"],
+        )
+        if any(not isinstance(item, str) for item in root_tuple):
+            diagnostics.append(BindingDiagnostic("PACKAGE_ROOT_RESULT_INVALID", report_member))
+            return
+        observed_roots.append(cast(tuple[str, str, str], root_tuple))
+        if not _validate_package_result_member(
+            entry, "results/roots/", json_documents, nodes, path_is_safe, result_members
+        ):
+            diagnostics.append(BindingDiagnostic("PACKAGE_ROOT_RESULT_INVALID", report_member))
+            return
+    if observed_roots != expected_roots:
+        diagnostics.append(BindingDiagnostic("PACKAGE_ROOT_RESULT_SET_INVALID", report_member))
+
+
+def _package_plan_roots(root_plans: list[object]) -> list[tuple[str, str, str]] | None:
+    roots: list[tuple[str, str, str]] = []
+    for item in root_plans:
+        if not isinstance(item, dict):
+            return None
+        route = item.get("route")
+        source = item.get("reuse") if route == "EXACT_REUSE" else item
+        if route not in {"EXACT_REUSE", "FULL_ANALYSIS"} or not isinstance(source, dict):
+            return None
+        root_id = source.get("target_root_id")
+        occurrence = source.get("target_occurrence_identity_sha256")
+        if not _is_digest(root_id) or not _is_digest(occurrence):
+            return None
+        roots.append((cast(str, occurrence), cast(str, root_id), cast(str, route)))
+    return roots
+
+
+def _validate_package_result_member(
+    entry: Mapping[str, object],
+    prefix: str,
+    json_documents: Mapping[str, object],
+    nodes: Mapping[str, MemberNode],
+    path_is_safe: PathValidator,
+    seen: set[str],
+) -> bool:
+    member = entry["member"]
+    digest = entry["sha256"]
+    if (
+        not isinstance(member, str)
+        or not member.startswith(prefix)
+        or not path_is_safe(member)
+        or member in seen
+        or not _is_digest(digest)
+    ):
+        return False
+    node = nodes.get(member)
+    if node is None or node.kind != "file" or node.sha256 != digest:
+        return False
+    if member not in json_documents:
+        return False
+    seen.add(member)
+    return True
 
 
 def _preflight_artifact_sources(document: object | None) -> dict[str, str] | None:
@@ -1077,7 +1330,7 @@ def _validate_anchors(
                 continue
         try:
             expected_value = _resolve_semantic_pointer(ir_document, ir_pointer)
-        except KeyError, TypeError, ValueError:
+        except (IndexError, KeyError, TypeError, ValueError):
             diagnostics.append(
                 BindingDiagnostic(
                     "EVIDENCE_IR_POINTER_INVALID",
@@ -1179,43 +1432,6 @@ def _dependency_member(dependencies: object, name: str) -> str:
             if isinstance(member, str):
                 return member
     return VALIDATION_INPUT
-
-
-def _resolve_json_pointer(document: object | None, pointer: str) -> object:
-    if document is None or not pointer.startswith("/"):
-        raise ValueError("IR document or absolute pointer is missing")
-    current = document
-    for encoded in pointer[1:].split("/"):
-        token = _decode_pointer_token(encoded)
-        if isinstance(current, dict):
-            if token not in current:
-                raise KeyError(token)
-            current = current[token]
-        elif isinstance(current, list):
-            if not token.isdecimal() or (len(token) > 1 and token.startswith("0")):
-                raise ValueError("array index is not canonical")
-            index = int(token)
-            if index >= len(current):
-                raise KeyError(token)
-            current = current[index]
-        else:
-            raise TypeError("pointer traverses a scalar")
-    return current
-
-
-def _decode_pointer_token(token: str) -> str:
-    decoded: list[str] = []
-    index = 0
-    while index < len(token):
-        if token[index] != "~":
-            decoded.append(token[index])
-            index += 1
-            continue
-        if index + 1 >= len(token) or token[index + 1] not in {"0", "1"}:
-            raise ValueError("invalid JSON pointer escape")
-        decoded.append("~" if token[index + 1] == "0" else "/")
-        index += 2
-    return "".join(decoded)
 
 
 def _result(

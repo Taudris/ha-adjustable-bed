@@ -49,8 +49,10 @@ PACKAGE_REPORT_REVISION = "phase4-v2-package-report-v1"
 PACKAGE_REPORT_SCHEMA_REVISION = "phase4-v2-package-report-schema-v1"
 PACKAGE_REPORT_SCHEMA_CANONICAL_BYTES = json.dumps(
     {
+        "package_report_member": "package-report.json",
         "report_revision": PACKAGE_REPORT_REVISION,
         "required_package_local_domains": list(LOCAL_ONLY_DOMAINS),
+        "result_reference_format": "member-sha256-v1",
         "requires_authoritative_root_result_set": True,
         "requires_target_package_identity": True,
         "schema_revision": PACKAGE_REPORT_SCHEMA_REVISION,
