@@ -135,6 +135,12 @@ MEMORY_STORE_HOLD_S = 5.0
 MEMORY_SLOT_HOLD_S = 2.0
 MEMORY_PROGRAM_FRAME_CADENCE_MS = 100
 
+# Throwaway hardware probe. 0x00040000 is the vendor app's DUMMY keycode and has
+# no observable effect on this bed. Pressing it between the store's two stages
+# asks whether the box counts any other keypress as a disarm of a pending store.
+DISARM_PROBE_KEYCODE = 0x00040000
+DISARM_PROBE_FRAMES = 3
+
 # A movement hold has no protocol-defined end: the box moves while the keycode
 # keeps arriving. The stream therefore ends only when the next serialized
 # command preempts it (a stop, a new direction) or when this cap expires. The
@@ -797,6 +803,9 @@ class LeggettOkinController(BedController):
         directly, with no release frames between the stages, and sends the
         normal release burst only once the slot hold ends (decompile-derived;
         hardware verification pending).
+
+        Probe branch only: a release burst plus a short DUMMY press is inserted
+        between the two stages, so this no longer matches the app's sequence.
         """
         command = self._MEMORY_SLOTS.get(memory_num)
         if command is None:
@@ -807,7 +816,18 @@ class LeggettOkinController(BedController):
         completed = False
         try:
             await self._hold_keycode(LeggettOkinCommands.MEMORY_STORE, MEMORY_STORE_HOLD_S)
+            await self._send_release_frames("memory store arm")
+            _LOGGER.info(
+                "memory store probe: sending DUMMY 0x00040000 x3 between SET and slot"
+            )
+            await self.write_command_paced(
+                self._build_command(DISARM_PROBE_KEYCODE),
+                repeat_count=DISARM_PROBE_FRAMES,
+                cadence_ms=MEMORY_PROGRAM_FRAME_CADENCE_MS,
+            )
+            await self._send_release_frames("memory store probe")
             await self._hold_keycode(command, MEMORY_SLOT_HOLD_S)
+            _LOGGER.info("memory store probe: slot stage sent")
             completed = True
         finally:
             # On the success path this release ends the sequence, so a failure
