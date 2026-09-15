@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import pytest
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.adjustable_bed.hold_capability import HoldCapable
 from custom_components.adjustable_bed.hold_intent import (
@@ -22,8 +23,8 @@ from custom_components.adjustable_bed.hold_intent import (
     HoldOutcome,
     IntentAction,
     IntentId,
-    IntentSample,
-    IntentSampleSet,
+    ResolvedSample,
+    ResolvedSampleSet,
     SenderId,
 )
 from custom_components.adjustable_bed.hold_reconstructor import (
@@ -32,9 +33,13 @@ from custom_components.adjustable_bed.hold_reconstructor import (
 )
 from custom_components.adjustable_bed.hold_roster import (
     ActionKind,
+    ActivateSupport,
     Control,
     ControlDeclaration,
     ControlRoster,
+    HoldSupport,
+    PressFloor,
+    StagedActivate,
 )
 
 _CALL_LATER = "custom_components.adjustable_bed.hold_reconstructor.async_call_later"
@@ -43,6 +48,7 @@ HEAD_UP = Control("motor-head-up")
 HEAD_DOWN = Control("motor-head-down")
 PRESET_1 = Control("preset-1")
 LIGHT = Control("light-toggle")
+STORE_1 = Control("store-preset-1")
 
 CARD = SenderId("card")
 OTHER = SenderId("other-card")
@@ -61,21 +67,37 @@ def _roster() -> ControlRoster:
             _declare(HEAD_DOWN, {ActionKind.HOLD, ActionKind.ACTIVATE}, ACTIVATE_MS),
             _declare(PRESET_1, {ActionKind.HOLD}, None),
             _declare(LIGHT, {ActionKind.ACTIVATE}, 500),
+            _store(STORE_1),
         )
     )
 
 
 def _declare(
-    control: Control, actions: set[ActionKind], activate_duration_ms: int | None
+    control: Control,
+    actions: set[ActionKind],
+    activate_duration_ms: int | None,
 ) -> ControlDeclaration:
     """Return one synthetic declaration."""
     return ControlDeclaration(
         control=control,
-        actions=frozenset(actions),
-        ttl_max_ms=MOTOR_TTL_MAX_MS,
-        activate_duration_ms=activate_duration_ms,
-        press_min_frames=1,
-        press_min_ms=223,
+        press_floor=PressFloor(frames=1, ms=223),
+        hold=(
+            HoldSupport(ttl_max_ms=MOTOR_TTL_MAX_MS) if ActionKind.HOLD in actions else None
+        ),
+        activate=(
+            ActivateSupport(duration_ms=activate_duration_ms)
+            if activate_duration_ms is not None
+            else None
+        ),
+    )
+
+
+def _store(control: Control) -> ControlDeclaration:
+    """Return one synthetic operation control, whose Activate stages bed-side."""
+    return ControlDeclaration(
+        control=control,
+        press_floor=PressFloor(frames=1, ms=223),
+        activate=StagedActivate(),
     )
 
 
@@ -116,13 +138,37 @@ class _Timer:
 
 
 class _RecordingController(HoldCapable):
-    """A hold-capable controller double that records every pushed set."""
+    """A hold-capable controller double that records every call, in order."""
 
     def __init__(self) -> None:
         self.pushes: list[dict[Control, float]] = []
+        self.stops: list[frozenset[Control]] = []
+        self.releases = 0
+        # Each call appended as it arrives, so a test can assert that a stop
+        # reached the controller ahead of the push behind it.
+        self.calls: list[str] = []
+
+    def control_declarations(self, inputs: Any) -> tuple:
+        del inputs  # This double's roster is the test's, built directly.
+        return ()
+
+    def link_up(self) -> None:
+        self.calls.append("link_up")
 
     def hold(self, held: Any) -> None:
         self.pushes.append(dict(held))
+        self.calls.append("hold")
+
+    def stop(self, controls: frozenset[Control]) -> None:
+        self.stops.append(controls)
+        self.calls.append("stop")
+
+    def link_lost(self) -> None:
+        self.calls.append("link_lost")
+
+    def release_wire(self) -> None:
+        self.releases += 1
+        self.calls.append("release_wire")
 
     @property
     def latest(self) -> dict[Control, float]:
@@ -210,11 +256,11 @@ def _samples(
 ) -> None:
     """Hand one message to the reconstructor."""
     reconstructor.handle_samples(
-        IntentSampleSet(
+        ResolvedSampleSet(
             sender=sender,
             seq=seq,
             samples=tuple(
-                IntentSample(intent_id=IntentId(intent_id), control=control, action=action)
+                ResolvedSample(intent_id=IntentId(intent_id), control=control, action=action)
                 for intent_id, control, action in samples
             ),
         )
@@ -227,12 +273,32 @@ class TestIntentBounds:
     def test_every_door_bounds_its_assertion(self, reconstructor, clock):
         """intents-are-time-bounded: no assertion reaches the set without a deadline."""
         _samples(reconstructor, 1, ("a", HEAD_UP, Hold(2000)), ("b", LIGHT, Activate()))
-        reconstructor.submit(HEAD_DOWN, 3000)
+        reconstructor.submit(HEAD_DOWN, Hold(3000))
 
         for intent in reconstructor.held.values():
             assert intent.deadline > clock.now
 
-        assert "ttl_ms" in inspect.signature(reconstructor.submit).parameters
+        assert "action" in inspect.signature(reconstructor.submit).parameters
+
+    def test_a_submission_takes_the_sample_doors_rules(self, reconstructor):
+        """action-support-at-the-boundary: the direct door refuses what the wire's does.
+
+        Both refusals are HomeAssistantError rather than a validation error:
+        every caller of submit is this integration's own, so a refusal means
+        the bed module's declarations disagree with the code pressing them.
+        """
+        with pytest.raises(HomeAssistantError, match="does not support 'hold'"):
+            reconstructor.submit(LIGHT, Hold(1000))
+        with pytest.raises(HomeAssistantError, match="stages bed-side"):
+            reconstructor.submit(STORE_1, Activate())
+
+        assert not reconstructor.holds_anything
+
+    def test_a_submitted_activate_reads_the_rosters_duration(self, reconstructor, clock):
+        """intents-are-parameterized: the direct door prices an Activate the same way."""
+        reconstructor.submit(LIGHT, Activate())
+
+        assert reconstructor.held[LIGHT].deadline == pytest.approx(clock.now + 0.5)
 
     def test_an_activate_carries_no_ttl_and_reads_the_rosters(self, reconstructor, clock):
         """intents-are-parameterized: an Activate's duration is the roster's."""
@@ -331,7 +397,9 @@ class TestIntakeIsMemoryless:
         _samples(reconstructor, 2, ("a", HEAD_UP, Hold(3000)), ("b", HEAD_DOWN, Hold(3000)))
 
         assert set(reconstructor.held) == {HEAD_UP, HEAD_DOWN}
-        assert reconstructor.held[HEAD_UP].last_refresh == pytest.approx(clock.now)
+        # The refresh moved the deadline, which is what a refresh is for; when
+        # it happened is the record's own bookkeeping and reaches no consumer.
+        assert reconstructor.held[HEAD_UP].deadline == pytest.approx(clock.now + 3.0)
 
         _samples(reconstructor, 3, ("a", HEAD_UP, Hold(0)), ("b", HEAD_DOWN, Hold(3000)))
         assert set(reconstructor.held) == {HEAD_DOWN}
@@ -479,6 +547,87 @@ class TestStopFencesTheControl:
         assert len(controller.pushes) == pushes_before + 1
         assert controller.latest == {}
 
+    def test_a_per_control_stop_reaches_the_controller_before_the_push(
+        self, reconstructor
+    ):
+        """floors-are-interruptible: the stop lands first, naming the fenced controls."""
+        controller = _RecordingController()
+        reconstructor.attach(controller)
+        _samples(
+            reconstructor,
+            1,
+            ("a", HEAD_UP, Hold(3000)),
+            ("b", PRESET_1, Hold(3000)),
+        )
+        controller.calls.clear()
+
+        reconstructor.stop((HEAD_UP,))
+
+        assert controller.calls == ["stop", "hold"]
+        assert controller.stops == [frozenset({HEAD_UP})]
+        assert set(controller.latest) == {PRESET_1}
+
+    def test_the_bed_wide_stop_names_a_press_still_draining_its_floor(
+        self, reconstructor
+    ):
+        """stop-fences-the-control: a control out of the held set is still pressed.
+
+        A ttl-0 sample ends the intent, and the controller keeps the bit until
+        the press floor drains, so a stop inside that window has to name the
+        control the held set no longer carries.
+        """
+        controller = _RecordingController()
+        reconstructor.attach(controller)
+        _samples(reconstructor, 1, ("a", HEAD_UP, Hold(3000)))
+        _samples(reconstructor, 2, ("a", HEAD_UP, Hold(0)))
+        assert not reconstructor.holds_anything
+        controller.calls.clear()
+
+        reconstructor.stop_all()
+
+        assert controller.stops == [frozenset({HEAD_UP})]
+
+    def test_the_bed_wide_stop_names_every_held_control(self, reconstructor):
+        """floors-are-interruptible: stop_all is the same call over the whole set."""
+        controller = _RecordingController()
+        reconstructor.attach(controller)
+        _samples(
+            reconstructor,
+            1,
+            ("a", HEAD_UP, Hold(3000)),
+            ("b", PRESET_1, Hold(3000)),
+        )
+        controller.calls.clear()
+
+        reconstructor.stop_all()
+
+        assert controller.calls == ["stop", "hold"]
+        assert controller.stops == [frozenset({HEAD_UP, PRESET_1})]
+
+    def test_the_bed_wide_stop_names_a_control_still_draining_its_floor(
+        self, reconstructor, clock, timer
+    ):
+        """floors-are-interruptible: the press outlives the intent, so the stop names it.
+
+        A hold whose deadline the control's maximum capped lapses while its
+        record is still retained, so it is out of the held set with its press
+        still draining at the controller. Naming the held set alone would leave
+        that drain to finish, which is the drain the per-control stop exists to
+        end.
+        """
+        controller = _RecordingController()
+        reconstructor.attach(controller)
+        for seq in (1, 2, 3, 4):
+            _samples(reconstructor, seq, ("a", HEAD_UP, Hold(3000)))
+            _advance(clock, timer, 2.0)
+        _advance(clock, timer, 0.5)
+        controller.calls.clear()
+        assert not reconstructor.holds_anything
+
+        reconstructor.stop_all()
+
+        assert controller.stops == [frozenset({HEAD_UP})]
+
     def test_an_in_flight_refresh_of_a_stopped_press_holds_nothing(self, reconstructor):
         """stop-fences-the-control: the stopped id re-asserts nothing."""
         _samples(reconstructor, 1, ("a", HEAD_UP, Hold(3000)))
@@ -557,7 +706,7 @@ class TestLinkEdges:
     ):
         """one-shots-persist-holds-do-not: what a link's arrival expresses."""
         _samples(reconstructor, 1, ("a", LIGHT, Activate()))
-        submission = reconstructor.submit(HEAD_DOWN, 4000)
+        submission = reconstructor.submit(HEAD_DOWN, Hold(4000))
         _samples(reconstructor, 2, ("b", HEAD_UP, Hold(4000)), ("c", PRESET_1, Hold(200)))
         _advance(clock, timer, 0.3)
 
@@ -583,7 +732,7 @@ class TestLinkEdges:
         """one-shot-fails-at-detach: an awaiting caller wakes there, not after a reconnect."""
         controller = _RecordingController()
         reconstructor.attach(controller)
-        submission = reconstructor.submit(HEAD_UP, 4000)
+        submission = reconstructor.submit(HEAD_UP, Hold(4000))
         _samples(reconstructor, 1, ("b", PRESET_1, Hold(4000)))
         pushes_before = len(controller.pushes)
 
@@ -609,9 +758,14 @@ class TestLinkEdges:
     def test_a_detach_evicts_what_it_ended_after_its_retention_span(
         self, reconstructor, clock, timer
     ):
-        """one-shot-fails-at-detach: a detach ends a record, it does not keep it forever."""
+        """one-shot-fails-at-detach: a detach ends a record, it does not keep it forever.
+
+        The bed-wide stop names every control a record retains, so a press the
+        dead link was carrying would be named by every stop for the life of the
+        entry.
+        """
         reconstructor.attach(_RecordingController())
-        reconstructor.submit(HEAD_UP, 4000)
+        reconstructor.submit(HEAD_UP, Hold(4000))
 
         reconstructor.detach()
         assert reconstructor.diagnostics["records"] == 1
@@ -619,13 +773,19 @@ class TestLinkEdges:
         _advance(clock, timer, 4.1)
         assert reconstructor.diagnostics["records"] == 0
 
+        controller = _RecordingController()
+        reconstructor.attach(controller)
+        reconstructor.stop_all()
+
+        assert controller.stops == [frozenset()]
+
     def test_the_next_connect_pushes_nothing_the_dead_link_expressed(
         self, reconstructor
     ):
         """one-shot-fails-at-detach: an expressed one-shot does not come back."""
         first = _RecordingController()
         reconstructor.attach(first)
-        reconstructor.submit(HEAD_UP, 4000)
+        reconstructor.submit(HEAD_UP, Hold(4000))
         reconstructor.detach()
 
         second = _RecordingController()
@@ -633,9 +793,56 @@ class TestLinkEdges:
 
         assert second.controls == [set()]
 
+    def test_an_attach_tells_the_controller_its_link_is_live_before_pushing(
+        self, reconstructor
+    ):
+        """dummy-disarms-a-pending-store: the link's own gesture leads its first push."""
+        reconstructor.submit(HEAD_UP, Hold(4000))
+        controller = _RecordingController()
+
+        reconstructor.attach(controller)
+
+        assert controller.calls == ["link_up", "hold"]
+
+    def test_a_second_report_of_the_same_link_tells_it_once(self, reconstructor):
+        """dummy-disarms-a-pending-store: one link owes one gesture."""
+        controller = _RecordingController()
+        reconstructor.attach(controller)
+        controller.calls.clear()
+
+        reconstructor.attach(controller)
+
+        assert controller.calls == []
+
+    def test_a_detach_tells_the_controller_its_link_is_gone(self, reconstructor):
+        """link-lost-teardown, release-before-disconnect: the controller hears it.
+
+        Nothing is written after: an unsolicited drop is the box watchdog's
+        to end, not a release of ours.
+        """
+        controller = _RecordingController()
+        reconstructor.attach(controller)
+        _samples(reconstructor, 1, ("b", HEAD_UP, Hold(4000)))
+        controller.calls.clear()
+
+        reconstructor.detach()
+
+        assert controller.calls == ["link_lost"]
+
+    def test_a_detach_with_nothing_attached_tells_no_controller(self, reconstructor):
+        """link-lost-teardown, release-before-disconnect: once per attached link."""
+        controller = _RecordingController()
+        reconstructor.attach(controller)
+        reconstructor.detach()
+        controller.calls.clear()
+
+        reconstructor.detach()
+
+        assert controller.calls == []
+
     def test_a_link_start_report_ends_nothing(self, reconstructor):
         """one-shot-fails-at-detach: only a lost link is a detach."""
-        submission = reconstructor.submit(HEAD_UP, 4000)
+        submission = reconstructor.submit(HEAD_UP, Hold(4000))
 
         reconstructor.detach()
 
@@ -643,7 +850,7 @@ class TestLinkEdges:
 
     def test_a_second_report_of_the_same_link_pushes_nothing(self, reconstructor):
         """The connection state is a state, not an edge: re-reporting it is a no-op."""
-        reconstructor.submit(HEAD_UP, 4000)
+        reconstructor.submit(HEAD_UP, Hold(4000))
         controller = _RecordingController()
         reconstructor.attach(controller)
         pushes_before = len(controller.pushes)
@@ -718,7 +925,7 @@ class TestSubmissionOutcomes:
     def test_a_submission_expressed_to_its_end_completes(self, reconstructor, clock, timer):
         """A one-shot that reached an attached controller and ran out completes."""
         reconstructor.attach(_RecordingController())
-        submission = reconstructor.submit(HEAD_UP, 1000)
+        submission = reconstructor.submit(HEAD_UP, Hold(1000))
 
         _advance(clock, timer, 1.2)
 
@@ -727,7 +934,7 @@ class TestSubmissionOutcomes:
     def test_a_stop_interrupts_a_live_submission(self, reconstructor):
         """A stop is an interruption, not a failure."""
         reconstructor.attach(_RecordingController())
-        submission = reconstructor.submit(HEAD_UP, 4000)
+        submission = reconstructor.submit(HEAD_UP, Hold(4000))
 
         reconstructor.stop((HEAD_UP,))
 
@@ -735,7 +942,7 @@ class TestSubmissionOutcomes:
 
     def test_a_submission_never_expressed_fails(self, reconstructor, clock, timer):
         """A hold no controller ever took fails when its deadline passes."""
-        submission = reconstructor.submit(HEAD_UP, 1000)
+        submission = reconstructor.submit(HEAD_UP, Hold(1000))
 
         _advance(clock, timer, 1.2)
 
@@ -745,7 +952,7 @@ class TestSubmissionOutcomes:
         """Quiesce ends intents the way a bed-wide stop does."""
         controller = _RecordingController()
         reconstructor.attach(controller)
-        submission = reconstructor.submit(HEAD_UP, 4000)
+        submission = reconstructor.submit(HEAD_UP, Hold(4000))
 
         reconstructor.quiesce()
 
@@ -768,7 +975,7 @@ class TestSubmissionOutcomes:
         with pytest.raises(RuntimeError, match="intake closed"):
             _samples(reconstructor, 1, ("a", HEAD_UP, Hold(3000)))
         with pytest.raises(RuntimeError, match="intake closed"):
-            reconstructor.submit(HEAD_UP, 1000)
+            reconstructor.submit(HEAD_UP, Hold(1000))
 
 
 class TestPressFidelity:
@@ -815,12 +1022,12 @@ class TestPressFidelity:
         """
         controller = _RecordingController()
         reconstructor.attach(controller)
-        stopped = reconstructor.submit(HEAD_UP, 4000)
+        stopped = reconstructor.submit(HEAD_UP, Hold(4000))
         reconstructor.stop((HEAD_UP,))
         assert stopped.result() is HoldOutcome.INTERRUPTED
 
         reconstructor.detach()
-        unexpressed = reconstructor.submit(HEAD_DOWN, 1000)
+        unexpressed = reconstructor.submit(HEAD_DOWN, Hold(1000))
         _advance(clock, timer, 1.2)
         assert unexpressed.result() is HoldOutcome.FAILED
 
@@ -829,7 +1036,7 @@ class TestPressFidelity:
         assert not reconstructor.holds_anything
 
         reconstructor.attach(_RecordingController())
-        lost = reconstructor.submit(HEAD_UP, 4000)
+        lost = reconstructor.submit(HEAD_UP, Hold(4000))
         reconstructor.detach()
         assert lost.result() is HoldOutcome.FAILED
 

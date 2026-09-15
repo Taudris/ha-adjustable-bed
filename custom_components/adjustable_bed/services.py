@@ -55,8 +55,8 @@ from .hold_intent import (
     Hold,
     IntentAction,
     IntentId,
-    IntentSample,
-    IntentSampleSet,
+    ResolvedSample,
+    ResolvedSampleSet,
     SenderId,
 )
 from .hold_reconstructor import SUBMISSION_SENDER
@@ -191,6 +191,7 @@ ATTR_SAMPLES = "samples"
 ATTR_INTENT_ID = "intent_id"
 ATTR_CONTROL = "control"
 ATTR_ACTION = "action"
+ATTR_KIND = "kind"
 ATTR_TTL_MS = "ttl_ms"
 
 TIMED_MOVE_MOTOR_OPTIONS = (
@@ -573,18 +574,19 @@ def _resolve_sampled_control(coordinator: AdjustableBedCoordinator, name: str) -
 
 
 def _resolve_sampled_action(
-    coordinator: AdjustableBedCoordinator, control: Control, sample: dict[str, Any]
+    coordinator: AdjustableBedCoordinator, control: Control, action: dict[str, Any]
 ) -> IntentAction:
-    """Return the action a sample carries.
+    """Return the action a tagged variant carries.
 
-    Neither action is ever clamped or coerced into the other one.
+    The variant's own schema carries the ttl a hold needs and admits none on an
+    activate, so the two shapes arrive already separated. Neither action is ever
+    clamped or coerced into the other one.
 
     Raises:
         ServiceValidationError: Thrown when the control does not support the
-            action, or when a hold carries no ttl or an activate carries one.
+            action.
     """
-    kind = ActionKind(sample[ATTR_ACTION])
-    ttl_ms = sample.get(ATTR_TTL_MS)
+    kind = ActionKind(action[ATTR_KIND])
     if not coordinator.control_roster.supports(control, kind):
         raise ServiceValidationError(
             f"Control '{control.name}' on device '{coordinator.name}' does not support "
@@ -597,28 +599,16 @@ def _resolve_sampled_action(
                 "action": kind.value,
             },
         )
-    if (kind is ActionKind.HOLD) != (ttl_ms is not None):
-        raise ServiceValidationError(
-            f"A 'hold' sample carries ttl_ms and an 'activate' sample does not; "
-            f"control '{control.name}' on device '{coordinator.name}' carries neither shape",
-            translation_domain=DOMAIN,
-            translation_key="hold_ttl_mismatch",
-            translation_placeholders={
-                "device_name": coordinator.name,
-                "control": control.name,
-                "action": kind.value,
-            },
-        )
-    return Hold(ttl_ms) if ttl_ms is not None else Activate()
+    return Hold(action[ATTR_TTL_MS]) if kind is ActionKind.HOLD else Activate()
 
 
-def _resolve_sample(coordinator: AdjustableBedCoordinator, sample: dict[str, Any]) -> IntentSample:
+def _resolve_sample(coordinator: AdjustableBedCoordinator, sample: dict[str, Any]) -> ResolvedSample:
     """Return one sample with its control and action resolved against the roster."""
     control = _resolve_sampled_control(coordinator, sample[ATTR_CONTROL])
-    return IntentSample(
+    return ResolvedSample(
         intent_id=IntentId(sample[ATTR_INTENT_ID]),
         control=control,
-        action=_resolve_sampled_action(coordinator, control, sample),
+        action=_resolve_sampled_action(coordinator, control, sample[ATTR_ACTION]),
     )
 
 
@@ -638,9 +628,29 @@ def _intent_bed(target: BedTarget, inferred_side: str | None) -> AdjustableBedCo
 
 
 async def handle_send_intents(call: ServiceCall) -> None:
-    """Handle send_intents service call."""
+    """Handle send_intents service call.
+
+    One device, not a list: the bed a sample set names is an attribute of the
+    set, and this message drops whole or applies whole. A list would apply to
+    the first device and raise on the second's undeclared control, leaving the
+    caller with a half-applied message and one error.
+
+    The field still arrives as a list, because Home Assistant validates a
+    ``target:`` block with ``cv.ENTITY_SERVICE_FIELDS`` and merges the result
+    into the service data before this schema runs, so a card's or an
+    automation's single-device target reaches here as one element.
+    """
     hass = call.hass
-    device_ids = call.data.get(CONF_DEVICE_ID, [])
+    device_ids = call.data[CONF_DEVICE_ID]
+    if len(device_ids) > 1:
+        raise ServiceValidationError(
+            "A set of intents names one bed, so send_intents takes one device, "
+            f"not {len(device_ids)}",
+            translation_domain=DOMAIN,
+            translation_key="hold_multiple_devices_not_supported",
+            translation_placeholders={"count": str(len(device_ids))},
+        )
+    device_id = device_ids[0]
     sender = SenderId(call.data[ATTR_SENDER_ID])
     seq = call.data[ATTR_SEQ]
     samples = call.data[ATTR_SAMPLES]
@@ -656,29 +666,28 @@ async def handle_send_intents(call: ServiceCall) -> None:
             translation_placeholders={"sender_id": SUBMISSION_SENDER},
         )
 
-    for device_id in device_ids:
-        resolved = _resolve_sided_target(hass, device_id)
-        if resolved is None:
-            raise _missing_device_error(device_id)
-        target, inferred_side = resolved
-        coordinator = _intent_bed(target, inferred_side)
-        # The roster answers hold-capability, never a controller instance,
-        # which is absent while the bed sits idle.
-        if coordinator is None or not coordinator.control_roster.declares_hold:
-            raise ServiceValidationError(
-                f"Device '{target.name}' does not support hold intents",
-                translation_domain=DOMAIN,
-                translation_key="hold_not_supported",
-                translation_placeholders={"device_name": target.name},
-            )
-
-        # Every sample resolves before any of them reaches the reconstructor.
-        message = IntentSampleSet(
-            sender=sender,
-            seq=seq,
-            samples=tuple(_resolve_sample(coordinator, sample) for sample in samples),
+    resolved = _resolve_sided_target(hass, device_id)
+    if resolved is None:
+        raise _missing_device_error(device_id)
+    target, inferred_side = resolved
+    coordinator = _intent_bed(target, inferred_side)
+    # The roster answers hold-capability, never a controller instance,
+    # which is absent while the bed sits idle.
+    if coordinator is None or not coordinator.control_roster.declares_hold:
+        raise ServiceValidationError(
+            f"Device '{target.name}' does not support hold intents",
+            translation_domain=DOMAIN,
+            translation_key="hold_not_supported",
+            translation_placeholders={"device_name": target.name},
         )
-        coordinator.hold_reconstructor.handle_samples(message)
+
+    # Every sample resolves before any of them reaches the reconstructor.
+    message = ResolvedSampleSet(
+        sender=sender,
+        seq=seq,
+        samples=tuple(_resolve_sample(coordinator, sample) for sample in samples),
+    )
+    coordinator.hold_reconstructor.handle_samples(message)
 
 
 async def _submit_hold(
@@ -691,7 +700,8 @@ async def _submit_hold(
 
     Raises:
         HomeAssistantError: Thrown when the bed's roster declares no such
-            control. The handler validated the motor or the slot before this
+            control, and by the submission door when the control refuses a
+            Hold. The handler validated the motor or the slot before this
             branch, so the caller's input is good and the bed module's
             declarations disagree with its own controller class.
     """
@@ -703,11 +713,92 @@ async def _submit_hold(
             f"'{control_name}'"
         )
 
-    press_min_ms = roster.declaration(control).press_min_ms
-    outcome = await coordinator.hold_reconstructor.submit(
-        control, press_min_ms if ttl_ms is None else ttl_ms
-    )
+    ttl = roster.minimum_press_ms(control) if ttl_ms is None else ttl_ms
+    outcome = await coordinator.hold_reconstructor.submit(control, Hold(ttl))
     _LOGGER.debug("Hold intent on %s ended: %s", control_name, outcome)
+
+
+def _preset_name_error(target: BedChild, preset: int | str) -> ServiceValidationError:
+    """Return the refusal a preset this bed cannot name earns."""
+    return ServiceValidationError(
+        f"Device '{target.name}' has no '{preset}' preset. Use a memory slot "
+        "number, or a preset name this bed declares.",
+        translation_domain=DOMAIN,
+        translation_key="preset_name_not_supported",
+        translation_placeholders={"device_name": target.name, "preset": str(preset)},
+    )
+
+
+def _validate_declared_preset(target: AdjustableBedCoordinator, preset: int | str) -> None:
+    """Check one preset against the roster of a bed that declares its presets.
+
+    One path for a slot number and for a bed's own name, and one authority for
+    both: the roster answers which presets exist, never a controller instance,
+    which is absent while the bed sits idle. So a recall on an idle
+    hold-capable bed pays no connect before its intent exists, whichever form
+    it names the preset in.
+
+    Raises:
+        ServiceValidationError: Thrown when the bed's roster declares no such
+            preset.
+    """
+    if target.control_roster.find(preset_control_name(preset)) is None:
+        raise _preset_name_error(target, preset)
+
+
+def _pulsed_preset_slot(target: BedChild, preset: int | str, duration_ms: int | None) -> int:
+    """Return the slot a pulsed recall can carry, refusing what it cannot.
+
+    Both refusals land before anything connects, because neither reads the
+    bed.
+
+    Raises:
+        ServiceValidationError: Thrown when a duration is asked for, which a
+            pulsed recall cannot honour, and when the preset is named rather
+            than numbered, which only a roster resolves.
+    """
+    if duration_ms is not None:
+        raise ServiceValidationError(
+            f"Device '{target.name}' recalls a preset as a pulse, so it cannot hold "
+            "one for a duration",
+            translation_domain=DOMAIN,
+            translation_key="preset_duration_not_supported",
+            translation_placeholders={"device_name": target.name},
+        )
+    if not isinstance(preset, int):
+        raise _preset_name_error(target, preset)
+    return preset
+
+
+def _validate_pulsed_slot(
+    target: BedChild, controller: BedController | SideBoundController, preset: int
+) -> None:
+    """Check one slot number against the controller that recalls it.
+
+    Raises:
+        ServiceValidationError: Thrown when the bed has no memory presets, or
+            fewer slots than the one asked for.
+    """
+    if not controller.supports_memory_presets:
+        raise ServiceValidationError(
+            f"Device '{target.name}' does not support memory presets",
+            translation_domain=DOMAIN,
+            translation_key="memory_presets_not_supported",
+            translation_placeholders={"device_name": target.name},
+        )
+    slot_count = controller.memory_slot_count
+    if preset > slot_count:
+        raise ServiceValidationError(
+            f"Device '{target.name}' only supports memory presets 1-{slot_count}. "
+            f"Preset {preset} is not available for this bed type.",
+            translation_domain=DOMAIN,
+            translation_key="invalid_preset_number",
+            translation_placeholders={
+                "device_name": target.name,
+                "max_preset": str(slot_count),
+                "requested_preset": str(preset),
+            },
+        )
 
 
 async def handle_goto_preset(call: ServiceCall) -> None:
@@ -718,45 +809,32 @@ async def handle_goto_preset(call: ServiceCall) -> None:
     device_ids = call.data.get(CONF_DEVICE_ID, [])
     explicit_side = call.data.get(ATTR_SIDE)
 
-    _LOGGER.info("Service goto_preset called: preset=%d (side=%s)", preset, explicit_side)
+    _LOGGER.info("Service goto_preset called: preset=%s (side=%s)", preset, explicit_side)
 
     targets, missing = _resolve_sided_targets(hass, device_ids, explicit_side)
     if missing:
         raise _missing_device_error(missing[0])
 
     # Phase 1: validate the preset on EVERY targeted side before moving any
-    # bed, so a multi-target call never half-executes.
+    # bed, so a multi-target call never half-executes. A side whose every
+    # target declares the preset is validated against its roster and never
+    # reaches _validation_controller, so an idle hold-capable bed pays no
+    # connect before its intent exists.
     preflighted: PreflightedSides = []
     hold_targets: list[AdjustableBedCoordinator] = []
     try:
         for coordinator, side in targets:
             for target in _command_targets(coordinator, side):
-                controller = await _validation_controller(coordinator, target, preflighted)
-                if isinstance(controller, HoldCapable) and isinstance(
-                    target, AdjustableBedCoordinator
+                if (
+                    isinstance(target, AdjustableBedCoordinator)
+                    and target.control_roster.declares_hold
                 ):
+                    _validate_declared_preset(target, preset)
                     hold_targets.append(target)
-                if not controller.supports_memory_presets:
-                    raise ServiceValidationError(
-                        f"Device '{target.name}' does not support memory presets",
-                        translation_domain=DOMAIN,
-                        translation_key="memory_presets_not_supported",
-                        translation_placeholders={"device_name": target.name},
-                    )
-                # Validate preset against controller's memory slot count
-                slot_count = controller.memory_slot_count
-                if preset > slot_count:
-                    raise ServiceValidationError(
-                        f"Device '{target.name}' only supports memory presets 1-{slot_count}. "
-                        f"Preset {preset} is not available for this bed type.",
-                        translation_domain=DOMAIN,
-                        translation_key="invalid_preset_number",
-                        translation_placeholders={
-                            "device_name": target.name,
-                            "max_preset": str(slot_count),
-                            "requested_preset": str(preset),
-                        },
-                    )
+                    continue
+                slot = _pulsed_preset_slot(target, preset, duration_ms)
+                controller = await _validation_controller(coordinator, target, preflighted)
+                _validate_pulsed_slot(target, controller, slot)
     except ServiceValidationError:
         await _release_preflighted(preflighted)
         raise
@@ -2321,7 +2399,15 @@ async def async_register_services(hass: HomeAssistant) -> None:
         schema=vol.Schema(
             {
                 vol.Required(CONF_DEVICE_ID): cv.ensure_list,
-                vol.Required(ATTR_PRESET): vol.All(vol.Coerce(int), vol.Range(min=1)),
+                # The integer branch first, so 3 and "3" keep coercing to a slot
+                # number and only a non-numeric string reaches the name branch.
+                # Which names exist is the bed's roster to answer, not a list
+                # here: a second list would go stale the moment a bed module
+                # declared a preset it did not name.
+                vol.Required(ATTR_PRESET): vol.Any(
+                    vol.All(vol.Coerce(int), vol.Range(min=1)),
+                    vol.All(cv.string, vol.Length(min=1)),
+                ),
                 **SIDE_FIELD,
                 # timed_move's own bounds, which are also a preset control's ttl
                 # maximum, so the schema and the roster cannot disagree.
@@ -2683,7 +2769,17 @@ async def async_register_services(hass: HomeAssistant) -> None:
         handle_send_intents,
         schema=vol.Schema(
             {
-                vol.Required(CONF_DEVICE_ID): cv.ensure_list,
+                # One device, not a list: every other service here fans a
+                # command out per device, while a sample set names the one bed
+                # it belongs to and applies whole. The shape is still a list,
+                # because a ``target:`` block reaches a handler through
+                # cv.ENTITY_SERVICE_FIELDS, whose device_id is ensure_list, and
+                # a scalar in the service data is the same field spelled
+                # shorter. The handler refuses a second id with a translated
+                # message the schema has no way to phrase.
+                vol.Required(CONF_DEVICE_ID): vol.All(
+                    cv.ensure_list, [cv.string], vol.Length(min=1)
+                ),
                 vol.Required(ATTR_SENDER_ID): cv.string,
                 vol.Required(ATTR_SEQ): vol.All(vol.Coerce(int), vol.Range(min=0)),
                 # A hold ends with a ttl-0 sample, so no empty set exists.
@@ -2695,12 +2791,27 @@ async def async_register_services(hass: HomeAssistant) -> None:
                             {
                                 vol.Required(ATTR_INTENT_ID): cv.string,
                                 vol.Required(ATTR_CONTROL): cv.string,
-                                vol.Required(ATTR_ACTION): vol.In(["hold", "activate"]),
-                                # No ceiling here: the control's roster maximum
-                                # clamps the ttl, and a second authority on one
-                                # value is one too many.
-                                vol.Optional(ATTR_TTL_MS): vol.All(
-                                    vol.Coerce(int), vol.Range(min=0)
+                                # One variant's shape or the other's, so a ttl on
+                                # an activate and a hold without one are shapes
+                                # the wire cannot express.
+                                vol.Required(ATTR_ACTION): vol.Any(
+                                    vol.Schema(
+                                        {
+                                            vol.Required(ATTR_KIND): ActionKind.HOLD.value,
+                                            # No ceiling here: the control's
+                                            # roster maximum clamps the ttl, and
+                                            # a second authority on one value is
+                                            # one too many.
+                                            vol.Required(ATTR_TTL_MS): vol.All(
+                                                vol.Coerce(int), vol.Range(min=0)
+                                            ),
+                                        },
+                                        extra=vol.PREVENT_EXTRA,
+                                    ),
+                                    vol.Schema(
+                                        {vol.Required(ATTR_KIND): ActionKind.ACTIVATE.value},
+                                        extra=vol.PREVENT_EXTRA,
+                                    ),
                                 ),
                             }
                         )

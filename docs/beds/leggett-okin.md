@@ -95,6 +95,15 @@ SET key. It does not inherit the newer apps' composite favorite-programming
 sequence or their four direct favorite entries. Its sleep timer independently
 offers a third memory action.
 
+**Reaching a preset.** On this bed a preset is held rather than activated: the
+card renders each preset and memory tile as a hold tile, so the bed travels
+while you hold the tile down and a tap is a short hold. The automation's door is
+`adjustable_bed.goto_preset`, which takes a memory slot number or the name of a
+fixed position — `flat` or `dummy`. Its optional `duration_ms` says how long to
+hold the key; leave it out for the shortest press the box registers, which is
+what a box in latch mode needs, because there the down edge latches the whole
+travel and the release is a no-op.
+
 `0x00010000` arms the box to overwrite a slot. It must never appear in the
 recall ladder. Earlier releases of this integration used a ladder shifted one
 step up (`0x2000`…`0x10000`), so every memory button recalled its neighbour and
@@ -121,63 +130,81 @@ and never written; it must not be reconstructed as a command.
 
 ## Timing and release semantics
 
-This protocol treats held buttons and one-shot recalls very differently, and
-getting the distinction wrong is the main way to break it.
+The control box reads one frame as the OR of every key held down, so every
+command on this bed is a key held for as long as it is wanted. The integration
+streams one frame every 100 ms carrying the whole set, and ends the stream with
+**one** keycode-`0` frame written as a confirmed write. There is no distinct
+stop opcode; the release frame is an ordinary frame carrying zero.
 
-**Held keycodes** (motors, flat, light, massage) stream every ~100 ms while the
-button is down. On release the app emits **exactly four** keycode-`0` frames and
-then goes silent. The release frame is an ordinary frame carrying zero.
+CU170 hardware testing measured a 217-218 ms motion watchdog: the box carries a
+key that long past the frame asserting it, and a wider gap is a release. The
+stream's frames are unconfirmed writes, paced from the start of each write, so
+no BLE round trip rides in the gap. Awaiting a confirmed write and then sleeping
+100 ms repeatedly crosses the watchdog over a WiFi Bluetooth proxy and makes the
+motor stop and restart. The one confirmed write is the release, whose completion
+nothing waits on.
 
-For **Prodigy CE / CU170 only**, explicit **Stop all** first sends the
-reporter's hardware-tested DUMMY keycode `0x00040000`, then the ordinary release
-burst. This interrupts a latched preset or preset-save sequence, which zero
-alone does not stop. It uses the selected R0/R1 framing (`e5fe160004000002` /
-`040200040000`) and ignores the cancelled movement's cancel event. Ordinary
-end-of-hold cleanup still sends only zero; other app profiles retain their
-accepted release behavior. This semantic correction comes from the
-[September hardware report](https://github.com/kristofferR/ha-adjustable-bed/issues/368#issuecomment-5747783066),
-not a newly discovered reachable app command.
+Explicit **Stop all** drops every bit, writes that one release, and then presses
+the keycode `0x00040000` that has no function of its own. That press is what
+interrupts a latched preset or preset-save sequence, which zero alone does not
+stop; the
+[September hardware report](https://github.com/kristofferR/ha-adjustable-bed/issues/368#issuecomment-5747783066)
+confirmed it on a CU170.
 
-CU170 hardware testing measured a 217-218 ms motion watchdog. The integration
-therefore uses unconfirmed writes and measures the 100 ms interval from the
-start of each write. Awaiting a confirmed write and then sleeping 100 ms adds
-the BLE round trip to every gap, which repeatedly crosses the watchdog over a
-WiFi Bluetooth proxy and makes the motor stop and restart.
+How far the stream may run ahead of the box is the box's own answer: it
+acknowledges each frame it receives with a status notification, and the
+integration spends one of four credits per frame and takes one back per
+acknowledgement. At zero credit the next frame goes as a confirmed write and
+nothing follows until it completes. Acknowledgements are positive evidence only:
+their absence advances nothing, and a sustained absence ends the stream and the
+link.
 
-**One-shot recalls** (the memory slots) are a burst of **exactly 10 frames at
-~100 ms**, with **no terminator at all**. The control box drives the move to
-completion by itself. Successful Prodigy recalls retain that app behavior;
-CU170 hardware testing shows that explicit interruption needs the DUMMY keycode.
-Cancellation or write failure uses the proven zero cleanup. U Series memory
-controls follow the ordinary held-key lifecycle instead. Memory 1, Memory 2 and
-Snore therefore have no one-shot preset buttons in this profile. Use
-`adjustable_bed.leggett_hold_control` with an explicit duration for these controls.
+**A preset is a held key too**, not a burst. In hold mode the box travels while
+the key is down and stops at the release; in latch mode the box latches the
+whole travel at the press and the release is a no-op. One press shape serves
+both modes, so nothing here prices a recall's length.
 
 LP Control 2.9.0 uses a 200 ms cadence for held commands where Prodigy CE uses
-100 ms. The integration uses the accepted Prodigy/U Series 100 ms cadence and
-retains the recorded CU170 hardware policy.
+100 ms. The integration follows the 100 ms one: a shorter refresh cannot fall
+outside a keep-alive window that a longer one satisfies, and users on 200 ms
+reported stuttering movement.
 
-`adjustable_bed.leggett_hold_control` exposes bounded holds for flat, Snore,
-lighting and massage buttons. U Series also permits memory 1, memory 2 and SET.
-The existing movement services cover motor holds. These actions preserve the
-held-button behavior separately from the Prodigy fixed-count favorite recalls.
+U Series memory controls have no one-shot preset buttons in this profile. Use
+`adjustable_bed.leggett_hold_control` with an explicit duration for Memory 1,
+Memory 2 and Snore there. That action also exposes bounded holds for flat,
+Snore, lighting and massage buttons on every profile, and U Series adds SET; it
+writes through the command path rather than the streamed set.
 
 ## Memory programming
 
-There is no program opcode. Storing a position is two ordinary held keycodes in
-sequence:
+There is no program opcode. Storing a position is two held keys the box
+acknowledges one at a time, by flashing the under-bed light:
 
-1. hold `0x00010000` for approximately 5 seconds
-2. switch directly to the selected slot for approximately 2 seconds
-3. finish with the ordinary four zero frames
+1. hold `0x00010000` alone until the box answers with **one** light pulse, about
+   1-2 s in. It arms only while that key is held on its own, so nothing else
+   may ride the frame.
+2. drop the key: the set goes empty and one keycode-`0` frame ends the stage.
+   The next stage begins one clear floor, 223 ms, after that edge.
+3. hold the slot keycode until the box answers with **three** pulses, which is
+   the save.
 
-The app's reset and slot assignment are consecutive calls in one callback.
-An intermediate zero can occur through scheduling, but the integration does not
-insert a guaranteed four-zero gap between the two stages. U Series has only the
-standalone held SET path, available through `leggett_hold_control`.
+Each stage fails at a 5.5 s ceiling rather than advancing on elapsed time. A
+slot key against a box that never armed is a plain recall, so a lost cue has to
+fail the store rather than move the bed. A stage that ends without the saved cue
+- a ceiling, a stop, a preemption - is followed by one press of `0x00040000`,
+the key with no function of its own: the box counts it as a button, and a button
+clears a pending store. On a Prodigy CE bed, the profile the key is confirmed
+on, the bed-wide stop presses it for the same reason. A connect presses nothing:
+in latch mode any press during an autonomous travel is taken as that travel's
+stop, so a press the integration sends on reconnect can cut short a travel the
+hand control started.
 
-The shipped user guide corroborates this: "Touch Save… the massage motors will
-buzz once. Within 5 seconds, touch the Favorite Position being edited."
+The shipped user guide describes the same two stages for the hand control:
+"Touch Save… the massage motors will buzz once. Within 5 seconds, touch the
+Favorite Position being edited."
+
+U Series has only the standalone held SET path, available through
+`leggett_hold_control`.
 
 ## Notifications
 
@@ -268,12 +295,14 @@ See their Home Assistant action descriptions for field names and cancellation.
 ## Control mode
 
 The three Prodigy profiles expose two persistent control-box settings. U Series
-does not expose these settings or initialize the optional CSS channel.
+does not expose these settings or initialize the optional CSS channel. Each
+setting is one held chord the box acknowledges with its own count of light
+pulses, and each fails at a 7 s ceiling if that answer never comes:
 
-| Mode | Keycode | Lifecycle |
+| Mode | Keycode | Answer |
 |---|---|---|
-| Press-and-hold | `0x08010000` | 55 attempts at 100 ms, then one zero frame |
-| Press-and-release | `0x01800000` | 55 attempts at 100 ms, then one zero frame |
+| Press-and-hold | `0x08010000` | 2 pulses |
+| Press-and-release | `0x01800000` | 4 pulses |
 
 **Prodigy CE exception:** #368 reports that SET+FLAT (`0x08010000`) factory-resets
 the CU170 and wipes its saved presets. For this profile, Home Assistant removes
@@ -287,6 +316,17 @@ because neither notification channel reports the currently active mode. On
 boxes with the optional Smart Remote CSS service, notification setup also sends
 the app's raw `01 02` initialization write.
 
+**We recommend neither mode, and their consequences are asymmetric.**
+Press-and-hold restores the box's factory defaults, which is what restores hold
+mode, and it wipes the stored favorites with them. Press-and-release is one-way:
+the only route back is that reset.
+
+Latch mode also changes two things that reach anything built on the box. A press
+arriving while the box runs an autonomous travel is consumed as that travel's
+stop and does nothing else, so a light toggle sent during a preset travel stops
+the bed and does not toggle the light. And a held key's release is a no-op: the
+travel the press latched runs to its end whatever the frames say afterwards.
+
 ## Provenance
 
 Command values, framing, timing, notification parsing and release semantics
@@ -298,8 +338,10 @@ not modify or replace the accepted analysis. The [whole-cluster disposition](leg
 records all four accepted report identities, previously implemented behavior,
 remaining findings, exact app differences and transport exclusions.
 
+CU170 hardware testing has since settled the release semantics, the motion
+watchdog, the light bit in the notification mask, and the pulse count each
+staged gesture is acknowledged by.
+
 Unverified against hardware, and worth a capture if you have the equipment:
-which frame revision real units use, whether preset recall truly ends without a
-terminator, whether changing control mode also resets editable favorites on all
-firmware, and whether the corrected tap interval registers reliably on both
-local adapters and wireless proxies.
+which frame revision real units use, and whether changing control mode also
+resets editable favorites on all firmware.

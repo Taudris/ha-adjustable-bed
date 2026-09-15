@@ -20,7 +20,8 @@ from .const import (
     SIDE_BOTH,
 )
 from .entity import AdjustableBedEntity
-from .entity_runtime import EntityRuntime
+from .entity_runtime import EntityRuntime, entity_control_roster
+from .hold_roster import ActionKind
 from .paired_coordinator import (
     PairedBedCoordinator,
     SingleAddressPairedCoordinator,
@@ -36,6 +37,13 @@ _MASSAGE_INTENSITY_BUTTON_KEY_MIGRATIONS = (
     ("massage_intensity_1", "massage_intensity_level_1"),
     ("massage_intensity_2", "massage_intensity_level_2"),
     ("massage_intensity_3", "massage_intensity_level_3"),
+)
+
+# The buttons whose press stages bed-side rather than becoming a hold intent.
+# The three save buttons are marked by is_program_button; these two are the mode
+# chords, which reach the bed through the command path like a save.
+_OPERATION_BUTTON_KEYS = frozenset(
+    {"control_mode_press_and_hold", "control_mode_press_and_release"}
 )
 
 
@@ -1034,6 +1042,9 @@ class AdjustableBedButton(AdjustableBedEntity, ButtonEntity):
     """Button entity for Adjustable Bed."""
 
     entity_description: AdjustableBedButtonEntityDescription
+    # Constants for the life of the config entry, so the recorder would store
+    # the same two values on every state change forever.
+    _unrecorded_attributes = frozenset({"hold_control", "hold_ttl_max_ms"})
 
     def __init__(
         self,
@@ -1057,6 +1068,48 @@ class AdjustableBedButton(AdjustableBedEntity, ButtonEntity):
         slot_name = _discovered_memory_slot_name(coordinator, description)
         if slot_name is not None:
             self._attr_name = slot_name
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return the control this button renders, on a bed that declares it.
+
+        A card discovers the integration's hold primitive here: the roster is
+        the single author of a control name, so a client reads one rather than
+        composing it, and so does this platform - a bed module aliases each
+        control to the entity key of the button that renders it, and the button
+        asks for it by the one name it already has. Absent on every bed whose
+        module declares no control, and on any control the bed declares without
+        Hold.
+        """
+        roster = entity_control_roster(self._coordinator)
+        control = roster.find(self.entity_description.key)
+        # Hold support, not mere existence. The attribute's name and its one
+        # consumer promise a control a client can hold, and every gesture on an
+        # Activate-only control would die at the handler instead.
+        if control is None or not roster.supports(control, ActionKind.HOLD):
+            return None
+        return {
+            "hold_control": control.name,
+            "hold_ttl_max_ms": roster.ttl_max_ms(control),
+        }
+
+    @property
+    def _cancel_running(self) -> bool:
+        """Return whether this press may cancel the command in flight.
+
+        On a hold-capable bed a tap never cancels an operation the streamer is
+        staging, as the light's press has never done. The operation buttons keep
+        their declared value, so a second save or mode gesture preempts the first
+        rather than queueing behind seconds of staging.
+        """
+        if not self.entity_description.cancel_movement:
+            return False
+        if not entity_control_roster(self._coordinator).declares_hold:
+            return True
+        return (
+            self.entity_description.is_program_button
+            or self.entity_description.key in _OPERATION_BUTTON_KEYS
+        )
 
     async def async_press(self) -> None:
         """Handle button press."""
@@ -1102,7 +1155,7 @@ class AdjustableBedButton(AdjustableBedEntity, ButtonEntity):
                 return
             await self._coordinator.async_execute_controller_command(
                 self.entity_description.press_fn,
-                cancel_running=self.entity_description.cancel_movement,
+                cancel_running=self._cancel_running,
                 resource=_button_resource(self.entity_description.key),
             )
             _LOGGER.debug("Button action completed: %s", self.entity_description.key)

@@ -78,10 +78,10 @@ from custom_components.adjustable_bed.const import (
     OCTO_VARIANT_STANDARD,
 )
 from custom_components.adjustable_bed.coordinator import AdjustableBedCoordinator
+from custom_components.adjustable_bed.hold_intent import Hold, HoldOutcome
 from custom_components.adjustable_bed.hold_reconstructor import HoldReconstructor
+from custom_components.adjustable_bed.hold_roster import Control
 from custom_components.adjustable_bed.pairing import is_paired
-
-_LOAD_DECLARATIONS = "custom_components.adjustable_bed.coordinator.load_control_declarations"
 
 
 def _configure_linak_advanced(
@@ -2479,7 +2479,11 @@ class TestServices:
         mock_coordinator_connected,
         enable_custom_integrations,
     ):
-        """CU170 timed_move should accept its exposed pillow actuator."""
+        """CU170 timed_move accepts its exposed pillow actuator, as a hold intent.
+
+        The bed is hold-capable, so the service submits one direct submission
+        for the requested duration instead of running the baseline pulse path.
+        """
         entry = MockConfigEntry(
             domain=DOMAIN,
             title="Leggett Okin Timed Move Bed",
@@ -2507,9 +2511,16 @@ class TestServices:
         assert len(devices) == 1
         device_id = devices[0].id
 
-        controller = hass.data[DOMAIN][entry.entry_id].controller
-        controller.move_pillow_up = AsyncMock()
-        controller.move_pillow_stop = AsyncMock()
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+        submissions: list[tuple] = []
+
+        def _submit(control, action):
+            submissions.append((control, action))
+            future: asyncio.Future = hass.loop.create_future()
+            future.set_result(HoldOutcome.COMPLETED)
+            return future
+
+        coordinator.hold_reconstructor.submit = _submit
 
         await hass.services.async_call(
             DOMAIN,
@@ -2523,42 +2534,38 @@ class TestServices:
             blocking=True,
         )
 
-        controller.move_pillow_up.assert_awaited_once()
-        controller.move_pillow_stop.assert_awaited_once()
+        assert submissions == [(Control("motor-pillow-up"), Hold(1000))]
 
 
 class TestHoldPiecesLifecycle:
     """The entry's ownership of the roster and the reconstructor."""
 
-    async def test_setup_builds_the_roster_before_the_first_connect(
+    async def test_setup_takes_the_roster_from_the_controller_it_connects(
         self,
         hass: HomeAssistant,
         mock_config_entry,
         mock_coordinator_connected,
         enable_custom_integrations,
     ):
-        """roster-build-site: the build is at entry setup, not inside the connect."""
+        """roster-build-site: only a controller knows which controls its bed has."""
         order: list[str] = []
-
-        async def _declarations(coordinator):
-            del coordinator
-            order.append("roster")
-            return ()
-
         original_connect = AdjustableBedCoordinator.async_connect
 
         async def _connect(self, *args, **kwargs):
             order.append("connect")
             return await original_connect(self, *args, **kwargs)
 
+        def _adopt(self) -> None:
+            order.append("roster")
+
         with (
-            patch(_LOAD_DECLARATIONS, _declarations),
+            patch.object(AdjustableBedCoordinator, "adopt_control_roster", _adopt),
             patch.object(AdjustableBedCoordinator, "async_connect", _connect),
         ):
             await hass.config_entries.async_setup(mock_config_entry.entry_id)
             await hass.async_block_till_done()
 
-        assert order[:2] == ["roster", "connect"]
+        assert order[:2] == ["connect", "roster"]
         coordinator = hass.data[DOMAIN][mock_config_entry.entry_id]
         assert coordinator.control_roster.declares_hold is False
         assert coordinator.hold_reconstructor.holds_anything is False

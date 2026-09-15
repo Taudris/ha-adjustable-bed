@@ -31,12 +31,15 @@ import {
 import { watchCardFreshness } from "./freshness";
 import { MotorHold } from "./hold";
 import { cardNavigationPath, compactActions, compactStopEntities } from "./compact";
+import { IntentHold } from "./intent-hold";
+import { IntentSender, mintIntentId } from "./intents";
 import { localize } from "./localize";
 import {
   type AdjustableBedCardConfig,
   type BedEntities,
   CARD_VERSION,
   type HassEntity,
+  type HoldControl,
   type HomeAssistant,
   type MemorySlot,
   type MotorEntity,
@@ -86,6 +89,28 @@ export class AdjustableBedCard extends LitElement {
   // Retain STOP targets across tab changes, including presets that outlive their
   // service response. A later Stop must still reach movement this card started.
   private readonly _compactStopTargets = new Map<string, symbol>();
+  // One sender per bed device, built at the first hold rather than when the
+  // bed's capability becomes known: the published attributes arrive with the
+  // first state update after a connect, so building on discovery would need a
+  // rebuild edge and a lifetime this element does not otherwise have.
+  private _sender: IntentSender | null = null;
+  // Whether this render shows a pair. The sender addresses the card's one
+  // configured device, which on a paired render is the parent or the other
+  // side rather than the side whose button was pressed, so every button here
+  // keeps 4.0's pulse path until the card can address a side. Failing to the
+  // pulse path moves the bed the user pressed; a sample moves the other one,
+  // or is refused with nothing on screen to say so. The interim until pairing
+  // is designed for this tier.
+  private _rendersAPair = false;
+  // The sample strategy, for a control the bed publishes a hold for. Both
+  // strategies are built once and routed per gesture: idle, each costs two
+  // null fields. Which one runs is the control the entity published — present
+  // is the integration's hold primitive, absent is every other bed, which
+  // keeps the pulse path.
+  private readonly _intentHold = new IntentHold(
+    () => this._senderForDevice(),
+    (stopEntityId) => this._stopBed(stopEntityId),
+  );
   // Press-and-hold rules live in MotorHold; this class owns only the event
   // wiring and the service calls it drives.
   private readonly _hold = new MotorHold({
@@ -109,9 +134,7 @@ export class AdjustableBedCard extends LitElement {
     // Which stop applies depends on the bed the held motor belongs to, so it is
     // threaded in from the row that started the hold rather than read from a
     // single bed-wide stop, which a paired render does not have.
-    stopBed: (stopEntityId) => {
-      if (stopEntityId) this._stopCompactTarget(stopEntityId);
-    },
+    stopBed: (stopEntityId) => this._stopBed(stopEntityId),
   });
 
   public static async getConfigElement(): Promise<HTMLElement> {
@@ -131,6 +154,12 @@ export class AdjustableBedCard extends LitElement {
     if (this._config) {
       this._hold.abandon();
       this._stopCompact();
+    }
+    // A sender's identity scope is one bed device, so pointing the card at
+    // another bed ends whatever the old one is holding and drops it.
+    if (this._sender && config.device_id !== this._config?.device_id) {
+      this._intentHold.abandon();
+      this._sender = null;
     }
     if (config.device_id !== this._config?.device_id ||
         config.default_target !== this._config?.default_target) {
@@ -160,8 +189,10 @@ export class AdjustableBedCard extends LitElement {
     super.disconnectedCallback();
     // Navigating away mid-hold never delivers pointerup, which would leave the
     // repeat loop running forever and a cover-backed motor moving with nothing
-    // left to stop it.
+    // left to stop it. On the sample path it would leave the bed holding until
+    // the ttl ran out.
     this._hold.abandon();
+    this._intentHold.abandon();
   }
 
   protected override willUpdate(changed: PropertyValues): void {
@@ -208,6 +239,9 @@ export class AdjustableBedCard extends LitElement {
     // single-device rendering for a non-paired bed.
     const parentId = resolvePairedParentId(this.hass, this._config.device_id);
     const childIds = pairedChildDeviceIds(this.hass, parentId);
+    this._rendersAPair =
+      Boolean(parentId && childIds.length) ||
+      isSingleAddressPairedDevice(this.hass, this._config.device_id);
     if (parentId && childIds.length) return this._renderPaired(parentId, childIds);
     if (
       this._config.device_id &&
@@ -981,7 +1015,7 @@ export class AdjustableBedCard extends LitElement {
       }
       ${
         bed.stop
-          ? html`<button class="stop-all" @click=${() => this._hold.stopAll(bed.stop)}>
+          ? html`<button class="stop-all" @click=${() => this._stopAll(bed.stop)}>
               <ha-icon icon="mdi:stop"></ha-icon>
               <span>${localize(this.hass, "action.stop_all")}</span>
             </button>`
@@ -1045,6 +1079,7 @@ export class AdjustableBedCard extends LitElement {
         @pointerdown=${(e: PointerEvent) => this._startHold(e, m, direction, stopId)}
         @pointerup=${(e: PointerEvent) => this._endPointerHold(e, m)}
         @pointercancel=${(e: PointerEvent) => this._endPointerHold(e, m)}
+        @lostpointercapture=${() => this._endHold(m)}
         @keydown=${(e: KeyboardEvent) => this._startHold(e, m, direction, stopId)}
         @keyup=${(e: KeyboardEvent) => this._endKeyHold(e, m)}
         @blur=${() => this._endHold(m)}
@@ -1058,7 +1093,11 @@ export class AdjustableBedCard extends LitElement {
     return html`
       ${this._heading("section.presets")}
       <div class="tiles">
-        ${bed.presets.map((id) => this._tile(id, () => this._press(id)))}
+        ${bed.presets.map((p) =>
+          this._samples(p.hold)
+            ? this._holdTile(p.id, p.hold)
+            : this._tile(p.id, () => this._press(p.id)),
+        )}
       </div>
     `;
   }
@@ -1136,6 +1175,11 @@ export class AdjustableBedCard extends LitElement {
         </button>
       `;
     }
+    // On a bed with the hold primitive a preset is held, never activated, so
+    // the tile takes the same gesture the motor buttons do and a tap is a short
+    // hold.
+    if (this._samples(slot.gotoHold))
+      return this._holdTile(slot.goto!, slot.gotoHold);
     // Only a real goto recalls; a save-only slot must not be saved by a plain
     // tap (that requires Save mode), so its tile is disabled here.
     const canRecall = !!slot.goto;
@@ -1224,6 +1268,29 @@ export class AdjustableBedCard extends LitElement {
     return html`
       <button class="tile ${opts.cls ?? ""}" @click=${onClick}>
         ${this._icon(entityId, opts.icon)}
+        <span class="tile-label">${this._name(entityId)}</span>
+      </button>
+    `;
+  }
+
+  // A tile for a control the bed holds rather than activates. Same appearance
+  // as a click tile, the motor buttons' gesture: the bed travels while the key
+  // is asserted in hold mode, and latches the travel at the press in latch
+  // mode, which is the box's business and not the card's.
+  private _holdTile(entityId: string, hold: HoldControl): TemplateResult {
+    return html`
+      <button
+        class="tile hold-tile"
+        @pointerdown=${(e: PointerEvent) => this._startTileHold(e, entityId, hold)}
+        @pointerup=${(e: PointerEvent) => this._endTilePointerHold(e, entityId)}
+        @pointercancel=${(e: PointerEvent) => this._endTilePointerHold(e, entityId)}
+        @lostpointercapture=${() => this._intentHold.end(entityId)}
+        @keydown=${(e: KeyboardEvent) => this._startTileHold(e, entityId, hold)}
+        @keyup=${(e: KeyboardEvent) => this._endTileKeyHold(e, entityId)}
+        @blur=${() => this._intentHold.end(entityId)}
+        @click=${(e: MouseEvent) => this._tapWithoutPointer(e, entityId, hold)}
+      >
+        ${this._icon(entityId)}
         <span class="tile-label">${this._name(entityId)}</span>
       </button>
     `;
@@ -1397,7 +1464,7 @@ export class AdjustableBedCard extends LitElement {
         (x) => x && ids.add(x),
       );
     }
-    bed.presets.forEach((x) => ids.add(x));
+    bed.presets.forEach((p) => ids.add(p.id));
     for (const s of bed.memory) {
       [s.goto, s.save].forEach((x) => x && ids.add(x));
     }
@@ -1427,37 +1494,192 @@ export class AdjustableBedCard extends LitElement {
 
   // ---- actions ------------------------------------------------------------
 
-  // Translates the DOM event into a hold, or ignores it. Everything about who
-  // owns the hold and when it ends is MotorHold's business.
+  // The stop that covers a held control, which on a paired bed is the side's
+  // own rather than the parent's. Both hold strategies press it through here,
+  // and it goes out through the compact router so a retained target a compact
+  // card is still holding is released with it.
+  private _stopBed(stopEntityId?: string): void {
+    if (stopEntityId) this._stopCompactTarget(stopEntityId);
+  }
+
+  // The sender for the configured bed, built on first use. Its whole surface to
+  // Home Assistant is the one service call below; the sender hands a rejection
+  // back here to be logged and nothing else happens, because the ttl bounds
+  // what a lost message can do.
+  private _senderForDevice(): IntentSender | null {
+    const deviceId = this._config?.device_id;
+    if (!deviceId) return null;
+    this._sender ??= new IntentSender({
+      send: (set) => {
+        // No tile renders before hass arrives and none survives its removal,
+        // so a send without it is a logic error rather than a state to skip:
+        // optional-chaining it would drop the message and, on a release, leave
+        // the bed holding until the ttl ran out with nothing to say why.
+        if (!this.hass) throw new Error("send_intents before hass");
+        return this.hass.callService(
+          "adjustable_bed",
+          "send_intents",
+          { ...set },
+          { device_id: deviceId },
+        );
+      },
+      report: (error) => {
+        // eslint-disable-next-line no-console
+        console.warn("adjustable-bed-card: send_intents rejected", error);
+      },
+      stranded: (handle) => this._intentHold.noteStranded(handle),
+      schedule: (ms, fn) => {
+        const timer = setTimeout(fn, ms);
+        return () => clearTimeout(timer);
+      },
+      mintId: mintIntentId,
+      now: () => Date.now(),
+    });
+    return this._sender;
+  }
+
+  // The strategy router, asked by every renderer and every gesture entry point
+  // so the choice has one author. A control whose entity published a hold takes
+  // the sample path; everything else keeps the pulse path, which is what every
+  // bed without the integration's hold primitive needs. The answer is the
+  // control's, not the bed's: a bed can publish one motor's control and not
+  // another's, and each gesture follows its own.
+  private _samples(hold: HoldControl | undefined): hold is HoldControl {
+    return hold !== undefined && !this._rendersAPair;
+  }
+
+  // Whether the gesture in flight is the sample strategy's. `key` names the
+  // control a release is for, or is null for the bed-wide stop, which ends
+  // whatever holds. Routing a release by the published control instead would
+  // send it to the wrong strategy whenever the attributes moved mid-gesture.
+  private _sampleHolds(key: string | null): boolean {
+    const held = this._intentHold.heldKey;
+    return held !== null && (key === null || held === key);
+  }
+
+  // One control at a time, whichever strategy holds it. Each strategy refuses a
+  // second claim of its own; a bed can publish a control for one motor and not
+  // another, so both are reachable on the same bed and a claim by either has to
+  // block the other, which is also what leaves the bed-wide stop one holder to
+  // dispatch to.
+  private _anyHold(): boolean {
+    return this._hold.heldKey !== null || this._intentHold.heldKey !== null;
+  }
+
+  // The press filter both strategies share, and the only place the DOM press
+  // event is read. Returns null when the event is not a press to act on;
+  // otherwise the owning pointer, whose id is null for keyboard activation,
+  // which has no pointer.
+  private _pressOwner(
+    e: PointerEvent | KeyboardEvent,
+  ): { element: HTMLElement; pointerId: number | null } | null {
+    const element = e.currentTarget as HTMLElement;
+    if (e instanceof KeyboardEvent) {
+      // Ignore the auto-repeat the OS generates while a key stays down: the
+      // hold already keeps the bed moving.
+      if (e.repeat || (e.key !== "Enter" && e.key !== " ")) return null;
+      e.preventDefault();
+      return { element, pointerId: null };
+    }
+    // Only the primary button of the primary pointer moves the bed. Without
+    // this a right-click, a stylus barrel button or a secondary touch starts
+    // the bed moving, and pointerdown fires before any click the @click handler
+    // would have filtered out.
+    if (e.button !== 0 || !e.isPrimary) return null;
+    // Keep receiving pointerup even if the finger slides off the button.
+    element.setPointerCapture?.(e.pointerId);
+    e.preventDefault();
+    return { element, pointerId: e.pointerId };
+  }
+
+  // Whether a gesture is still the one that started it: the button it began on
+  // still in the document, still rendered, and still holding the pointer that
+  // took it. A re-render that swaps a tile's template discards the captured
+  // button without any pointerup, pointercancel or blur reaching it, so this is
+  // the only thing that can end the gesture on that path.
+  private _gestureIsLive(
+    element: HTMLElement,
+    pointerId: number | null,
+  ): () => boolean {
+    return () =>
+      element.isConnected &&
+      (element.checkVisibility?.() ?? true) &&
+      (pointerId === null || element.hasPointerCapture?.(pointerId) === true);
+  }
+
+  // pointercancel carries no meaningful button, so only pointerup can be a
+  // non-primary release.
+  private _isPrimaryRelease(e: PointerEvent): boolean {
+    return e.type !== "pointerup" || e.button === 0;
+  }
+
+  // Translates the DOM event into a hold, or ignores it. The router picks the
+  // strategy; who owns the hold and when it ends is the strategy's business.
   private _startHold(
     e: PointerEvent | KeyboardEvent,
     m: MotorEntity,
     dir: "up" | "down",
     stopId?: string,
   ): void {
-    let ownerPointerId: number | null = null;
-    if (e instanceof KeyboardEvent) {
-      // Ignore the auto-repeat the OS generates while a key stays down: the
-      // repeat loop already keeps the motor moving.
-      if (e.repeat || (e.key !== "Enter" && e.key !== " ")) return;
-      e.preventDefault();
-    } else {
-      // Only the primary button of the primary pointer moves the bed. Without
-      // this a right-click, a stylus barrel button or a secondary touch starts
-      // the bed moving, and pointerdown fires before any click the previous
-      // @click handler would have filtered out.
-      if (e.button !== 0 || !e.isPrimary) return;
-      // Keep receiving pointerup even if the finger slides off the button.
-      (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
-      e.preventDefault();
-      ownerPointerId = e.pointerId;
+    const owner = this._pressOwner(e);
+    if (!owner || this._anyHold()) return;
+    const hold = dir === "up" ? m.holdUp : m.holdDown;
+    if (this._samples(hold)) {
+      this._intentHold.start(
+        hold,
+        m.key,
+        owner.pointerId,
+        this._gestureIsLive(owner.element, owner.pointerId),
+      );
+      return;
     }
     if (this._config?.layout === "compact") {
       if (stopId) this._compactStopTargets.set(stopId, Symbol());
       else if (m.cover) this._compactStopTargets.set(m.cover, Symbol());
       this.requestUpdate();
     }
-    this._hold.start(m, dir, ownerPointerId, stopId);
+    this._hold.start(m, dir, owner.pointerId, stopId);
+  }
+
+  private _startTileHold(
+    e: PointerEvent | KeyboardEvent,
+    entityId: string,
+    hold: HoldControl,
+  ): void {
+    const owner = this._pressOwner(e);
+    if (!owner || this._anyHold()) return;
+    this._intentHold.start(
+      hold,
+      entityId,
+      owner.pointerId,
+      this._gestureIsLive(owner.element, owner.pointerId),
+    );
+  }
+
+  // A press and its release back to back. The sender floors it, so what reaches
+  // the bed is a press long enough to register.
+  private _tapWithoutPointer(
+    e: MouseEvent,
+    entityId: string,
+    hold: HoldControl,
+  ): void {
+    if (e.detail !== 0 || this._anyHold()) return;
+    // Started and ended in one turn, so no refresh ever asks whether it lives.
+    this._intentHold.start(hold, entityId, null, () => true);
+    this._intentHold.end(entityId);
+  }
+
+  private _endTilePointerHold(e: PointerEvent, entityId: string): void {
+    this._intentHold.endFromPointer(
+      entityId,
+      e.pointerId,
+      this._isPrimaryRelease(e),
+    );
+  }
+
+  private _endTileKeyHold(e: KeyboardEvent, entityId: string): void {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    this._intentHold.end(entityId);
   }
 
   // Screen readers, voice control and switch devices activate a native button
@@ -1472,7 +1694,12 @@ export class AdjustableBedCard extends LitElement {
     dir: "up" | "down",
     stopId?: string,
   ): void {
-    if (e.detail !== 0 || this._hold.heldKey !== null) return;
+    if (e.detail !== 0 || this._anyHold()) return;
+    const hold = dir === "up" ? m.holdUp : m.holdDown;
+    if (this._samples(hold)) {
+      this._tapWithoutPointer(e, m.key, hold);
+      return;
+    }
     if (this._config?.layout === "compact") {
       if (stopId) this._compactStopTargets.set(stopId, Symbol());
       else if (m.cover) this._compactStopTargets.set(m.cover, Symbol());
@@ -1486,34 +1713,54 @@ export class AdjustableBedCard extends LitElement {
     if (id) this._press(id);
   }
 
+  // A release goes to the strategy that owns the gesture, which is what leaves
+  // no pulse loop running on a motor whose press the sample strategy took.
   private _endPointerHold(e: PointerEvent, m: MotorEntity): void {
-    // pointercancel carries no meaningful button, so only pointerup can be a
-    // non-primary release.
-    this._hold.endFromPointer(
-      m,
-      e.pointerId,
-      e.type !== "pointerup" || e.button === 0,
-    );
+    if (this._sampleHolds(m.key)) {
+      this._intentHold.endFromPointer(
+        m.key,
+        e.pointerId,
+        this._isPrimaryRelease(e),
+      );
+      return;
+    }
+    this._hold.endFromPointer(m, e.pointerId, this._isPrimaryRelease(e));
   }
 
   private _endKeyHold(e: KeyboardEvent, m: MotorEntity): void {
     if (e.key !== "Enter" && e.key !== " ") return;
-    this._hold.end(m);
+    this._endHold(m);
   }
 
   private _endHold(m: MotorEntity): void {
+    if (this._sampleHolds(m.key)) {
+      this._intentHold.end(m.key);
+      return;
+    }
     this._hold.end(m);
   }
 
   private _motorStop(m: MotorEntity, stopId?: string): void {
     if (m.cover) {
-      this._hold.cancel(m);
+      if (this._sampleHolds(m.key)) this._intentHold.cancel(m.key);
+      else this._hold.cancel(m);
       this._cover(m.cover, "stop_cover");
       return;
     }
     // A button-backed row has no stop of its own and falls through to the stop
     // of the bed it belongs to, which halts whatever is moving on that bed. So
     // it has to invalidate any active hold, not just this row's.
+    this._stopAll(stopId);
+  }
+
+  // The bed-wide stop. At most one strategy holds, so dispatching to the holder
+  // invalidates the gesture in flight and stops the bed exactly once; with
+  // nothing held the stop still reaches the bed.
+  private _stopAll(stopId?: string): void {
+    if (this._sampleHolds(null)) {
+      this._intentHold.stopAll(stopId);
+      return;
+    }
     this._hold.stopAll(stopId);
   }
 
@@ -2163,6 +2410,14 @@ export class AdjustableBedCard extends LitElement {
       -webkit-user-select: none;
       user-select: none;
       touch-action: manipulation;
+    }
+    .tile.hold-tile {
+      /* A held tile has to survive a slightly unsteady finger, the reason
+         .cg-btn carries the same rule: pointer capture and preventDefault() do
+         not override the browser's touch gesture arbitration, so without this a
+         small vertical drag starts scrolling the page, fires pointercancel and
+         cuts the hold short. */
+      touch-action: none;
     }
     .tile:hover {
       background: var(--secondary-background-color);

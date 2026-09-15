@@ -17,6 +17,7 @@ from custom_components.adjustable_bed.beds.leggett_gen2 import LeggettGen2Comman
 from custom_components.adjustable_bed.beds.richmat import RichmatCommands
 from custom_components.adjustable_bed.button import (
     BUTTON_DESCRIPTIONS,
+    AdjustableBedButtonEntityDescription,
     _button_translation_key,
 )
 from custom_components.adjustable_bed.const import (
@@ -24,6 +25,7 @@ from custom_components.adjustable_bed.const import (
     BED_TYPE_KAIDI,
     BED_TYPE_KEESON,
     BED_TYPE_LEGGETT_GEN2,
+    BED_TYPE_LEGGETT_OKIN,
     BED_TYPE_MALOUF_LEGACY_OKIN,
     BED_TYPE_MALOUF_NEW_OKIN,
     BED_TYPE_MOTOSLEEP,
@@ -55,6 +57,43 @@ from custom_components.adjustable_bed.const import (
     OCTO_VARIANT_STANDARD,
     SLEEP_NUMBER_VARIANT_LEFT,
 )
+from custom_components.adjustable_bed.coordinator import AdjustableBedCoordinator
+from custom_components.adjustable_bed.hold_capability import HoldCapable
+from custom_components.adjustable_bed.hold_intent import Hold
+from custom_components.adjustable_bed.hold_roster import (
+    ActivateSupport,
+    Control,
+    ControlDeclaration,
+    ControlRoster,
+    HoldSupport,
+    PressFloor,
+)
+
+from .conftest import adopting_declarations
+
+
+class _HoldingController(HoldCapable):
+    """A hold-capable controller double that takes every push and does nothing."""
+
+    def control_declarations(self, inputs) -> tuple:
+        """Declare nothing: the roster under test is installed directly."""
+        del inputs
+        return ()
+
+    def link_up(self) -> None:
+        """Take the live link: nothing here owes its box a gesture."""
+
+    def hold(self, held) -> None:
+        """Take the pushed held set."""
+
+    def stop(self, controls) -> None:
+        """Take the per-control stop: nothing here presses anything."""
+
+    def link_lost(self) -> None:
+        """Take the link's death: nothing here runs on a link."""
+
+    def release_wire(self) -> None:
+        """End the wire lifecycle: nothing here has one."""
 
 
 def _configure_linak_advanced(client: MagicMock, *, actuator_mask: int = 0xC0) -> None:
@@ -3435,3 +3474,394 @@ class TestEntityAvailability:
         for state in cover_entities:
             current_state = hass.states.get(state.entity_id)
             assert current_state.state != STATE_UNAVAILABLE
+
+
+
+
+def _button_description(key: str) -> AdjustableBedButtonEntityDescription:
+    """Return the shipped description for one button key."""
+    return next(d for d in BUTTON_DESCRIPTIONS if d.key == key)
+
+
+class TestPresetControlNames:
+    """A button asks the roster for its own key, so the publication above and a
+    press refusal on the same button cannot disagree about the name."""
+
+    def test_a_preset_button_resolves_its_own_entity_key(self):
+        """The bed module aliases the control to the key; the button composes nothing."""
+        roster = ControlRoster(
+            (
+                _declare("preset-3", aliases={"preset_memory_3", "preset_anti_snore"}),
+                _declare("preset-flat", aliases={"preset_flat"}),
+            )
+        )
+
+        assert roster.find(_button_description("preset_memory_3").key) == Control("preset-3")
+        assert roster.find(_button_description("preset_anti_snore").key) == Control("preset-3")
+        assert roster.find(_button_description("preset_flat").key) == Control("preset-flat")
+
+    def test_a_save_button_resolves_no_control(self):
+        """Storing is staged bed-side and rides no sample, so no bed aliases its key."""
+        roster = ControlRoster((_declare("preset-1", aliases={"preset_memory_1"}),))
+
+        assert roster.find(_button_description("program_memory_1").key) is None
+
+
+def _declare(name: str, *, aliases: set[str] | None = None) -> ControlDeclaration:
+    """Return one hold-only declaration, as a bed module would."""
+    return ControlDeclaration(
+        control=Control(name),
+        press_floor=PressFloor(frames=1, ms=223),
+        hold=HoldSupport(ttl_max_ms=30000),
+        aliases=frozenset(aliases or ()),
+    )
+
+
+def _declare_with_cap(name: str, ttl_max_ms: int) -> ControlDeclaration:
+    """Return one hold-only declaration with a chosen lifetime cap."""
+    return ControlDeclaration(
+        control=Control(name),
+        press_floor=PressFloor(frames=1, ms=223),
+        hold=HoldSupport(ttl_max_ms=ttl_max_ms),
+    )
+
+
+def _declare_activate_only(
+    name: str, *, aliases: set[str] | None = None
+) -> ControlDeclaration:
+    """Return one Activate-only declaration, which no card gesture can hold."""
+    return ControlDeclaration(
+        control=Control(name),
+        press_floor=PressFloor(frames=1, ms=223),
+        activate=ActivateSupport(duration_ms=1000),
+        aliases=frozenset(aliases or ()),
+    )
+
+
+class TestPublishedHoldControls:
+    """The entities publish the controls they render, which is a card's only
+    channel for discovering that a bed takes hold intents."""
+
+    @staticmethod
+    def _with_memory_presets(hass: HomeAssistant, entry) -> None:
+        """Point the entry at a bed whose buttons include a memory slot.
+
+        The basic Linak profile declares no memory slots, so the default entry
+        renders no preset button for a published control to sit on.
+        """
+        hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_BED_TYPE: BED_TYPE_BEDTECH}
+        )
+
+    async def test_a_declared_bed_publishes_its_controls(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """A cover publishes both directions, a preset button its one control."""
+        self._with_memory_presets(hass, mock_config_entry)
+        declarations = (
+            _declare("motor-back-up"),
+            _declare("motor-back-down"),
+            _declare("preset-1", aliases={"preset_memory_1"}),
+        )
+        with adopting_declarations(*declarations):
+            await hass.config_entries.async_setup(mock_config_entry.entry_id)
+            await hass.async_block_till_done()
+
+        cover = hass.states.get("cover.test_bed_back")
+        assert cover.attributes["hold_control_up"] == "motor-back-up"
+        assert cover.attributes["hold_control_down"] == "motor-back-down"
+        assert cover.attributes["hold_ttl_max_ms"] == 30000
+
+        goto = hass.states.get("button.test_bed_memory_1")
+        assert goto.attributes["hold_control"] == "preset-1"
+        assert goto.attributes["hold_ttl_max_ms"] == 30000
+
+    async def test_an_undeclared_bed_publishes_nothing(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """Every bed without the hold primitive, which is what keeps its card
+        on the pulse path."""
+        self._with_memory_presets(hass, mock_config_entry)
+        await hass.config_entries.async_setup(mock_config_entry.entry_id)
+        await hass.async_block_till_done()
+
+        cover = hass.states.get("cover.test_bed_back")
+        assert "hold_control_up" not in cover.attributes
+        assert "hold_ttl_max_ms" not in cover.attributes
+
+        goto = hass.states.get("button.test_bed_memory_1")
+        assert "hold_control" not in goto.attributes
+
+    async def test_a_motor_the_roster_does_not_declare_publishes_nothing(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """A roster declaring one motor leaves the other on the pulse path."""
+        declarations = (_declare("motor-back-up"), _declare("motor-back-down"))
+        with adopting_declarations(*declarations):
+            await hass.config_entries.async_setup(mock_config_entry.entry_id)
+            await hass.async_block_till_done()
+
+        legs = hass.states.get("cover.test_bed_legs")
+        assert "hold_control_up" not in legs.attributes
+
+    async def test_a_save_button_publishes_no_control(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """operation-controls-command-path-only: storing is staged bed-side and
+        rides no sample, so its tile never becomes a hold tile."""
+        self._with_memory_presets(hass, mock_config_entry)
+        declarations = (_declare("preset-1", aliases={"preset_memory_1"}),)
+        with adopting_declarations(*declarations):
+            await hass.config_entries.async_setup(mock_config_entry.entry_id)
+            await hass.async_block_till_done()
+
+        save = hass.states.get("button.test_bed_save_to_memory_1")
+        assert "hold_control" not in save.attributes
+
+    async def test_a_covers_cap_is_the_lower_of_its_two_directions(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """One cap covers the pair, so it is the one both directions honour."""
+        declarations = (
+            _declare_with_cap("motor-back-up", 30000),
+            _declare_with_cap("motor-back-down", 12000),
+        )
+        with adopting_declarations(*declarations):
+            await hass.config_entries.async_setup(mock_config_entry.entry_id)
+            await hass.async_block_till_done()
+
+        cover = hass.states.get("cover.test_bed_back")
+        assert cover.attributes["hold_ttl_max_ms"] == 12000
+
+    async def test_an_activate_only_control_publishes_nothing(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """The attribute promises a control a card can hold, so a control the
+        bed declares without Hold keeps its tile on the command path."""
+        self._with_memory_presets(hass, mock_config_entry)
+        declarations = (
+            _declare_activate_only("motor-back-up"),
+            _declare_activate_only("motor-back-down"),
+            _declare_activate_only("preset-1", aliases={"preset_memory_1"}),
+        )
+        with adopting_declarations(*declarations):
+            await hass.config_entries.async_setup(mock_config_entry.entry_id)
+            await hass.async_block_till_done()
+
+        cover = hass.states.get("cover.test_bed_back")
+        assert "hold_control_up" not in cover.attributes
+        assert "hold_control_down" not in cover.attributes
+
+        goto = hass.states.get("button.test_bed_memory_1")
+        assert "hold_control" not in goto.attributes
+
+    async def test_one_activate_only_direction_withholds_the_pair(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """A cover renders one gesture per direction, so a direction the card
+        cannot hold takes the whole motor back to the pulse path."""
+        declarations = (
+            _declare("motor-back-up"),
+            _declare_activate_only("motor-back-down"),
+        )
+        with adopting_declarations(*declarations):
+            await hass.config_entries.async_setup(mock_config_entry.entry_id)
+            await hass.async_block_till_done()
+
+        cover = hass.states.get("cover.test_bed_back")
+        assert "hold_control_up" not in cover.attributes
+
+
+class TestHoldCapableEntities:
+    """What the cover and button platforms do on a bed whose roster declares Hold."""
+
+    @staticmethod
+    def _entry(hass: HomeAssistant) -> MockConfigEntry:
+        """Return an added CU170 entry, the effort's one hold-capable bed."""
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="Leggett Okin Bed",
+            data={
+                CONF_ADDRESS: "AA:BB:CC:DD:EE:07",
+                CONF_NAME: "Leggett Okin Bed",
+                CONF_BED_TYPE: BED_TYPE_LEGGETT_OKIN,
+                CONF_MOTOR_COUNT: 4,
+                CONF_HAS_MASSAGE: True,
+                CONF_DISABLE_ANGLE_SENSING: True,
+                CONF_PREFERRED_ADAPTER: "auto",
+            },
+            unique_id="AA:BB:CC:DD:EE:07",
+            entry_id="hold_capable_entities_entry",
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    async def _setup(self, hass: HomeAssistant) -> AdjustableBedCoordinator:
+        """Set up the entry and return its coordinator."""
+        entry = self._entry(hass)
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        return hass.data[DOMAIN][entry.entry_id]
+
+    async def test_a_preset_button_presses_rather_than_refusing(
+        self,
+        hass: HomeAssistant,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """presets-hold-only: button.press reaches the controller, which submits a press.
+
+        A preset holds rather than activates, and the controller turns this
+        press into a hold intent of the shortest press the bed registers, so an
+        automation that pressed the button before still recalls the slot. A
+        latch-mode box latches that press into the whole travel; travelling
+        only while the key is down is the card's gesture, not this button's.
+        """
+        coordinator = await self._setup(hass)
+
+        with patch.object(
+            coordinator, "async_execute_controller_command", new=AsyncMock()
+        ) as command:
+            await hass.services.async_call(
+                "button",
+                "press",
+                {"entity_id": "button.leggett_okin_bed_favorite_1"},
+                blocking=True,
+            )
+
+        command.assert_awaited_once()
+
+    async def test_an_operation_button_keeps_its_declared_cancel(
+        self,
+        hass: HomeAssistant,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """A second operation preempts the first rather than queueing behind it."""
+        coordinator = await self._setup(hass)
+
+        with patch.object(
+            coordinator, "async_execute_controller_command", new=AsyncMock()
+        ) as command:
+            await hass.services.async_call(
+                "button",
+                "press",
+                {"entity_id": "button.leggett_okin_bed_save_favorite_1"},
+                blocking=True,
+            )
+            await hass.services.async_call(
+                "button",
+                "press",
+                {"entity_id": "button.leggett_okin_bed_use_press_and_release_controls"},
+                blocking=True,
+            )
+
+        # The save button declares no cancel of its own; the mode gesture does.
+        assert [call.kwargs["cancel_running"] for call in command.await_args_list] == [
+            False,
+            True,
+        ]
+
+    async def test_a_tap_never_cancels_the_command_in_flight(
+        self,
+        hass: HomeAssistant,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """one-expression-door: a tap must not abort an operation the streamer stages."""
+        coordinator = await self._setup(hass)
+
+        with patch.object(
+            coordinator, "async_execute_controller_command", new=AsyncMock()
+        ) as command:
+            await hass.services.async_call(
+                "cover",
+                "open_cover",
+                {"entity_id": "cover.leggett_okin_bed_head"},
+                blocking=True,
+            )
+            await hass.services.async_call(
+                "button",
+                "press",
+                {"entity_id": "button.leggett_okin_bed_massage_toggle"},
+                blocking=True,
+            )
+
+        assert [call.kwargs["cancel_running"] for call in command.await_args_list] == [
+            False,
+            False,
+        ]
+
+    async def test_a_cover_renders_the_held_set(
+        self,
+        hass: HomeAssistant,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """entity-state-from-authority: the reconstructor publishes, the cover renders."""
+        coordinator = await self._setup(hass)
+        coordinator.hold_reconstructor.attach(_HoldingController())
+
+        coordinator.hold_reconstructor.submit(Control("motor-head-up"), Hold(5000))
+        await hass.async_block_till_done()
+
+        assert hass.states.get("cover.leggett_okin_bed_head").state == "opening"
+
+        coordinator.hold_reconstructor.stop_all()
+        await hass.async_block_till_done()
+
+        assert hass.states.get("cover.leggett_okin_bed_head").state != "opening"
+
+    async def test_a_cover_stop_fences_the_control_without_the_command_path(
+        self,
+        hass: HomeAssistant,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """end-is-not-stop: the fence lands with no lock and with the link down."""
+        coordinator = await self._setup(hass)
+        stopped: list[frozenset] = []
+        coordinator.hold_reconstructor.stop = lambda controls: stopped.append(
+            frozenset(controls)
+        )
+
+        with patch.object(
+            coordinator, "async_execute_controller_command", new=AsyncMock()
+        ) as command:
+            await hass.services.async_call(
+                "cover",
+                "stop_cover",
+                {"entity_id": "cover.leggett_okin_bed_head"},
+                blocking=True,
+            )
+
+        assert stopped == [frozenset({Control("motor-head-up"), Control("motor-head-down")})]
+        command.assert_not_awaited()

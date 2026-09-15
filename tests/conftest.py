@@ -58,10 +58,32 @@ from custom_components.adjustable_bed.const import (  # noqa: E402
     SVANE_HEAD_SERVICE_UUID,
     VIBRADORM_SERVICE_UUID,
 )
+from custom_components.adjustable_bed.coordinator import (  # noqa: E402
+    AdjustableBedCoordinator,
+)
+from custom_components.adjustable_bed.hold_roster import (  # noqa: E402
+    ControlDeclaration,
+    ControlRoster,
+)
 
 # Test constants
 TEST_ADDRESS = "AA:BB:CC:DD:EE:FF"
 TEST_NAME = "Test Bed"
+
+
+def adopting_declarations(*declarations: ControlDeclaration):
+    """Patch the roster a coordinator adopts when its controller is built.
+
+    Production reads the roster off the hold-capable controller the factory
+    built, so a test wanting a synthetic roster replaces that read rather than
+    the controller behind it.
+    """
+
+    def adopt(coordinator: AdjustableBedCoordinator) -> None:
+        coordinator._control_roster = ControlRoster(declarations)
+        coordinator.hold_reconstructor.use_roster(coordinator._control_roster)
+
+    return patch.object(AdjustableBedCoordinator, "adopt_control_roster", adopt)
 
 
 def make_controller_mock(**overrides: object) -> MagicMock:

@@ -199,7 +199,7 @@ from .detection import (
 from .diagnostic_payloads import new_connection_attempt_details
 from .hold_capability import HoldCapable
 from .hold_reconstructor import HoldReconstructor
-from .hold_roster import ControlRoster, load_control_declarations
+from .hold_roster import ControlDeclarationInputs, ControlRoster
 from .pairing import inheritable_child_fields, octo_snapshot_from_descriptor
 from .position_seek import (
     PositionFeedbackError,
@@ -577,9 +577,10 @@ class AdjustableBedCoordinator:
         self._last_seek_motion: dict[str, SeekMotion] = {}
 
         # The intent tier's durable pieces. The roster starts empty and
-        # async_build_hold_pieces replaces it once the bed module has been
-        # imported off the event loop; the reconstructor is built here so that
-        # no entry point - a stop above all - has to ask whether it exists yet.
+        # adopt_control_roster replaces it with the declarations of the first
+        # hold-capable controller this entry builds; the reconstructor is built
+        # here so that no entry point - a stop above all - has to ask whether it
+        # exists yet.
         self._control_roster = ControlRoster.empty()
         self._hold_reconstructor = HoldReconstructor(hass, self._control_roster, self)
         self._hold_connect_task: asyncio.Task[bool] | None = None
@@ -1976,15 +1977,37 @@ class AdjustableBedCoordinator:
         """Return hold-intent state for diagnostics."""
         return self._hold_reconstructor.diagnostics
 
-    async def async_build_hold_pieces(self) -> None:
-        """Build the control roster and hand it to the reconstructor.
+    @callback
+    def adopt_control_roster(self) -> None:
+        """Take the roster from the controller this link just built.
 
-        Asynchronous because resolving a bed module imports it, which runs off
-        the event loop. Entry setup calls this before the first connect, and the
-        connect calls it again when a protocol correction changes the bed type.
+        Only a controller knows which controls its bed has: the app profile it
+        was built with and the bed type a connect-time correction settled are
+        both its own, and neither is readable from the entry. A controller that
+        is not hold-capable declares nothing, so the bed keeps upstream's pulse
+        path on every door.
+
+        The roster outlives the controller that declared it, because the sample
+        door decides hold-capability from the roster and an idle bed has no
+        controller to ask. Until a first connect resolves one, the bed answers
+        as any other non-hold bed does.
         """
-        self._control_roster = ControlRoster(await load_control_declarations(self))
+        controller = self._controller
+        declarations = (
+            controller.control_declarations(self._declaration_inputs())
+            if isinstance(controller, HoldCapable)
+            else ()
+        )
+        self._control_roster = ControlRoster(declarations)
         self._hold_reconstructor.use_roster(self._control_roster)
+
+    def _declaration_inputs(self) -> ControlDeclarationInputs:
+        """Return what a controller reads from this entry to declare its controls."""
+        return ControlDeclarationInputs(
+            motor_pulse_count=self._motor_pulse_count,
+            motor_pulse_delay_ms=self._motor_pulse_delay_ms,
+            has_massage=self._has_massage,
+        )
 
     @callback
     def connect_on_demand(self) -> None:
@@ -3282,11 +3305,6 @@ class AdjustableBedCoordinator:
                     self._client.services,
                 )
                 bed_type_corrected = self._apply_runtime_bed_type_correction(corrected_bed_type)
-                if self._bed_type != previous_bed_type:
-                    # The declarations are the bed module's, so a corrected bed
-                    # type is a different roster, and the controller built below
-                    # is the first thing that can express against it.
-                    await self.async_build_hold_pieces()
                 if (
                     bed_type_corrected
                     and not bed_requires_pairing
@@ -3403,6 +3421,10 @@ class AdjustableBedCoordinator:
                     manufacturer_data=manufacturer_data,
                     capability_snapshot=stored_capability_snapshot,
                 )
+                # The declarations are this controller's, so the roster follows
+                # the controller the factory actually built - whatever the entry
+                # asked for, and whatever a connect-time correction changed.
+                self.adopt_control_roster()
                 discovery_result = cast(Any, self._controller).async_discover_capabilities()
                 if inspect.isawaitable(discovery_result):
                     await discovery_result
@@ -4480,6 +4502,11 @@ class AdjustableBedCoordinator:
             try:
                 # Stop keep-alive and notifications before disconnecting
                 if self._controller is not None:
+                    # release-before-disconnect: the release precedes every
+                    # disconnect we order, and goes ahead of stop_notify so the
+                    # bed sees the button up while the link is still whole.
+                    if isinstance(self._controller, HoldCapable):
+                        self._controller.release_wire()
                     # Stop Octo keep-alive if running
                     if hasattr(self._controller, "stop_keepalive"):
                         try:

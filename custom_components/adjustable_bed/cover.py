@@ -23,7 +23,8 @@ from .const import (
     DOMAIN,
 )
 from .entity import AdjustableBedEntity
-from .entity_runtime import EntityRuntime
+from .entity_runtime import EntityRuntime, entity_control_roster, entity_hold_reconstructor
+from .hold_roster import ActionKind, MotorControls
 from .logicdata_app_protocol import LAYOUTS, layout_axes
 from .paired_coordinator import entity_runtimes
 
@@ -297,6 +298,11 @@ class AdjustableBedCover(AdjustableBedEntity, CoverEntity):
     _attr_supported_features = (
         CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE | CoverEntityFeature.STOP
     )
+    # Constants for the life of the config entry, so the recorder would store
+    # the same three values on every state change forever.
+    _unrecorded_attributes = frozenset(
+        {"hold_control_up", "hold_control_down", "hold_ttl_max_ms"}
+    )
 
     def __init__(
         self,
@@ -311,6 +317,35 @@ class AdjustableBedCover(AdjustableBedEntity, CoverEntity):
         self._is_moving = False
         self._move_direction: str | None = None
         self._movement_generation: int = 0  # Track active movement to handle cancellation
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to the held set.
+
+        Unconditionally on a runtime carrying a reconstructor, because the
+        roster arrives with the bed's first hold-capable controller and an
+        entity added before that connect would otherwise never subscribe. On a
+        bed that declares nothing the held set never changes, so the
+        subscription costs no writes.
+        """
+        await super().async_added_to_hass()
+        reconstructor = entity_hold_reconstructor(self._coordinator)
+        if reconstructor is not None:
+            self.async_on_remove(reconstructor.async_add_listener(self._held_set_changed))
+
+    def _held_set_changed(self) -> None:
+        """Re-render from the held set the reconstructor just published."""
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    @property
+    def _hold_controls(self) -> MotorControls | None:
+        """Return this cover's two direction controls, or None off a hold bed.
+
+        The roster is the authority, so an idle bed answers the same as a
+        connected one and a cover the bed declares no motor for keeps the
+        per-entity moving flag.
+        """
+        return entity_control_roster(self._coordinator).motor(self.entity_description.key)
 
     @property
     def _position_key(self) -> str:
@@ -336,14 +371,49 @@ class AdjustableBedCover(AdjustableBedEntity, CoverEntity):
         return None
 
     @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return the controls this cover renders, on a bed that declares them.
+
+        A card discovers the integration's hold primitive here: the roster is
+        the single author of a control name, so a client reads one rather than
+        composing it. Absent on every bed whose module declares no control, and
+        on any direction the bed declares without Hold.
+        """
+        roster = entity_control_roster(self._coordinator)
+        motor = self._hold_controls
+        # Hold support, not mere existence: the attribute names promise controls
+        # a client can hold, and every gesture on an Activate-only direction
+        # would die at the handler instead.
+        if motor is None or not all(
+            roster.supports(control, ActionKind.HOLD) for control in motor.both
+        ):
+            return None
+        return {
+            "hold_control_up": motor.up.name,
+            "hold_control_down": motor.down.name,
+            # One cap covers the pair on the wire, so it is the lower of the
+            # two: a client holding to the higher one would outlive whichever
+            # direction declared the lower and have its intent clamped.
+            "hold_ttl_max_ms": min(
+                roster.ttl_max_ms(motor.up), roster.ttl_max_ms(motor.down)
+            ),
+        }
+
+    @property
     def is_opening(self) -> bool:
         """Return if the cover is opening."""
-        return self._is_moving and self._move_direction == "open"
+        motor = self._hold_controls
+        if motor is None:
+            return self._is_moving and self._move_direction == "open"
+        return motor.up in self._coordinator.hold_reconstructor.held
 
     @property
     def is_closing(self) -> bool:
         """Return if the cover is closing."""
-        return self._is_moving and self._move_direction == "close"
+        motor = self._hold_controls
+        if motor is None:
+            return self._is_moving and self._move_direction == "close"
+        return motor.down in self._coordinator.hold_reconstructor.held
 
     @property
     def current_cover_position(self) -> int | None:
@@ -400,14 +470,19 @@ class AdjustableBedCover(AdjustableBedEntity, CoverEntity):
                 direction,
                 self.entity_description.key,
             )
+            # A hold-capable bed expresses this as an intent, so the press must
+            # not cancel a staged operation the streamer is withholding it from.
+            cancel_running = self._hold_controls is None
             if direction == "open":
                 await self._coordinator.async_execute_controller_command(
                     self.entity_description.open_fn,
+                    cancel_running=cancel_running,
                     resource=self._motor_resource,
                 )
             else:
                 await self._coordinator.async_execute_controller_command(
                     self.entity_description.close_fn,
+                    cancel_running=cancel_running,
                     resource=self._motor_resource,
                 )
             _LOGGER.debug(
@@ -435,6 +510,13 @@ class AdjustableBedCover(AdjustableBedEntity, CoverEntity):
             self.entity_description.key,
             self._coordinator.name,
         )
+
+        motor = self._hold_controls
+        if motor is not None:
+            # The fence goes up with no lock and with the link down, which is
+            # what a stop has to do; the command path would give it neither.
+            self._coordinator.hold_reconstructor.stop(motor.both)
+            return
 
         # Capture generation at stop start to avoid clearing state from a newer movement
         # that started after this stop was called (rapid stop→move sequence)

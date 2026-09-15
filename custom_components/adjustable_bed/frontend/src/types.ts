@@ -1,5 +1,10 @@
 // Minimal Home Assistant frontend typings used by the card. We avoid pulling in
 // custom-card-helpers so the bundle stays small and dependency-light.
+import type { HoldControl } from "./intents";
+
+// The sender defines the pair, because it is the sender's input; every module
+// that names a published control reads it from here.
+export type { HoldControl };
 
 export interface HassEntityAttributes {
   friendly_name?: string;
@@ -115,12 +120,23 @@ export interface MotorEntity {
   down?: string;
   angle?: string; // sensor.* angle in degrees
   position?: string; // number.* position
+  holdUp?: HoldControl;
+  holdDown?: HoldControl;
+}
+
+// One preset button, in preferred display order.
+export interface PresetEntity {
+  id: string;
+  hold?: HoldControl;
 }
 
 export interface MemorySlot {
   slot: number;
   goto?: string; // button.* preset_memory_N
   save?: string; // button.* program_memory_N
+  // The goto button's control. A save button publishes none: storing is a
+  // staged operation and reaches the bed through the command path alone.
+  gotoHold?: HoldControl;
 }
 
 export interface LightEntities {
@@ -137,7 +153,7 @@ export interface BedEntities {
   motors: MotorEntity[];
   synchro?: string; // switch.* synchro_mode (link split-bed sides)
   firmness: string[]; // number.* sleep_number_setting[_left|_right]
-  presets: string[]; // button.* in preferred display order
+  presets: PresetEntity[];
   stop?: string; // button.* stop
   memory: MemorySlot[];
   connect?: string;

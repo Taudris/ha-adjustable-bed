@@ -320,9 +320,14 @@ Everything is configurable from the card's **visual editor** (no YAML needed):
   use instead of showing all of them.
 
 **Recalling and saving positions.** In the Memory section, tap a position to
-move the bed to it. To store the bed's *current* position, tap **Save…** in the
-Memory header, then tap the position you want to overwrite (tap **Cancel** to
-back out). The Save button only appears for beds that support saving.
+move the bed to it. On a bed that holds a position key rather than pulsing it,
+the tile behaves like the motor buttons instead: the bed travels while you hold
+the tile down, and a tap is a short hold. Either way,
+`adjustable_bed.goto_preset` is the automation's door to a position — it takes a
+memory slot number, or the name of a fixed position (`flat` or `dummy`) on a bed
+that has one. To store the bed's *current* position, tap **Save…** in the Memory
+header, then tap the position you want to overwrite (tap **Cancel** to back
+out). The Save button only appears for beds that support saving.
 
 **Names and icons follow your entities.** The card displays each control using
 its entity's own name and icon, so to relabel something you just rename the

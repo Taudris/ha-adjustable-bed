@@ -10,13 +10,13 @@ from typing import TYPE_CHECKING, Any, Protocol
 from homeassistant.helpers.device_registry import ChildDeviceInfo, DeviceInfo
 
 from .beds.base import BedController, SideBoundController
+from .hold_roster import ControlRoster
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
 
     from .coordinator import ChildEntryView
     from .hold_reconstructor import HoldReconstructor
-    from .hold_roster import ControlRoster
 
 type ControllerCommand = Callable[[BedController], Coroutine[object, object, None]]
 
@@ -138,6 +138,25 @@ class EntityRuntime(Protocol):
     ) -> None: ...
 
     async def async_stop_command(self) -> None: ...
+
+
+# The roster and the reconstructor are the one optional part of the runtime, and
+# they arrive together: a runtime carries both or neither, and one carrying
+# neither is a bed that holds nothing rather than a broken one. Entities read
+# them through these two, so the absence is answered once rather than at every
+# call site, and a caller holding a control off the roster has a reconstructor
+# to hand it to.
+
+
+def entity_control_roster(runtime: EntityRuntime) -> ControlRoster:
+    """Return the runtime's control roster, empty where it carries none."""
+    roster = getattr(runtime, "control_roster", None)
+    return ControlRoster.empty() if roster is None else roster
+
+
+def entity_hold_reconstructor(runtime: EntityRuntime) -> HoldReconstructor | None:
+    """Return the runtime's hold reconstructor, or None where it carries none."""
+    return getattr(runtime, "hold_reconstructor", None)
 
 
 class EntityRuntimeView(ABC):

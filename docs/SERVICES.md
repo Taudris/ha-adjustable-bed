@@ -43,10 +43,18 @@ two-address pair. See [support capture](GETTING_HELP.md#generating-a-support-bun
 | `set_position` | `motor`, `position` | Move one supported axis to a target |
 | `set_positions` | `positions` | Validate all motor targets before starting an ordered multi-motor request |
 | `timed_move` | `motor`, `direction`, `duration_ms` | Move up/down for an elapsed movement ceiling of 100–30000 ms |
+| `send_intents` | `sender_id`, `seq`, `samples` | Send one bed the complete set of controls a client is holding; beds that declare no hold control refuse the call |
 
 The maximum memory slot depends on the bed; accepting numbers up to 6 does not
-create extra hardware memory. Named presets such as Flat or Zero G are exposed
-as buttons where supported. `save_preset` changes memory stored on the bed.
+create extra hardware memory. `goto_preset` also takes the name of a preset the
+bed declares, such as `flat`, and a bed that holds a preset key rather than
+pulsing it takes `duration_ms` as well. Named presets such as Flat or Zero G are
+exposed as buttons where supported. `save_preset` changes memory stored on the
+bed.
+
+`send_intents` is the door a card or an automation holds a control through: each
+message replaces that sender's previous set, so a held control ends by sending it
+with a `ttl_ms` of 0, and an unrefreshed hold ends at its own ttl.
 
 Position targets use the controller's units, which may be degrees or percentages.
 Check the position entity and [protocol guide](SUPPORTED_ACTUATORS.md). Feedback

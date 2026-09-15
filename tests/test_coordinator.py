@@ -84,13 +84,14 @@ from custom_components.adjustable_bed.coordinator import (
     AdjustableBedCoordinator,
 )
 from custom_components.adjustable_bed.hold_capability import HoldCapable
-from custom_components.adjustable_bed.hold_intent import HoldOutcome
+from custom_components.adjustable_bed.hold_intent import Hold, HoldOutcome
 from custom_components.adjustable_bed.hold_reconstructor import HoldReconstructor
 from custom_components.adjustable_bed.hold_roster import (
-    ActionKind,
     Control,
     ControlDeclaration,
     ControlRoster,
+    HoldSupport,
+    PressFloor,
 )
 from custom_components.adjustable_bed.position_seek import PositionFeedbackError
 
@@ -7018,29 +7019,46 @@ class TestUnverifiedBondMarkerScope:
 
 
 _HOLD_CONTROL = Control("motor-head-up")
-_LOAD_DECLARATIONS = "custom_components.adjustable_bed.coordinator.load_control_declarations"
 
 
 def _hold_declaration() -> ControlDeclaration:
     """Return the one declaration the coordinator's hold wiring is exercised with."""
     return ControlDeclaration(
         control=_HOLD_CONTROL,
-        actions=frozenset({ActionKind.HOLD}),
-        ttl_max_ms=30000,
-        activate_duration_ms=None,
-        press_min_frames=1,
-        press_min_ms=223,
+        press_floor=PressFloor(frames=1, ms=223),
+        hold=HoldSupport(ttl_max_ms=30000),
     )
 
 
 class _HoldingController(HoldCapable):
-    """A hold-capable controller double recording every pushed set."""
+    """A hold-capable controller double recording every pushed set and release."""
 
     def __init__(self) -> None:
         self.pushes: list[dict[Control, float]] = []
+        self.calls: list[str] = []
+
+    def control_declarations(self, inputs: Any) -> tuple[ControlDeclaration, ...]:
+        del inputs  # One declaration is all the coordinator's wiring needs.
+        return (_hold_declaration(),)
+
+    def link_up(self) -> None:
+        self.calls.append("link_up")
 
     def hold(self, held: Any) -> None:
         self.pushes.append(dict(held))
+
+    def stop(self, controls: Any) -> None:
+        self.calls.append("stop")
+
+    def link_lost(self) -> None:
+        self.calls.append("link_lost")
+
+    def release_wire(self) -> None:
+        self.calls.append("release_wire")
+
+    async def stop_notify(self) -> None:
+        """Stand in for the controller teardown the disconnect path runs."""
+        self.calls.append("stop_notify")
 
 
 def _disconnect_after_command_entry(hass: HomeAssistant, entry_id: str) -> MockConfigEntry:
@@ -7073,62 +7091,69 @@ class TestHoldPieces:
     predicates counting a held set.
     """
 
-    async def test_building_the_pieces_hands_the_roster_to_the_reconstructor(
+    async def test_adopting_a_controllers_roster_hands_it_to_the_reconstructor(
         self,
         hass: HomeAssistant,
         mock_config_entry,
     ):
-        """The roster is built asynchronously and the reconstructor adopts it."""
+        """roster-build-site: the roster is the controller's, and the reconstructor adopts it."""
         coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
         assert coordinator.control_roster.controls == ()
 
-        with patch(_LOAD_DECLARATIONS, AsyncMock(return_value=(_hold_declaration(),))):
-            await coordinator.async_build_hold_pieces()
+        coordinator._controller = _HoldingController()
+        coordinator.adopt_control_roster()
 
         assert coordinator.control_roster.find("motor-head-up") == _HOLD_CONTROL
         assert coordinator.hold_reconstructor._roster is coordinator.control_roster
 
-    async def test_a_bed_type_correction_rebuilds_the_roster(
+    async def test_a_connect_takes_the_roster_of_the_controller_it_built(
         self,
         hass: HomeAssistant,
         mock_config_entry,
         mock_coordinator_connected,
         mock_bleak_client: MagicMock,
     ):
-        """roster-build-site: the connect awaits the corrected type's roster."""
+        """roster-build-site: whatever the entry said, the built controller declares.
+
+        A Linak entry builds a controller that is not hold-capable, so the
+        roster stays empty however the entry is configured.
+        """
         del mock_bleak_client
         coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
 
-        with (
-            patch(
-                "custom_components.adjustable_bed.coordinator."
-                "refine_okin_dot_protocol_from_gatt",
-                return_value=BED_TYPE_OKIN_CST,
-            ),
-            patch(_LOAD_DECLARATIONS, AsyncMock(return_value=(_hold_declaration(),))),
-        ):
-            await coordinator.async_connect()
-
-        assert coordinator._bed_type == BED_TYPE_OKIN_CST
-        assert coordinator.control_roster.find("motor-head-up") == _HOLD_CONTROL
-
-    async def test_an_unchanged_bed_type_rebuilds_nothing(
-        self,
-        hass: HomeAssistant,
-        mock_config_entry,
-        mock_coordinator_connected,
-        mock_bleak_client: MagicMock,
-    ):
-        """The roster follows the bed type, so an unchanged type rebuilds nothing."""
-        del mock_bleak_client
-        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
-        load = AsyncMock(return_value=(_hold_declaration(),))
-
-        with patch(_LOAD_DECLARATIONS, load):
-            await coordinator.async_connect()
+        await coordinator.async_connect()
 
         assert coordinator._bed_type == BED_TYPE_LINAK
-        load.assert_not_awaited()
+        assert coordinator.control_roster.controls == ()
+
+    async def test_adopting_a_roster_replaces_it_and_not_the_reconstructor(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry,
+        mock_coordinator_connected,
+    ):
+        """roster-build-site: a subscriber taken at setup survives a reconnect.
+
+        The cover subscribes to the reconstructor once, in async_added_to_hass,
+        so an adoption that replaced the instance would leave every cover on the
+        bed listening to a dead object.
+        """
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        reconstructor = coordinator.hold_reconstructor
+        published: list[int] = []
+        coordinator.hold_reconstructor.async_add_listener(
+            lambda: published.append(len(published))
+        )
+
+        coordinator._controller = _HoldingController()
+        coordinator.adopt_control_roster()
+
+        assert coordinator.hold_reconstructor is reconstructor
+        assert coordinator.control_roster.find("motor-head-up") == _HOLD_CONTROL
+
+        reconstructor.submit(_HOLD_CONTROL, Hold(5000))
+
+        assert len(published) > 1
 
     async def test_the_stop_path_ends_holds_ahead_of_the_counter_and_the_lock(
         self,
@@ -7189,7 +7214,7 @@ class TestHoldPieces:
         coordinator._controller = controller
         coordinator._notify_connection_state_change(True)
 
-        submission = coordinator.hold_reconstructor.submit(_HOLD_CONTROL, 5000)
+        submission = coordinator.hold_reconstructor.submit(_HOLD_CONTROL, Hold(5000))
         assert set(controller.pushes[-1]) == {_HOLD_CONTROL}
 
         coordinator._notify_connection_state_change(False)
@@ -7214,8 +7239,8 @@ class TestHoldPieces:
         with patch.object(
             coordinator, "async_ensure_connected", new=AsyncMock(side_effect=_connect)
         ) as connect:
-            coordinator.hold_reconstructor.submit(_HOLD_CONTROL, 5000)
-            coordinator.hold_reconstructor.submit(_HOLD_CONTROL, 5000)
+            coordinator.hold_reconstructor.submit(_HOLD_CONTROL, Hold(5000))
+            coordinator.hold_reconstructor.submit(_HOLD_CONTROL, Hold(5000))
             link_up.set()
             assert coordinator._hold_connect_task is not None
             await coordinator._hold_connect_task
@@ -7261,7 +7286,7 @@ class TestHoldPieces:
         await coordinator.async_connect()
         coordinator.hold_reconstructor.use_roster(ControlRoster((_hold_declaration(),)))
         coordinator.hold_reconstructor.attach(_HoldingController())
-        coordinator.hold_reconstructor.submit(_HOLD_CONTROL, 5000)
+        coordinator.hold_reconstructor.submit(_HOLD_CONTROL, Hold(5000))
         coordinator._cancel_disconnect_timer()
 
         coordinator.hold_reconstructor.stop_all()
@@ -7282,7 +7307,7 @@ class TestHoldPieces:
         coordinator.async_disconnect = AsyncMock()
         coordinator.hold_reconstructor.use_roster(ControlRoster((_hold_declaration(),)))
         coordinator.hold_reconstructor.attach(_HoldingController())
-        coordinator.hold_reconstructor.submit(_HOLD_CONTROL, 5000)
+        coordinator.hold_reconstructor.submit(_HOLD_CONTROL, Hold(5000))
 
         async def _noop_command(controller) -> None:
             del controller
@@ -7330,6 +7355,72 @@ class TestHoldPieces:
 
         coordinator.async_disconnect.assert_not_awaited()
         assert coordinator._disconnect_timer is not None
+
+    async def test_an_ordered_disconnect_releases_before_it_stops_notifying(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry,
+        mock_coordinator_connected,
+        mock_bleak_client: MagicMock,
+    ):
+        """release-before-disconnect: the release precedes every exit we order."""
+        del mock_bleak_client
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        await coordinator.async_connect()
+        controller = _HoldingController()
+        coordinator._controller = controller
+
+        async with coordinator._lock:
+            await coordinator._async_disconnect_locked()
+
+        assert controller.calls == ["release_wire", "stop_notify"]
+
+    async def test_an_unsolicited_drop_writes_no_release(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry,
+        mock_coordinator_connected,
+        mock_bleak_client: MagicMock,
+    ):
+        """release-before-disconnect: an unsolicited drop is the watchdog's."""
+        del mock_bleak_client
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        await coordinator.async_connect()
+        controller = _HoldingController()
+        coordinator._controller = controller
+        coordinator._notify_connection_state_change(True)
+        controller.calls.clear()
+
+        coordinator._on_disconnect(coordinator._client)
+
+        assert "release_wire" not in controller.calls
+
+    async def test_an_unsolicited_drop_tells_the_controller_its_link_is_gone(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry,
+        mock_coordinator_connected,
+        mock_bleak_client: MagicMock,
+    ):
+        """link-lost-teardown, release-before-disconnect: the coordinator's own edge.
+
+        The whole path, not its halves: the drop callback fans the disconnected
+        state, the reconstructor detaches, and the controller it still holds
+        hears link_lost once. A second report of the same state finds nothing
+        attached and tells it no second time.
+        """
+        del mock_bleak_client
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        await coordinator.async_connect()
+        controller = _HoldingController()
+        coordinator._controller = controller
+        coordinator._notify_connection_state_change(True)
+        controller.calls.clear()
+
+        coordinator._on_disconnect(coordinator._client)
+        coordinator._notify_connection_state_change(False)
+
+        assert controller.calls == ["link_lost"]
 
     async def test_shutdown_quiesces_before_the_disconnect(
         self,

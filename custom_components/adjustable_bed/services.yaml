@@ -107,14 +107,11 @@ goto_preset:
         device:
           integration: adjustable_bed
     preset:
-      name: Preset Number
-      description: Memory slot number (1-6, device-dependent).
+      name: Preset
+      description: A memory slot number (1-6, device-dependent), or the name of a fixed position, such as flat. A bed accepts a name only when it declares that preset; every other bed takes slot numbers.
       required: true
       selector:
-        number:
-          min: 1
-          max: 6
-          mode: box
+        text:
     side:
       name: Side
       description: Which side of a paired bed to target. Leave unset to target the whole bed (or the specific side when you target one side's device); single beds always control the whole bed.
@@ -130,7 +127,7 @@ goto_preset:
               label: Right
     duration_ms:
       name: Duration (ms)
-      description: How long to hold the preset key, in milliseconds. Beds that hold a preset key rather than pulsing it use this; every other bed accepts and ignores it. Leave it out for the shortest press the bed registers, which is what a bed in latch mode needs.
+      description: How long to hold the preset key, in milliseconds. Only beds that hold a preset key rather than pulsing it accept this; every other bed refuses the call. Leave it out for the shortest press the bed registers, which is what a bed in latch mode needs.
       required: false
       selector:
         number:
@@ -1118,15 +1115,16 @@ sleep_number_command:
 
 send_intents:
   name: Send Intents
-  description: Send a client's complete set of active hold intents to a bed that supports them. Each message replaces the sender's previous set, so a held control is released by sending it with a ttl of 0. Beds that do not declare a hold control reject the call.
+  description: Send a client's complete set of active hold intents to one bed that supports them. Each message replaces the sender's previous set, so a held control is released by sending it with a ttl of 0. Beds that do not declare a hold control reject the call.
   fields:
     device_id:
       name: Device
-      description: The adjustable bed device.
+      description: The one adjustable bed device this set of intents is for. A set names a single bed, and it applies whole or not at all.
       required: true
       selector:
         device:
           integration: adjustable_bed
+          multiple: false
     sender_id:
       name: Sender ID
       description: Identifies the client sending the set. Mint one per client and keep it for that client's lifetime.
@@ -1143,8 +1141,8 @@ send_intents:
           mode: box
     samples:
       name: Samples
-      description: "The complete active set, one entry per intent: `intent_id` (the client's own id for this press), `control` (a control the bed declares, for example `motor-head-up`), `action` (`hold` or `activate`), and `ttl_ms` for a hold. A hold with `ttl_ms` 0 releases it."
+      description: "The complete active set, one entry per intent: `intent_id` (the client's own id for this press), `control` (a control the bed declares, for example `motor-head-up`), and `action`, which is either `{kind: hold, ttl_ms: 800}` or `{kind: activate}`. A hold whose `ttl_ms` is 0 releases it."
       required: true
-      example: "[{\"intent_id\": \"c0ffee\", \"control\": \"motor-head-up\", \"action\": \"hold\", \"ttl_ms\": 800}]"
+      example: "[{\"intent_id\": \"c0ffee\", \"control\": \"motor-head-up\", \"action\": {\"kind\": \"hold\", \"ttl_ms\": 800}}, {\"intent_id\": \"decaf\", \"control\": \"light-toggle\", \"action\": {\"kind\": \"activate\"}}]"
       selector:
         object:
