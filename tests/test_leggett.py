@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
-from bleak.exc import BleakError
 from homeassistant.const import CONF_ADDRESS, CONF_NAME
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -17,10 +16,13 @@ from custom_components.adjustable_bed.beds.leggett_gen2 import (
     LeggettGen2Controller,
 )
 from custom_components.adjustable_bed.beds.leggett_okin import (
-    LeggettOkinCommands,
     LeggettOkinController,
+    okin_dummy_program,
+    okin_mode_program,
+    okin_store_program,
     parse_leggett_okin_feedback,
 )
+from custom_components.adjustable_bed.beds.leggett_okin_hold import LeggettOkinCommands
 from custom_components.adjustable_bed.button import BUTTON_DESCRIPTIONS, _should_add_button
 from custom_components.adjustable_bed.const import (
     BED_TYPE_LEGGETT_GEN2,
@@ -36,7 +38,6 @@ from custom_components.adjustable_bed.const import (
     LEGGETT_GEN2_WRITE_CHAR_UUID,
     LEGGETT_OKIN_CHAR_UUID,
     LEGGETT_OKIN_NOTIFY_CHAR_UUID,
-    LEGGETT_OKIN_PULSE_DEFAULTS,
     LEGGETT_OKIN_REVISION_SELECTOR_CHAR_UUID,
     LEGGETT_OKIN_SERVICE_UUID,
     LEGGETT_VARIANT_GEN2,
@@ -50,6 +51,80 @@ from custom_components.adjustable_bed.const import (
     requires_pairing_after_service_discovery,
 )
 from custom_components.adjustable_bed.coordinator import AdjustableBedCoordinator
+from custom_components.adjustable_bed.hold_capability import HoldCapable
+from custom_components.adjustable_bed.hold_intent import Activate, Hold, IntentAction
+from custom_components.adjustable_bed.hold_operation import OperationOutcome, OperationProgram
+from custom_components.adjustable_bed.hold_roster import (
+    Control,
+    ControlDeclarationInputs,
+    ControlRoster,
+)
+
+
+class _FakeStreamer:
+    """Records what the controller asks the streamer to do, in order."""
+
+    def __init__(self, *, outcome: OperationOutcome = OperationOutcome.COMPLETED) -> None:
+        self.calls: list[str] = []
+        self.operations: list[OperationProgram] = []
+        self.pushes: list[dict] = []
+        self.stops: list[frozenset] = []
+        self._outcome = outcome
+
+    def hold(self, held) -> None:
+        self.calls.append("hold")
+        self.pushes.append(dict(held))
+
+    def stop(self, controls) -> None:
+        self.calls.append("stop")
+        self.stops.append(frozenset(controls))
+
+    def release_wire(self) -> None:
+        self.calls.append("release_wire")
+
+    def link_lost(self) -> None:
+        self.calls.append("link_lost")
+
+    def stage(self, program) -> asyncio.Future:
+        self.calls.append("stage")
+        self.operations.append(program)
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        future.set_result(self._outcome)
+        return future
+
+    async def run_operation(self, program) -> OperationOutcome:
+        self.calls.append("run_operation")
+        self.operations.append(program)
+        return self._outcome
+
+
+def _hold_coordinator(
+    *, has_massage: bool = True, app_profile: str = "prodigy4"
+) -> MagicMock:
+    """Return a coordinator double carrying the roster this profile declares.
+
+    The roster is read off a controller on the same profile, the way production
+    reads it: the coordinator adopts what the controller it built says its bed
+    has, so a test never spells the profile's control set a second time.
+
+    The reconstructor is a mock, so an expression-door test reads the intent the
+    controller submitted rather than the frames a streamer would compose.
+    """
+    coordinator = MagicMock()
+    coordinator.motor_pulse_count = 10
+    coordinator.motor_pulse_delay_ms = 100
+    declaring = LeggettOkinController(MagicMock(), app_profile=app_profile)
+    coordinator.control_roster = ControlRoster(
+        declaring.control_declarations(
+            ControlDeclarationInputs(
+                motor_pulse_count=10,
+                motor_pulse_delay_ms=100,
+                has_massage=has_massage,
+            )
+        )
+    )
+    coordinator.hold_reconstructor = MagicMock()
+    return coordinator
 
 
 @pytest.fixture
@@ -198,8 +273,7 @@ class TestLeggettOkinController:
 
     async def test_favorites_match_the_prodigy_ce_model(self):
         """Only Favorite 1/2/3 are editable; the third wire slot is fixed Snore."""
-        controller = self._controller_with_characteristics()
-        controller.write_command = AsyncMock()
+        controller = LeggettOkinController(_hold_coordinator())
 
         assert controller.supports_preset_zero_g is False
         assert controller.memory_slot_names == (
@@ -215,34 +289,26 @@ class TestLeggettOkinController:
             True,
         ]
 
-        await controller.program_memory(3)
-
-        controller.write_command.assert_not_awaited()
-
         descriptions = {description.key: description for description in BUTTON_DESCRIPTIONS}
         assert not _should_add_button(descriptions["preset_zero_g"], controller, True)
         assert not _should_add_button(descriptions["program_memory_3"], controller, True)
         assert not _should_add_button(descriptions["control_mode_press_and_hold"], controller, True)
         assert _should_add_button(descriptions["control_mode_press_and_release"], controller, True)
 
-    async def test_massage_wave_mode_is_advertised_and_sends_release(self):
+    async def test_massage_wave_mode_is_advertised(self):
         """Expose the proven wave keycode through the shared mode-step entity."""
-        controller = self._controller_with_characteristics()
-        controller.write_command = AsyncMock()
+        controller = LeggettOkinController(_hold_coordinator())
 
         assert controller.supports_massage_mode_step_control is True
 
-        await controller.massage_mode_step()
-
-        wave, release = controller.write_command.await_args_list
-        assert wave.args == (bytes.fromhex("040210000000"),)
-        assert release.args == (bytes.fromhex("040200000000"),)
-        assert release.kwargs["repeat_count"] == 4
-        assert release.kwargs["cancel_event"].is_set() is False
-
     async def test_write_stream_is_unconfirmed_and_wall_clock_paced(self):
-        """CU170 streams must not add a confirmed-write RTT to every gap."""
-        controller = self._controller_with_characteristics()
+        """write_command stays BedController's contract for the service door.
+
+        The streamer writes through its own link-bound writer, but
+        async_write_command still reaches this, and a confirmed write here would
+        add a round trip to every frame it carries.
+        """
+        controller = LeggettOkinController(MagicMock())
         controller._write_gatt_with_retry = AsyncMock()
         cancel_event = MagicMock()
 
@@ -277,69 +343,260 @@ class TestLeggettOkinController:
             {"back", "legs", "tilt", "pillow", "lumbar"}
         )
 
-    async def test_motor_streams_then_sends_four_release_frames(self):
-        """Held keycodes stream at the configured cadence, then release with four zeros.
+    async def test_the_controller_is_hold_capable(self):
+        """one-expression-door: the class declares the capability by inheriting it."""
+        controller = LeggettOkinController(_hold_coordinator())
 
-        The app's output thread writes the held keycode every 100ms and emits
-        exactly four keycode-0 frames on release (MaxZeroCount = 3). There is no
-        distinct stop opcode; the release frame is an ordinary frame carrying 0.
-        """
-        coordinator = MagicMock()
-        coordinator.motor_pulse_count = 10
-        coordinator.motor_pulse_delay_ms = 100
-        coordinator.client = self._controller_with_characteristics().client
-        coordinator.cancel_command = asyncio.Event()
-        controller = LeggettOkinController(coordinator)
-        controller.write_command = AsyncMock()
-
-        await controller.move_head_up()
-
-        move_call, release_call = controller.write_command.await_args_list
-        assert move_call.args == (bytes.fromhex("040200000001"),)
-        assert move_call.kwargs == {
-            "repeat_count": 10,
-            "repeat_delay_ms": 100,
-        }
-        assert release_call.args == (bytes.fromhex("040200000000"),)
-        assert release_call.kwargs["repeat_count"] == 4
-        assert release_call.kwargs["cancel_event"].is_set() is False
-
-    @pytest.mark.parametrize("stored_delay", [0, 1, 100, 300])
-    async def test_motor_stream_uses_the_proven_pulse_delay(self, stored_delay: int):
-        """Stored timing cannot flood writes or exceed the CU170 watchdog."""
-        coordinator = MagicMock()
-        coordinator.motor_pulse_count = 10
-        coordinator.motor_pulse_delay_ms = stored_delay
-        coordinator.client = self._controller_with_characteristics().client
-        controller = LeggettOkinController(coordinator)
-        controller.write_command = AsyncMock()
-
-        await controller.move_head_up()
-
-        move_call = controller.write_command.await_args_list[0]
-        assert move_call.kwargs["repeat_delay_ms"] == LEGGETT_OKIN_PULSE_DEFAULTS[1]
+        assert isinstance(controller, HoldCapable)
 
     @pytest.mark.parametrize(
-        ("slot", "keycode"),
-        [(1, "00001000"), (2, "00002000"), (3, "00004000"), (4, "00008000")],
+        ("method", "control", "action"),
+        [
+            ("move_head_up", "motor-head-up", Activate()),
+            ("move_head_down", "motor-head-down", Activate()),
+            ("move_legs_up", "motor-feet-up", Activate()),
+            ("move_lumbar_down", "motor-lumbar-down", Activate()),
+            ("move_pillow_up", "motor-pillow-up", Activate()),
+            ("preset_flat", "preset-flat", Hold(223)),
+            ("preset_anti_snore", "preset-3", Hold(223)),
+            ("preset_dummy", "preset-dummy", Hold(223)),
+            ("lights_toggle", "light-toggle", Activate()),
+            ("massage_toggle", "massage-toggle", Activate()),
+            ("massage_head_down", "massage-head-down", Activate()),
+            ("massage_mode_step", "massage-wave-step", Activate()),
+        ],
     )
-    async def test_memory_recall_ladder_and_burst(self, slot: int, keycode: str):
-        """Recall is a 10-frame burst of the slot bit with no terminator.
+    async def test_a_one_shot_submits_its_controls_fixed_duration_intent(
+        self, method: str, control: str, action: IntentAction
+    ):
+        """one-expression-door: every motion and tap is a hold intent, unawaited.
 
-        The ladder previously started at 0x2000 and ran to 0x10000, so every slot
-        recalled its neighbour and "memory 4" actually sent the store-arm keycode
-        (issue #368). Recall is also autonomous: appending a release frame could
-        cancel the move the box just started.
+        A control declaring an Activate is submitted as one, so the roster
+        prices the press; a preset, which this bed only holds, is submitted as
+        a Hold of the roster's press minimum.
         """
-        controller = self._controller_with_characteristics()
-        controller.write_command = AsyncMock()
+        coordinator = _hold_coordinator()
+        controller = LeggettOkinController(coordinator)
+
+        await getattr(controller, method)()
+
+        coordinator.hold_reconstructor.submit.assert_called_once_with(
+            Control(control), action
+        )
+
+    @pytest.mark.parametrize("slot", [1, 2, 3, 4])
+    async def test_each_preset_recalls_only_its_own_slot(self, slot: int):
+        """Memory 1 owns 0x1000; no other exposed preset may reach for it.
+
+        0x1000 is the slot the vendor app also labels Zero-G, so a second button
+        carrying it would be a duplicate of Memory 1 under another name.
+        """
+        coordinator = _hold_coordinator()
+        controller = LeggettOkinController(coordinator)
 
         await controller.preset_memory(slot)
 
-        controller.write_command.assert_awaited_once()
-        call = controller.write_command.await_args
-        assert call.args == (bytes.fromhex(f"0402{keycode}"),)
-        assert call.kwargs == {"repeat_count": 10, "repeat_delay_ms": 100}
+        coordinator.hold_reconstructor.submit.assert_called_once_with(
+            Control(f"preset-{slot}"), Hold(223)
+        )
+
+    @pytest.mark.parametrize(
+        ("method", "motor"),
+        [
+            ("move_head_stop", "head"),
+            ("move_legs_stop", "feet"),
+            ("move_pillow_stop", "pillow"),
+            ("move_lumbar_stop", "lumbar"),
+        ],
+    )
+    async def test_a_per_motor_stop_fences_both_of_its_directions(
+        self, method: str, motor: str
+    ):
+        """end-is-not-stop: a per-motor stop passes the motor's two controls."""
+        coordinator = _hold_coordinator()
+        controller = LeggettOkinController(coordinator)
+
+        await getattr(controller, method)()
+
+        coordinator.hold_reconstructor.stop.assert_called_once_with(
+            frozenset({Control(f"motor-{motor}-up"), Control(f"motor-{motor}-down")})
+        )
+
+    async def test_the_held_set_and_the_release_reach_the_streamer(self):
+        """frame-is-the-or: the controller relays both and decides neither."""
+        controller = LeggettOkinController(_hold_coordinator())
+        controller._streamer = _FakeStreamer()
+
+        controller.hold({Control("motor-head-up"): 12.0})
+        controller.release_wire()
+
+        assert controller._streamer.calls == ["hold", "release_wire"]
+        assert controller._streamer.pushes == [{Control("motor-head-up"): 12.0}]
+
+    async def test_link_up_stages_nothing(self):
+        """A connect expresses nothing, so it cannot consume a travel in progress.
+
+        A latch-mode box takes any press during an autonomous travel as that
+        travel's stop, and a reconnect is not user-initiated on every path.
+        """
+        controller = LeggettOkinController(_hold_coordinator(app_profile="prodigy4"), app_profile="prodigy4")
+        controller._streamer = _FakeStreamer()
+
+        controller.link_up()
+        controller.hold({Control("preset-1"): 12.0})
+
+        assert controller._streamer.calls == ["hold"]
+        assert controller._streamer.operations == []
+
+    async def test_a_staged_operation_carries_its_own_cues(self):
+        """store-cue-backstop: the store and the mode gestures stage, and nothing else.
+
+        On a Prodigy 2 profile, because Prodigy CE refuses the press-and-hold
+        chord before it reaches the streamer: that chord is a factory reset,
+        and this bed's presets are what it erases.
+        """
+        controller = LeggettOkinController(_hold_coordinator(app_profile="prodigy2"), app_profile="prodigy2")
+        controller._streamer = _FakeStreamer()
+
+        await controller.program_memory(2)
+        await controller.set_control_mode_press_and_hold()
+        await controller.set_control_mode_press_and_release()
+
+        assert controller._streamer.operations == [
+            okin_store_program(2, presses_the_disarm_key=False),
+            okin_mode_program(Control("factory-reset")),
+            okin_mode_program(Control("latch-mode-enable")),
+        ]
+
+    @pytest.mark.parametrize("app_profile", ["prodigy2", "prodigy2l", "prodigy4"])
+    async def test_a_store_names_only_controls_its_own_roster_prices(
+        self, app_profile: str
+    ):
+        """dummy-disarms-a-pending-store: the streamer prices every stage it presses.
+
+        The disarming key is declared on Prodigy CE alone, so a store that owed
+        it everywhere would meet a roster that cannot price it and end the pump
+        part way through the store, with the save button still waiting.
+        """
+        coordinator = _hold_coordinator(app_profile=app_profile)
+        controller = LeggettOkinController(coordinator, app_profile=app_profile)
+        controller._streamer = _FakeStreamer()
+
+        await controller.program_memory(1)
+
+        (program,) = controller._streamer.operations
+        for stage in program.stages + program.recovery:
+            for control in stage.controls:
+                assert coordinator.control_roster.press_floor(control) is not None
+
+    async def test_a_fixed_slot_stages_nothing(self):
+        """operation-controls-command-path-only: slot 3 is the fixed snore entry."""
+        controller = LeggettOkinController(_hold_coordinator())
+        controller._streamer = _FakeStreamer()
+
+        await controller.program_memory(3)
+
+        assert controller._streamer.operations == []
+
+    async def test_stop_all_releases_the_wire_and_then_presses_dummy(self):
+        """latched-travel-stop, cancellation-leaves-bed-ready: the stop's own cause.
+
+        The bed-wide stop drops every bit, then presses DUMMY - which is what
+        leaves the box ready for the next preset key whatever the stop cancelled.
+        """
+        controller = LeggettOkinController(_hold_coordinator())
+        controller._streamer = _FakeStreamer()
+
+        await controller.stop_all()
+
+        assert controller._streamer.calls == ["release_wire", "run_operation"]
+        assert controller._streamer.operations == [okin_dummy_program()]
+
+    async def test_a_status_notification_is_a_receipt_and_a_cue_transition(self):
+        """receipts-positive-only: only the main status channel answers frames."""
+        controller = LeggettOkinController(_hold_coordinator())
+        controller._feedback = MagicMock()
+
+        controller._handle_notification(
+            SimpleNamespace(uuid=LEGGETT_OKIN_NOTIFY_CHAR_UUID),
+            bytearray.fromhex("040055aa000000"),
+        )
+        controller._handle_notification(
+            SimpleNamespace(uuid=OKIN_SMART_REMOTE_CSS_NOTIFY_CHAR_UUID),
+            bytearray.fromhex("040055aa000000"),
+        )
+
+        controller._feedback.note_notification.assert_called_once()
+        assert controller._feedback.note_notification.call_args.args[0] == 0x55AA
+
+    async def test_a_main_channel_frame_carrying_no_status_is_still_a_receipt(self):
+        """receipts-positive-only: the channel answers frames, and status is narrower.
+
+        On Prodigy CE the first status frame latches the mask. A later frame on
+        the same channel that is not that shape is still the box answering one,
+        and the light bit stays where the last status put it.
+        """
+        controller = LeggettOkinController(_hold_coordinator())
+        controller._handle_notification(
+            SimpleNamespace(uuid=LEGGETT_OKIN_NOTIFY_CHAR_UUID),
+            bytearray.fromhex("090b0002000000020000ff000000000000000000"),
+        )
+        controller._feedback = MagicMock()
+
+        controller._handle_notification(
+            SimpleNamespace(uuid=LEGGETT_OKIN_NOTIFY_CHAR_UUID),
+            bytearray.fromhex("040055aa000000"),
+        )
+        controller._handle_notification(
+            SimpleNamespace(uuid=OKIN_SMART_REMOTE_CSS_NOTIFY_CHAR_UUID),
+            bytearray.fromhex("040055aa000000"),
+        )
+
+        controller._feedback.note_notification.assert_called_once()
+        assert controller._feedback.note_notification.call_args.args[0] == 0x00020000
+        assert controller._cu170_status_mask == 0x00020000
+
+    async def test_a_missing_slot_submits_nothing(self):
+        """A slot this bed does not have reaches the reconstructor as nothing."""
+        coordinator = _hold_coordinator()
+        controller = LeggettOkinController(coordinator)
+
+        await controller.preset_memory(7)
+
+        coordinator.hold_reconstructor.submit.assert_not_called()
+
+    async def test_only_memory_1_asserts_the_memory_1_control(self):
+        """Memory 1 owns 0x1000; no other exposed preset may reach for it.
+
+        0x1000 is the slot the vendor app also labels Zero-G, so a second
+        button carrying it would be a duplicate of Memory 1 under another name.
+        """
+        coordinator = _hold_coordinator()
+        controller = LeggettOkinController(coordinator)
+
+        presets = [
+            description
+            for description in BUTTON_DESCRIPTIONS
+            if description.key.startswith("preset_")
+            and _should_add_button(description, controller, True)
+        ]
+        assert {description.key for description in presets} == {
+            "preset_memory_1",
+            "preset_memory_2",
+            "preset_memory_3",
+            "preset_memory_4",
+            "preset_flat",
+            "preset_anti_snore",
+        }
+
+        for description in presets:
+            coordinator.hold_reconstructor.submit.reset_mock()
+            assert description.press_fn is not None
+            await description.press_fn(controller)
+            control = coordinator.hold_reconstructor.submit.call_args.args[0]
+            assert (control == Control("preset-1")) is (
+                description.key == "preset_memory_1"
+            ), description.key
 
     async def test_store_keycode_is_never_a_recall(self):
         """0x10000 arms an overwrite and must not appear in the recall ladder."""
@@ -352,35 +609,11 @@ class TestLeggettOkinController:
             LeggettOkinCommands.PRESET_ANTI_SNORE,
         }
 
-    @pytest.mark.parametrize(
-        ("method_name", "command_hex"),
-        [
-            ("set_control_mode_press_and_hold", "040208010000"),
-            ("set_control_mode_press_and_release", "040201800000"),
-        ],
-    )
-    async def test_control_modes_use_the_exact_special_command_lifecycle(
-        self, method_name: str, command_hex: str
-    ):
-        """Prodigy 2 retains the app's 55 attempts and one explicit zero."""
-        controller = LeggettOkinController(
-            self._controller_with_characteristics()._coordinator, app_profile="prodigy2"
-        )
-        controller._wait_hold_deadline = AsyncMock()
-        controller.write_command = AsyncMock()
+    async def test_the_control_mode_gestures_are_advertised(self):
+        """The two mode chords stay reachable from the settings dialog."""
+        controller = LeggettOkinController(_hold_coordinator())
 
         assert controller.supports_control_mode_configuration is True
-        await getattr(controller, method_name)()
-
-        command_write, release_write = controller.write_command.await_args_list
-        assert command_write.args == (bytes.fromhex(command_hex),)
-        assert command_write.kwargs == {
-            "repeat_count": 55,
-            "repeat_delay_ms": 100,
-        }
-        assert release_write.args == (bytes.fromhex("040200000000"),)
-        assert release_write.kwargs["repeat_count"] == 1
-        assert release_write.kwargs["cancel_event"].is_set() is False
 
     @pytest.mark.parametrize(
         ("payload", "expected"),
@@ -439,162 +672,6 @@ class TestLeggettOkinController:
 
         await controller.stop_notify()
         assert client.stop_notify.await_count == 2
-
-    async def test_program_memory_is_a_two_stage_hold(self):
-        """Programming switches directly from store to slot, then releases."""
-        controller = self._controller_with_characteristics()
-        controller.write_command = AsyncMock()
-
-        await controller.program_memory(2)
-
-        arm, slot, slot_release = controller.write_command.await_args_list
-        # ~5s of the store keycode...
-        assert arm.args == (bytes.fromhex("040200010000"),)
-        assert {key: value for key, value in arm.kwargs.items() if key != "deadline"} == {"repeat_count": 50, "repeat_delay_ms": 100}
-        # ...directly followed by ~2s of the slot keycode, then a release.
-        assert slot.args == (bytes.fromhex("040200002000"),)
-        assert {key: value for key, value in slot.kwargs.items() if key != "deadline"} == {"repeat_count": 20, "repeat_delay_ms": 100}
-        assert slot_release.args == (bytes.fromhex("040200000000"),)
-
-    async def test_stop_all_propagates_write_failures(self):
-        """An explicit stop must not report success when it never reached the bed.
-
-        The release burst is this protocol's only stop, and the shared helper
-        logs and swallows BleakError for cleanup callers. stop_all opts out, or
-        async_stop_command would log "Stop command sent" while the bed kept
-        moving.
-        """
-        controller = self._controller_with_characteristics()
-        controller.write_command = AsyncMock(side_effect=BleakError("write failed"))
-
-        with pytest.raises(BleakError):
-            await controller.stop_all()
-
-    async def test_cleanup_release_failures_do_not_mask_the_real_error(self):
-        """A failed release burst during cleanup stays logged, not raised.
-
-        The two writes raise distinct errors so the assertion actually proves
-        which one propagated: with a shared message it would pass even if the
-        cleanup failure replaced the movement failure.
-        """
-        controller = self._controller_with_characteristics()
-        controller.write_command = AsyncMock(
-            side_effect=[BleakError("movement failed"), BleakError("release failed")]
-        )
-
-        with pytest.raises(BleakError, match="movement failed"):
-            await controller.move_head_up()
-
-        assert controller.write_command.await_count == 2
-
-    async def test_preset_flat_floors_an_unsafe_pulse_delay(self):
-        """Flat is a fixed-duration hold, so the cadence has a floor.
-
-        The setup and options flows accept any integer. 0 would divide by zero,
-        a negative would collapse the hold to one frame, and a small positive
-        like 1ms would expand the 30s hold into 30,000 sequential writes and
-        saturate the link. All three floor to the proven cadence.
-        """
-        for stored_delay in (0, -50, 1):
-            coordinator = MagicMock()
-            coordinator.motor_pulse_count = 10
-            coordinator.motor_pulse_delay_ms = stored_delay
-            coordinator.client = self._controller_with_characteristics().client
-            controller = LeggettOkinController(coordinator)
-            controller.write_command = AsyncMock()
-
-            await controller.preset_flat()
-
-            flat_call = controller.write_command.await_args_list[0]
-            assert flat_call.args == (bytes.fromhex("040208000000"),)
-            assert flat_call.kwargs["repeat_delay_ms"] == LEGGETT_OKIN_PULSE_DEFAULTS[1]
-            assert flat_call.kwargs["repeat_count"] == 300
-
-    async def test_program_memory_cancellation_after_arm_skips_slot(self):
-        """A cancelled arm never starts programming a slot, but still releases."""
-        controller = self._controller_with_characteristics()
-
-        async def cancel_after_arm(*args, **kwargs):
-            if args[0] == bytes.fromhex("040200010000"):
-                controller._coordinator.cancel_command.set()
-
-        controller.write_command = AsyncMock(side_effect=cancel_after_arm)
-        await controller.program_memory(2)
-
-        sent = [item.args[0] for item in controller.write_command.await_args_list]
-        assert sent == [bytes.fromhex("040200010000"), bytes.fromhex("040200000000")]
-        release = controller.write_command.await_args_list[-1]
-        assert not release.kwargs["cancel_event"].is_set()
-
-    async def test_light_and_massage_taps_end_with_a_release_burst(self):
-        """Lights and massage are held keycodes, so a tap must release the key.
-
-        Sending the frame alone can leave the key asserted, and the receiver may
-        then not recognise the next press of the same control.
-        """
-        controller = self._controller_with_characteristics()
-        controller.write_command = AsyncMock()
-
-        await controller.lights_toggle()
-
-        press, release = controller.write_command.await_args_list
-        assert press.args == (bytes.fromhex("040200020000"),)
-        assert release.args == (bytes.fromhex("040200000000"),)
-        assert release.kwargs["repeat_count"] == 4
-
-        controller.write_command.reset_mock()
-        await controller.massage_toggle()
-
-        press, release = controller.write_command.await_args_list
-        assert press.args == (bytes.fromhex("040200000100"),)
-        assert release.args == (bytes.fromhex("040200000000"),)
-
-    async def test_program_memory_surfaces_a_failed_final_release(self):
-        """On the success path the closing release is the operation, not cleanup.
-
-        If it fails the slot keycode may still be asserted, so the save must not
-        report success.
-        """
-        controller = self._controller_with_characteristics()
-        # arm and slot holds succeed; the final release fails.
-        controller.write_command = AsyncMock(
-            side_effect=[None, None, BleakError("final release failed")]
-        )
-
-        with pytest.raises(BleakError, match="final release failed"):
-            await controller.program_memory(2)
-
-    @pytest.mark.parametrize(
-        ("action", "primary_frame"),
-        [
-            ("move_head_up", "040200000001"),
-            ("preset_flat", "040208000000"),
-            ("lights_toggle", "040200020000"),
-            ("massage_toggle", "040200000100"),
-        ],
-    )
-    async def test_release_failure_surfaces_after_a_successful_command(
-        self, action: str, primary_frame: str
-    ):
-        """A lost release after a successful command must not report success.
-
-        The release burst is this protocol's stop, so losing it can leave the
-        bed moving or a keycode asserted. Every command family that ends in one
-        has to surface that, not just log it.
-        """
-        coordinator = MagicMock()
-        coordinator.motor_pulse_count = 10
-        coordinator.motor_pulse_delay_ms = 100
-        coordinator.client = self._controller_with_characteristics().client
-        controller = LeggettOkinController(coordinator)
-        controller.write_command = AsyncMock(side_effect=[None, BleakError("release failed")])
-        coordinator.cancel_command = asyncio.Event()
-
-        with pytest.raises(BleakError, match="release failed"):
-            await getattr(controller, action)()
-
-        first = controller.write_command.await_args_list[0]
-        assert first.args == (bytes.fromhex(primary_frame),)
 
     async def test_massage_timer_step_is_not_exposed(self):
         """0x200 is a constant the app never builds or writes, so it is not a command."""

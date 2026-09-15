@@ -24,20 +24,22 @@ from types import MappingProxyType
 from typing import Any, Protocol
 
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later
 
 from .hold_capability import HoldCapable
 from .hold_intent import (
+    Deadline,
     Hold,
     HoldIntent,
     HoldOutcome,
     IntentAction,
     IntentId,
-    IntentSample,
-    IntentSampleSet,
+    ResolvedSample,
+    ResolvedSampleSet,
     SenderId,
 )
-from .hold_roster import Control, ControlRoster
+from .hold_roster import ActionKind, Control, ControlRoster
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -87,6 +89,7 @@ class _IntentRecord:
     intent: HoldIntent
     origin: _IntentOrigin
     retention_s: float
+    last_refresh: float
     evict_at: float = inf
     ended: bool = False
     expressed: bool = False
@@ -149,7 +152,7 @@ class HoldReconstructor:
         self._roster = roster
 
     @callback
-    def handle_samples(self, message: IntentSampleSet) -> None:
+    def handle_samples(self, message: ResolvedSampleSet) -> None:
         """Apply one sender's complete active set.
 
         A message at or below its sender's high-water drops whole rather than
@@ -181,8 +184,12 @@ class HoldReconstructor:
         self._settle(now)
 
     @callback
-    def submit(self, control: Control, ttl_ms: int) -> Future[HoldOutcome]:
-        """Hold control for ttl_ms as a degenerate sender, returning its outcome.
+    def submit(self, control: Control, action: IntentAction) -> Future[HoldOutcome]:
+        """Assert control as a degenerate sender, returning the intent's outcome.
+
+        The same door the wire's samples take: the control must declare the
+        action and must not be a staged operation, and a ``Hold``'s ttl is
+        clamped exactly as a sample's is.
 
         The future resolves ``COMPLETED`` when the intent ends after reaching an
         attached controller, ``INTERRUPTED`` on a stop or a quiesce, and
@@ -192,13 +199,19 @@ class HoldReconstructor:
             RuntimeError: Thrown once ``quiesce`` has closed intake, as
                 ``handle_samples`` is. An outcome would say the submission was
                 taken and then lost; it never arrived.
+            HomeAssistantError: Thrown when the control refuses the action.
+                Every caller here is internal, so a refusal is this
+                integration's own invariant failure rather than bad input:
+                the bed module's declarations disagree with the code pressing
+                them.
         """
         self._require_open()
+        self._refuse_an_undeclared_submission(control, action)
         future: Future[HoldOutcome] = self.hass.loop.create_future()
         self._submissions += 1
         key = (SUBMISSION_SENDER, IntentId(f"submission-{self._submissions}"))
         now = self._clock()
-        ttl_s = self._roster.clamp_ttl_ms(control, ttl_ms) / 1000
+        ttl_s = self._sample_ttl_s(control, action)
         self._outcomes[key] = future
         self._records[key] = _record(control, ttl_s, _IntentOrigin.ONE_SHOT, now)
         self._settle(now)
@@ -208,9 +221,10 @@ class HoldReconstructor:
     def stop(self, controls: Iterable[Control]) -> None:
         """End every hold intent on each control and fence it.
 
-        The unconditional safety verb: a per-motor stop passes that motor's two
-        direction controls. Each ended record is retained, so the stopped id's
-        in-flight samples refresh it and hold nothing.
+        The unconditional safety verb: a per-motor stop passes
+        ``MotorControls.both``, which the roster composes so no caller pairs
+        two directions itself. Each ended record is retained, so the stopped
+        id's in-flight samples refresh it and hold nothing.
         """
         self._stop(set(controls))
 
@@ -251,11 +265,17 @@ class HoldReconstructor:
         State-idempotent, because the coordinator publishes connection state
         rather than edges: re-reporting the controller already attached is a
         no-op, and pushes nothing a second time.
+
+        This is where the controller learns its link is live, and it learns
+        ahead of the push: a bed that owes its box a connect-time gesture runs
+        it with nothing waiting behind it, rather than withholding the first
+        command that needs it.
         """
         if self._controller is controller:
             return
 
         self._controller = controller
+        controller.link_up()
         now = self._clock()
         self._sweep(now)
         arriving = _newest_per_control(
@@ -286,10 +306,18 @@ class HoldReconstructor:
         reports a lost connection at the start of a connect attempt as well as
         at a link's end, so a detach with nothing attached is a no-op and ends
         no intent.
+
+        This is also where the controller learns its link is gone. The
+        coordinator's own drop paths null their controller reference at five
+        sites and fan the disconnected state from three, and the reconstructor
+        is the one holder that still has the controller when the fan-out
+        arrives, so telling it here is what makes the edge single-authored.
         """
-        if self._controller is None:
+        controller = self._controller
+        if controller is None:
             return
 
+        controller.link_lost()
         self._controller = None
         now = self._clock()
         for key, record in self._records.items():
@@ -343,7 +371,27 @@ class HoldReconstructor:
         if self._closed:
             raise RuntimeError("intake closed")
 
-    def _apply(self, sender: SenderId, sample: IntentSample, now: float) -> None:
+    def _refuse_an_undeclared_submission(
+        self, control: Control, action: IntentAction
+    ) -> None:
+        """Refuse a submission the wire's sample door would have refused.
+
+        Raises:
+            HomeAssistantError: Thrown when the control stages bed-side or does
+                not declare the action.
+        """
+        if self._roster.is_operation(control):
+            raise HomeAssistantError(
+                f"Control '{control.name}' stages bed-side and cannot be submitted as "
+                "an intent"
+            )
+        kind = ActionKind.HOLD if isinstance(action, Hold) else ActionKind.ACTIVATE
+        if not self._roster.supports(control, kind):
+            raise HomeAssistantError(
+                f"Control '{control.name}' does not support '{kind.value}'"
+            )
+
+    def _apply(self, sender: SenderId, sample: ResolvedSample, now: float) -> None:
         """Reconcile one sample against the record it names."""
         key = (sender, sample.intent_id)
         record = self._records.get(key)
@@ -379,7 +427,7 @@ class HoldReconstructor:
             return
         self._end(key, record, now)
 
-    def _refresh(self, record: _IntentRecord, sample: IntentSample, now: float) -> None:
+    def _refresh(self, record: _IntentRecord, sample: ResolvedSample, now: float) -> None:
         """Move a record's retention, and its deadline while it still holds.
 
         A refresh replaces the deadline outright rather than extending it, so a
@@ -394,12 +442,12 @@ class HoldReconstructor:
             self._dropped_renewals += 1
             return
 
-        deadline = (
-            self._bounded_deadline(record.intent, now + record.retention_s)
-            if isinstance(sample.action, Hold)
-            else record.intent.deadline
-        )
-        record.intent = replace(record.intent, last_refresh=now, deadline=deadline)
+        record.last_refresh = now
+        if isinstance(sample.action, Hold):
+            record.intent = replace(
+                record.intent,
+                deadline=self._bounded_deadline(record.intent, now + record.retention_s),
+            )
 
     def _sample_ttl_s(self, control: Control, action: IntentAction) -> float:
         """Return one sample's hold length: a clamped ttl, or the roster's duration."""
@@ -407,13 +455,26 @@ class HoldReconstructor:
             return self._roster.clamp_ttl_ms(control, action.ttl_ms) / 1000
         return self._roster.activate_duration_ms(control) / 1000
 
-    def _bounded_deadline(self, intent: HoldIntent, deadline: float) -> float:
+    def _bounded_deadline(self, intent: HoldIntent, deadline: float) -> Deadline:
         """Return a deadline capped at the press start plus the control's lifetime."""
-        lifetime_s = self._roster.declaration(intent.control).ttl_max_ms / 1000
-        return min(deadline, intent.began + lifetime_s)
+        lifetime_s = self._roster.ttl_max_ms(intent.control) / 1000
+        return Deadline(min(deadline, intent.began + lifetime_s))
 
     def _stop(self, controls: set[Control] | None) -> None:
-        """End and fence the named controls, or every control when None."""
+        """End and fence the named controls, or every control when None.
+
+        The controller hears the stop before the push that shrinks the set: a
+        shrunken push alone reads as an intent that ended, which drains its
+        press floor, and a stop drops the press with the floor unmet.
+
+        The bed-wide case names every control a record still retains, not the
+        derived held set: a press whose intent ended within the last press
+        floor - a ttl-0 sample, or a lapse - is out of the held set and still
+        draining at the controller, so naming the held set alone leaves the
+        drain the stop was raised to end. A record outlives its hold by its own
+        clamped ttl, which covers the floor for any client whose ttl exceeds
+        it: the card's 750 ms against the CU170's 223 ms floor does.
+        """
         now = self._clock()
         for key, record in self._records.items():
             if record.ended or (controls is not None and record.intent.control not in controls):
@@ -421,6 +482,13 @@ class HoldReconstructor:
             record.ended = True
             record.evict_at = now + record.retention_s
             self._resolve(key, HoldOutcome.INTERRUPTED)
+        controller = self._controller
+        if controller is not None:
+            controller.stop(
+                frozenset(record.intent.control for record in self._records.values())
+                if controls is None
+                else frozenset(controls)
+            )
         self._settle(now)
 
     def _settle(self, now: float, *, push: bool = True) -> None:
@@ -565,9 +633,10 @@ def _record(
 ) -> _IntentRecord:
     """Return the record for a press beginning now and lasting ttl_s."""
     return _IntentRecord(
-        intent=HoldIntent(control=control, began=now, last_refresh=now, deadline=now + ttl_s),
+        intent=HoldIntent(control=control, began=now, deadline=Deadline(now + ttl_s)),
         origin=origin,
         retention_s=ttl_s,
+        last_refresh=now,
     )
 
 

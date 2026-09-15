@@ -7,10 +7,10 @@ so it takes no ttl of its own. The reconstructor turns either into a
 ``HoldIntent`` - a control with a deadline.
 
 Units, stated once: a ttl is a duration in milliseconds as ``int``, matching the
-integration's other ``duration_ms`` values. A began, a last refresh and a
-deadline are instants in seconds as ``float`` on the event loop's monotonic
-clock. Different types and different units, so a transposition is a type error
-rather than a silent factor of a thousand.
+integration's other ``duration_ms`` values. A press start and a deadline are
+instants in seconds on the event loop's monotonic clock, and the deadline - the
+one instant that crosses every tier - is a ``Deadline`` rather than a bare
+float, because ``float`` alone no longer says which unit it carries.
 """
 
 from __future__ import annotations
@@ -24,6 +24,11 @@ from .hold_roster import Control
 # Two opaque client-minted ids that are never interchangeable and never parsed.
 SenderId = NewType("SenderId", str)
 IntentId = NewType("IntentId", str)
+
+# The instant a hold ends, in seconds on the event loop's monotonic clock. Named
+# because it is the value the reconstructor, the controller and the streamer all
+# read, and the tier that mints one says so where it does.
+Deadline = NewType("Deadline", float)
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,8 +47,14 @@ IntentAction = Hold | Activate
 
 
 @dataclass(frozen=True, slots=True)
-class IntentSample:
-    """One intent's state in one message, with its control already resolved."""
+class ResolvedSample:
+    """One intent's state in one message, with its control already resolved.
+
+    Named for what makes it different from the wire's sample, which the card
+    calls an ``IntentSample`` and the handler takes as a dict: this one has
+    passed the door, so its control is a ``Control`` the roster declared and
+    its action is one of the two the control supports.
+    """
 
     intent_id: IntentId
     control: Control
@@ -51,12 +62,12 @@ class IntentSample:
 
 
 @dataclass(frozen=True, slots=True)
-class IntentSampleSet:
-    """One sender's complete active set under one message seq."""
+class ResolvedSampleSet:
+    """One sender's complete active set under one message seq, resolved."""
 
     sender: SenderId
     seq: int
-    samples: tuple[IntentSample, ...]
+    samples: tuple[ResolvedSample, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,8 +81,7 @@ class HoldIntent:
 
     control: Control
     began: float
-    last_refresh: float
-    deadline: float
+    deadline: Deadline
 
 
 class HoldOutcome(StrEnum):

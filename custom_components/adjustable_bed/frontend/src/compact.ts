@@ -35,7 +35,8 @@ export interface CompactAction {
 }
 
 export function compactActionOptions(hass: HomeAssistant, bed: BedEntities): CompactAction[] {
-  return [...bed.presets, ...bed.memory.flatMap((slot) => slot.goto ? [slot.goto] : [])]
+  return [...bed.presets.map((preset) => preset.id),
+    ...bed.memory.flatMap((slot) => slot.goto ? [slot.goto] : [])]
     .flatMap((entityId) => {
       const rawKey = hass.entities[entityId]?.translation_key;
       return rawKey ? [{ key: splitSide(rawKey).key, entityId }] : [];
