@@ -459,8 +459,9 @@ Per-side entities render *ungrouped* even with no card change, so this can ship 
 - **Graphic**: Both renders two stacked compact silhouettes (L/R labelled); each side tab
   renders that side's silhouette; single-address combined-angle renders one as today.
   Graphic is decorative (`aria-hidden`).
-- `bun run check` + `bun test`, rebuild & **commit** `frontend/dist/adjustable-bed-card.js`;
-  mirror en/nb.
+- `bun run check` + `bun test`, rebuild & **commit** both
+  `frontend/dist/adjustable-bed-card.js` and
+  `frontend/dist/adjustable-bed-card-chunk.js`; mirror en/nb.
 
 ---
 
@@ -641,7 +642,8 @@ Layer Octo's hard quirks onto the proven Phase-1 core, and ship the card. This i
   `climate.py`, `number.py`, `select.py`, `binary_sensor.py`, `cover.py`, `button.py`,
   `frontend/src/{discovery,types,adjustable-bed-card,bed-graphic,editor}.ts`,
   `frontend/src/translations/{en,nb}.json`, `frontend/src/discovery.test.ts`,
-  `frontend/dist/adjustable-bed-card.js`, `tests/test_octo.py`.
+  `frontend/dist/{adjustable-bed-card,adjustable-bed-card-chunk}.js`,
+  `tests/test_octo.py`.
 - **Exit**: a separate-address Octo split bed works as ONE paired device (fixing #327), with
   sequential switching not starving the keepalive during a long `both` (time-virtualized
   test); unpair restores two standalone beds losslessly; full `discovery.test.ts` passes

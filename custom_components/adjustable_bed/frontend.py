@@ -1,9 +1,12 @@
 """Serve and auto-load the Adjustable Bed Lovelace card.
 
-The card bundle is built from ``frontend/src`` into ``frontend/dist`` and ships
-with the integration. We register it as a static path and Lovelace module
-resource so ``custom:adjustable-bed-card`` is available with zero user setup.
-YAML resource mode retains Home Assistant's frontend module fallback.
+The card is built from ``frontend/src`` into ``frontend/dist`` as two files that
+ship with the integration: an entry module that waits for the host application's
+root element before importing the card chunk, and the chunk itself. We register
+each on its own content-versioned static path, point the permanent card URL at
+the entry, and add a Lovelace module resource, so
+``custom:adjustable-bed-card`` is available with zero user setup. YAML resource
+mode retains Home Assistant's frontend module fallback.
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ DATA_FRONTEND_REGISTERED = "frontend_registered"
 
 URL_BASE = "/adjustable_bed_frontend"
 CARD_FILENAME = "adjustable-bed-card.js"
+CHUNK_FILENAME = "adjustable-bed-card-chunk.js"
 CARD_URL = f"{URL_BASE}/{CARD_FILENAME}"
 
 
@@ -46,7 +50,10 @@ class CardLoaderView(HomeAssistantView):
     """Resolve permanent and previously published URLs to the current bundle."""
 
     url = CARD_URL
-    extra_urls = [f"{URL_BASE}/{{cache_key}}/{CARD_FILENAME}"]
+    extra_urls = [
+        f"{URL_BASE}/{{cache_key}}/{CARD_FILENAME}",
+        f"{URL_BASE}/{{cache_key}}/{CHUNK_FILENAME}",
+    ]
     name = "adjustable_bed:card_loader"
     requires_auth = False
 
@@ -58,9 +65,10 @@ class CardLoaderView(HomeAssistantView):
     ) -> web.Response:
         """Never cache the pointer to a bundle that changes after an upgrade.
 
-        The exact current bundle URL has its own static route. Old URLs kept
-        by a browser, WebView or YAML dashboard reach this loader instead of
-        returning 404. The URL parameter is never used as a filesystem path.
+        The current entry and chunk have their own static routes. Old URLs
+        kept by a browser, WebView or YAML dashboard reach this loader
+        instead of returning 404, and so does the chunk path an old entry
+        imports. The URL parameter is never used as a filesystem path.
         """
         return web.Response(
             text=self._module,
@@ -79,11 +87,14 @@ def _gather() -> tuple[bool, str, str]:
 
     Return bundle availability, integration version, and a module cache key.
 
-    The bundle digest handles reinstalls or development builds where the card
-    changes without an integration version bump.
+    The bundle is both files: an entry that serves without its chunk answers
+    404 on the import the browser makes next, so neither is registered unless
+    both are present. Both are digested, so either one changing moves the key.
     """
-    card = _dist_dir() / CARD_FILENAME
-    exists = card.is_file()
+    dist = _dist_dir()
+    card = dist / CARD_FILENAME
+    chunk = dist / CHUNK_FILENAME
+    exists = card.is_file() and chunk.is_file()
     version = "dev"
     try:
         manifest = json.loads(
@@ -95,8 +106,10 @@ def _gather() -> tuple[bool, str, str]:
     cache_key = version
     if exists:
         try:
-            digest = hashlib.sha256(card.read_bytes()).hexdigest()[:12]
-            cache_key = f"{version}-{digest}"
+            digest = hashlib.sha256()
+            for shipped in (card, chunk):
+                digest.update(shipped.read_bytes())
+            cache_key = f"{version}-{digest.hexdigest()[:12]}"
         except OSError:  # pragma: no cover - file disappeared after is_file()
             pass
     return exists, version, cache_key
@@ -105,6 +118,11 @@ def _gather() -> tuple[bool, str, str]:
 def _card_url(cache_key: str) -> str:
     """Return a content-versioned URL whose path survives cache normalization."""
     return f"{URL_BASE}/{cache_key}/{CARD_FILENAME}"
+
+
+def _chunk_url(cache_key: str) -> str:
+    """Return the chunk's URL, which the entry's relative import resolves to."""
+    return f"{URL_BASE}/{cache_key}/{CHUNK_FILENAME}"
 
 
 def _is_card_resource(url: object) -> bool:
@@ -220,21 +238,25 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
     exists, version, cache_key = await hass.async_add_executor_job(_gather)
     if not exists:
         _LOGGER.warning(
-            "Adjustable Bed card bundle missing at %s; build it with "
+            "Adjustable Bed card bundle missing from %s; build it with "
             "`bun run build` in frontend/. The custom:adjustable-bed-card card "
             "will be unavailable until then",
-            _dist_dir() / CARD_FILENAME,
+            _dist_dir(),
         )
         return
 
     card_url = _card_url(cache_key)
     card_path = str(_dist_dir() / CARD_FILENAME)
+    chunk_path = str(_dist_dir() / CHUNK_FILENAME)
     try:
         await hass.http.async_register_static_paths(
             [
                 # Put the content identity in the path. Some webview and proxy
                 # caches normalize query parameters before looking up assets.
+                # The entry is served from this segment alone, so the chunk it
+                # imports relatively resolves to the `_chunk_url` route.
                 StaticPathConfig(card_url, card_path, True),
+                StaticPathConfig(_chunk_url(cache_key), chunk_path, True),
             ]
         )
         # Register the exact static route first, then the loader's fallback for
