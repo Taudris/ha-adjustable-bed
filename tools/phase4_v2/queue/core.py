@@ -601,6 +601,8 @@ class Queue:
                     raise _unsupported_schema_revision(pinned["revision"])
             self._enable_wal(connection)
             connection.executescript(_SCHEMA)
+            # Lock before reading so concurrent initializers cannot both insert.
+            connection.execute("BEGIN IMMEDIATE")
             identity = self._database_identity()
             existing_identity = connection.execute(
                 "SELECT database_path, database_device, database_inode, parent_identities "
@@ -624,6 +626,10 @@ class Queue:
                 )
             elif self._stored_database_identity(existing_identity) != identity:
                 raise QueueError("queue database or parent identity differs from initialized queue")
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
         finally:
             connection.close()
         with self._immediate(require_schema=False) as connection:
