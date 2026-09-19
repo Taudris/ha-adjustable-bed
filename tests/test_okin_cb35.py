@@ -20,6 +20,7 @@ from custom_components.adjustable_bed.const import (
     BED_TYPE_OKIN_CB35,
     CONF_BED_TYPE,
     CONF_DISABLE_ANGLE_SENSING,
+    CONF_DISCONNECT_AFTER_COMMAND,
     CONF_HAS_MASSAGE,
     CONF_MOTOR_COUNT,
     CONF_PREFERRED_ADAPTER,
@@ -391,4 +392,50 @@ async def test_scheduler_stop_interrupts_a_partially_sent_cb35_preset(
             if not task.done():
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+            await coordinator.async_shutdown()
+
+
+@pytest.mark.parametrize("expired", [False, True])
+async def test_stop_after_preset_disconnect_keeps_bounded_interrupt_window(
+    hass: HomeAssistant,
+    mock_okin_cb35_config_entry: MockConfigEntry,
+    mock_cb35_client: AsyncMock,
+    expired: bool,
+) -> None:
+    """Default v4 disconnects must not forget a still-driving autonomous preset."""
+    hass.config_entries.async_update_entry(
+        mock_okin_cb35_config_entry,
+        data={**mock_okin_cb35_config_entry.data, CONF_DISCONNECT_AFTER_COMMAND: True},
+    )
+    coordinator = AdjustableBedCoordinator(hass, mock_okin_cb35_config_entry)
+    controllers: list[OkinCB35Controller] = []
+
+    async def connect(*, reset_timer: bool) -> bool:
+        if coordinator.controller is None:
+            coordinator._client = mock_cb35_client
+            controller = OkinCB35Controller(coordinator)
+            controller._initialized = True
+            coordinator._controller = controller
+            controllers.append(controller)
+        return True
+
+    with (
+        patch.object(coordinator, "async_ensure_connected", side_effect=connect),
+        patch.object(coordinator, "_async_refresh_controller_auth", new=AsyncMock()),
+    ):
+        try:
+            assert coordinator._disconnect_after_operation_enabled()
+            await coordinator.async_execute_controller_command(lambda bed: bed.preset_flat())
+            assert coordinator.controller is None
+            assert coordinator.okin_cb35_preset_started_at is not None
+            mock_cb35_client.disconnect.assert_awaited_once()
+            if expired:
+                coordinator.okin_cb35_preset_started_at -= 46.0
+            mock_cb35_client.write_gatt_char.reset_mock()
+            await coordinator.async_stop_command()
+            payloads = [call.args[1] for call in mock_cb35_client.write_gatt_char.call_args_list]
+            assert payloads == ([] if expired else [_cmd(0x00)]) + [_cmd(0x0F)] * 3
+            assert len(controllers) == 2
+            assert coordinator.okin_cb35_preset_started_at is None
+        finally:
             await coordinator.async_shutdown()

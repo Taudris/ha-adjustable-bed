@@ -137,6 +137,9 @@ The interrupt window is 45 seconds after the last successfully transmitted prese
 packet, based on the reporter's approximately 30-second full travel. A successful
 motor-key write clears this window, even if later repeats are cancelled or fail.
 Cancellation during wake-up does not count as a transmitted movement command.
+The physical coordinator retains this window across BLE disconnects and controller
+recreation, including the default disconnect-after-command path. It is runtime
+state only, not persisted across integration reloads or Home Assistant restarts.
 The window estimates possible motion; it does not confirm that a preset is still
 running. Stop can therefore send the motor-key tap after an early completion,
 and sends STOP alone after the window expires. The reporter observed no visible

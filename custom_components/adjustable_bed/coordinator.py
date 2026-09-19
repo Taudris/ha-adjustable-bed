@@ -456,6 +456,8 @@ class AdjustableBedCoordinator:
         self._position_data_updated_monotonic: dict[str, float] = {}
         self._position_connection_generation = 0
         self._position_callbacks: set[Callable[[dict[str, float]], None]] = set()
+        # CB35 autonomous presets can outlive the connection-scoped controller.
+        self.okin_cb35_preset_started_at: float | None = None
         self._controller_state: dict[str, Any] = {}
         self._controller_state_callbacks: set[Callable[[dict[str, Any]], None]] = set()
         self._controller_state_refresh_task: asyncio.Task[None] | None = None

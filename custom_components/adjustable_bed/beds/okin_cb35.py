@@ -98,7 +98,15 @@ class OkinCB35Controller(Okin7ByteController):
     def __init__(self, coordinator: AdjustableBedCoordinator) -> None:
         """Initialize the CB35 controller."""
         super().__init__(coordinator, config=OKIN_CB35_CONFIG)
-        self._preset_started_at: float | None = None
+
+    @property
+    def _preset_started_at(self) -> float | None:
+        """Keep the interrupt window across BLE reconnects on this physical bed."""
+        return self._coordinator.okin_cb35_preset_started_at
+
+    @_preset_started_at.setter
+    def _preset_started_at(self, value: float | None) -> None:
+        self._coordinator.okin_cb35_preset_started_at = value
 
     # ─── Write override: CB35 requires write-without-response ─────────
 
