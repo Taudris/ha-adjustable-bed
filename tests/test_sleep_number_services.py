@@ -12,13 +12,15 @@ from custom_components.adjustable_bed import sleep_number_services as services
 
 
 def controller(side=None):
-    return SimpleNamespace(
+    result = SimpleNamespace(
         sleep_number_command_names=("query",),
         validate_sleep_number_command=MagicMock(),
         async_execute_sleep_number_command=AsyncMock(return_value={"level": 42}),
         command_side=side,
         _coordinator=SimpleNamespace(address="AA:BB"),
     )
+    result.bind_side = MagicMock(return_value=result)
+    return result
 
 
 def call(hass, **data):
@@ -153,3 +155,60 @@ def test_json_response_preserves_nested_programs():
 def test_json_response_rejects_non_serializable_values(value):
     with pytest.raises(ValueError):
         services._json_value(value)
+
+
+@pytest.mark.parametrize("selected_side", ["right", "both"])
+async def test_two_address_pair_rejects_cross_side_parameters_before_writes(hass, selected_side):
+    from custom_components.adjustable_bed.beds.sleep_number import SleepNumberController
+    from custom_components.adjustable_bed.paired_coordinator import PairedBedCoordinator
+
+    children = {side: MagicMock(address=address, name=side) for side, address in (
+        ("left", "AA:01"), ("right", "AA:02")
+    )}
+    controllers = {side: SleepNumberController(child) for side, child in children.items()}
+    parent = MagicMock(spec=PairedBedCoordinator)
+    parent.children = children
+    parent.child_for_side.side_effect = children.get
+    selected = ("left", "right") if selected_side == "both" else ("right",)
+    with (
+        patch.object(services, "_resolve_sided_targets", return_value=([(parent, selected_side)], [])),
+        patch.object(services, "_validation_controller", side_effect=[controllers[s] for s in selected]),
+        patch.object(services, "_execute_sided") as scheduler,
+        pytest.raises(ServiceValidationError, match="physical bed side"),
+    ):
+        await services.handle_sleep_number_command(call(
+            hass, command="get_sleep_number_controls", parameters={"side": "left"}
+        ))
+    scheduler.assert_not_awaited()
+
+
+async def test_two_address_execution_revalidates_the_physical_side(hass):
+    from custom_components.adjustable_bed.beds.sleep_number import SleepNumberController
+    from custom_components.adjustable_bed.paired_coordinator import PairedBedCoordinator
+
+    child = MagicMock(address="AA:02", name="right")
+    live = SleepNumberController(child)
+    live.async_execute_sleep_number_command = AsyncMock(return_value={"level": 42})
+    parent = MagicMock(spec=PairedBedCoordinator)
+    parent.children = {"right": child}
+    parent.child_for_side.return_value = child
+    observed = []
+
+    async def execute(coordinator, side, callback, **kwargs):
+        await callback(live)
+
+    async def record(command, parameters):
+        observed.append(live.command_side)
+        return {"level": 42}
+
+    live.async_execute_sleep_number_command.side_effect = record
+    with (
+        patch.object(services, "_resolve_sided_targets", return_value=([(parent, "right")], [])),
+        patch.object(services, "_validation_controller", return_value=live),
+        patch.object(services, "_execute_sided", side_effect=execute),
+    ):
+        result = await services.handle_sleep_number_command(call(
+            hass, command="get_sleep_number_controls", parameters={"side": "right"}
+        ))
+    assert observed == ["right"]
+    assert result["results"] == {"right": {"level": 42}}

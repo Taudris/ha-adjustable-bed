@@ -135,6 +135,12 @@ NUMBER_DESCRIPTIONS: tuple[AdjustableBedNumberEntityDescription, ...] = (
 )
 
 
+_POSITION_ENTITY_KEYS = frozenset(
+    [description.key for description in NUMBER_DESCRIPTIONS]
+    + [f"{axis}_position_{side}" for axis in ("back", "legs") for side in ("left", "right")]
+)
+
+
 @dataclass(frozen=True, kw_only=True)
 class AdjustableBedMassageNumberEntityDescription(NumberEntityDescription):
     """Describes an Adjustable Bed massage intensity number entity."""
@@ -334,9 +340,7 @@ def _number_entities_for(
             hass,
             coordinator,
             stale_keys=frozenset(
-                description.key
-                for description in NUMBER_DESCRIPTIONS
-                if description.key not in supported_keys
+                key for key in _POSITION_ENTITY_KEYS if key not in supported_keys
             ),
         )
     elif bed_type == BED_TYPE_SLEEPSTAR:
@@ -654,11 +658,9 @@ def _async_remove_stale_position_entities(
     that now linger as dead orphaned numbers (#322, #344).
     """
     registry = er.async_get(hass)
-    for description in NUMBER_DESCRIPTIONS:
-        if stale_keys is not None and description.key not in stale_keys:
-            continue
+    for key in _POSITION_ENTITY_KEYS if stale_keys is None else stale_keys:
         entity_id = registry.async_get_entity_id(
-            "number", DOMAIN, coordinator.entity_unique_id(description.key)
+            "number", DOMAIN, coordinator.entity_unique_id(key)
         )
         if entity_id is not None:
             registry.async_remove(entity_id)

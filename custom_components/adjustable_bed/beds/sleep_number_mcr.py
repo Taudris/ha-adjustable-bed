@@ -213,7 +213,8 @@ class SleepNumberMcrController(BedController):
             advertised = classify_smartpump(
                 company.to_bytes(2, "little") + data, coordinator.address
             )
-            self._pump_model = str(advertised["model"])
+            if advertised["model"] != "unknown":
+                self._pump_model = str(advertised["model"])
         self._state: dict[str, object] = {}
         self._notify_started = False
         self._notify_callback: Callable[[str, float], None] | None = None
