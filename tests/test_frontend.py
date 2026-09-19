@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,6 +21,8 @@ from homeassistant.const import (
     EVENT_COMPONENT_LOADED,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.setup import async_setup_component
+from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
 
 from custom_components.adjustable_bed.const import DOMAIN
 from custom_components.adjustable_bed.frontend import (
@@ -235,13 +238,13 @@ async def test_register_frontend_uses_resource_and_module_hook(
         await hass.async_block_till_done()
 
     card_url = _card_url("3.3.0-abc123")
-    register_resource.assert_awaited_once_with(hass, card_url)
-    add_extra_js_url.assert_called_once_with(hass, card_url)
+    register_resource.assert_awaited_once_with(hass, CARD_URL)
+    add_extra_js_url.assert_called_once_with(hass, CARD_URL)
     static_paths = hass.http.async_register_static_paths.await_args.args[0]
     assert [(item.url_path, item.cache_headers) for item in static_paths] == [
-        (CARD_URL, False),
         (card_url, True),
     ]
+    hass.http.register_view.assert_called_once()
     assert hass.data[DOMAIN][DATA_FRONTEND_REGISTERED] is True
 
 
@@ -273,7 +276,7 @@ async def test_register_frontend_falls_back_for_yaml_resources(
 
     add_extra_js_url.assert_called_once_with(
         hass,
-        _card_url("3.3.0-abc123"),
+        CARD_URL,
     )
     register_resource.assert_awaited_once()
     hass.http.async_register_static_paths.assert_awaited_once()
@@ -314,7 +317,7 @@ async def test_register_frontend_waits_for_late_dependencies(
         await hass.async_block_till_done()
         add_extra_js_url.assert_called_once_with(
             hass,
-            _card_url("3.3.0-abc123"),
+            CARD_URL,
         )
 
         hass.config.components.add("lovelace")
@@ -325,5 +328,72 @@ async def test_register_frontend_waits_for_late_dependencies(
         await hass.async_block_till_done()
         register_resource.assert_awaited_once_with(
             hass,
-            _card_url("3.3.0-abc123"),
+            CARD_URL,
         )
+
+
+@pytest.mark.parametrize("cache_key", ["3.7.1-old", "4.0.0-new"])
+async def test_card_loader_serves_current_bundle_through_http(
+    hass: HomeAssistant,
+    hass_client_no_auth: ClientSessionGenerator,
+    tmp_path: Path,
+    cache_key: str,
+) -> None:
+    """Cold clients and saved old URLs load the bundle without authentication."""
+    card = tmp_path / CARD_FILENAME
+    bundle = b'customElements.define("test-bed-card", class extends HTMLElement {});'
+    card.write_bytes(bundle)
+    assert await async_setup_component(hass, "http", {})
+
+    with (
+        patch("custom_components.adjustable_bed.frontend._dist_dir", return_value=tmp_path),
+        patch(
+            "custom_components.adjustable_bed.frontend._gather",
+            return_value=(True, "test", cache_key),
+        ),
+    ):
+        await async_register_frontend(hass)
+
+    client = await hass_client_no_auth()
+    current_url = _card_url(cache_key)
+    for url in (CARD_URL, f"{CARD_URL}?v=3.2.1", _card_url("3.6.0-stale")):
+        response = await client.get(url)
+        assert response.status == 200
+        assert response.content_type == "text/javascript"
+        assert response.headers["Cache-Control"] == "no-store"
+        assert await response.text() == f"import {json.dumps(current_url)};\n"
+
+    # The exact current route must win over the loader's version-path fallback.
+    response = await client.get(current_url)
+    assert response.status == 200
+    assert response.content_type == "text/javascript"
+    assert "max-age=" in response.headers["Cache-Control"]
+    assert await response.read() == bundle
+
+    # The fallback serves only the loader, never arbitrary integration files.
+    assert (await client.get(f"{URL_BASE}/manifest.json")).status == 404
+    assert (await client.get(f"{URL_BASE}/old/manifest.json")).status == 404
+
+
+async def test_resource_migration_preserves_permanent_workaround(
+    hass: HomeAssistant,
+) -> None:
+    """Restart keeps the working permanent URL and removes only old aliases."""
+    resources = ResourceStorageCollection(hass, LovelaceStorage(hass, None))
+    permanent = {CONF_ID: "manual", CONF_TYPE: "module", CONF_URL: CARD_URL}
+    await resources.store.async_save(
+        {
+            "items": [
+                {
+                    CONF_ID: "previous-auto-resource",
+                    CONF_TYPE: "module",
+                    CONF_URL: _card_url("3.7.1-previous"),
+                },
+                permanent,
+            ]
+        }
+    )
+    hass.data[LOVELACE_DATA] = LovelaceData("storage", {}, resources, {})
+
+    assert await _async_register_lovelace_resource(hass, CARD_URL)
+    assert resources.async_items() == [permanent]

@@ -5,6 +5,7 @@ This guide covers common issues and their solutions when using the Adjustable Be
 ## Table of Contents
 
 - [Connection Issues](#connection-issues)
+- [Dashboard Card Missing or Configuration Error](#dashboard-card-missing-or-configuration-error)
 - [Commands Not Working](#commands-not-working)
 - [Position Feedback Issues](#position-feedback-issues)
 - [Physical Remote Conflicts](#physical-remote-conflicts)
@@ -16,6 +17,70 @@ This guide covers common issues and their solutions when using the Adjustable Be
 - [Still Need Help?](#still-need-help)
 
 ---
+
+## Dashboard Card Missing or Configuration Error
+
+If the card is missing from the picker or says **Custom element doesn't exist:
+adjustable-bed-card**, its JavaScript has not loaded. This is separate from an
+unavailable bed or Bluetooth proxy, which should leave the card visible.
+
+The integration automatically registers this **JavaScript module** resource:
+
+```text
+/adjustable_bed_frontend/adjustable-bed-card.js
+```
+
+This permanent URL is a small, uncached loader for the current versioned bundle.
+It stays the same across integration updates. Previously registered versioned
+URLs also load the current bundle if the old version is no longer installed.
+Storage-mode setup consolidates old card resources into the permanent URL.
+If you manage resources in YAML, you can explicitly add it under your existing
+`lovelace:` configuration:
+
+```yaml
+lovelace:
+  resources:
+    - url: /adjustable_bed_frontend/adjustable-bed-card.js
+      type: module
+```
+
+After updating the integration and restarting Home Assistant, reload the page
+or fully close and reopen the Companion app. A page already running JavaScript
+from an older version cannot replace its registered custom element in place.
+
+If the problem persists:
+
+1. Open the permanent URL on the **same Home Assistant address** used by the
+   failing browser/app. It should return an `import` statement. Open the path in
+   that statement too; it should return JavaScript, not a login page or a 404.
+2. Check **Settings → Dashboards → Resources** (enable Advanced mode in your
+   profile if needed). There should be one Adjustable Bed resource using the
+   permanent URL above, with type **JavaScript module**.
+3. Check **Settings → System → Logs** and the browser console. In particular,
+   loading both Mushroom and Mushroom Better Sliders causes duplicate
+   `mushroom-select` registration errors. The [Better Sliders author explicitly
+   requires disabling the original Mushroom](https://github.com/RubenKremer/lovelace-mushroom-better-sliders#what-is-mushroom-better-sliders).
+   Keep only the variant you use. This conflict is distinct from a failed
+   Adjustable Bed module request.
+4. If an old failed response is still cached, reset the Companion app's frontend
+   cache once after correcting the resource. Repeated cache resets are not a
+   lasting fix for a missing URL or a JavaScript exception.
+
+When reporting a remaining failure, include the expanded configuration error,
+Home Assistant and Companion app versions, resource URL, and any failed module
+request's HTTP status or console exception. A BLE support bundle alone cannot
+show why browser JavaScript failed to load.
+
+### Related upstream reports
+
+- [Home Assistant frontend #52570](https://github.com/home-assistant/frontend/issues/52570)
+  documents custom-module loading races, especially panel views and custom
+  dashboard strategies. Resource registration alone does not guarantee that
+  every dashboard waits for the module.
+- [Home Assistant core #181190](https://github.com/home-assistant/core/issues/181190)
+  reports long-lived cached 404 responses in its static-file handler on
+  2026.9.0. This is relevant when investigating a failed request, but does not
+  establish the cause of earlier failures on 2026.8.2.
 
 ## Connection Issues
 

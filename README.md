@@ -184,6 +184,9 @@ HACS/Lovelace resource manually. If Home Assistant was open in your browser
 during an integration update, reload that page once after restarting Home
 Assistant so the browser picks up the updated card module.
 
+If the card is missing or shows a configuration error, see the
+[dashboard card troubleshooting guide](docs/TROUBLESHOOTING.md#dashboard-card-missing-or-configuration-error).
+
 To add it: edit a dashboard → **Add Card** → search for **Adjustable Bed**, then
 pick your bed device. On Home Assistant 2026.6 or newer, selecting one of the
 bed's entities first also suggests the Adjustable Bed Card. Or in YAML:
