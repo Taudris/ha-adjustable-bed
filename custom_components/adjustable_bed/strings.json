@@ -344,6 +344,10 @@
           "address": "MAC address in format XX:XX:XX:XX:XX:XX"
         }
       },
+      "scan": {
+        "title": "Scanning for beds",
+        "description": "Looking for nearby Bluetooth beds…"
+      },
       "setup_progress": {
         "title": "Checking the connection",
         "description": "Checking **{name}** ({address})…"
@@ -2663,6 +2667,12 @@
     },
     "side_not_supported": {
       "message": "This is a single bed; the Left/Right/Both option only applies to paired beds."
+    },
+    "side_unavailable": {
+      "message": "The selected bed side is unavailable"
+    },
+    "side_selection_conflict": {
+      "message": "The selected {inferred_side} child device conflicts with side {side}"
     },
     "side_not_available": {
       "message": "This bed has no {side} side."

@@ -248,7 +248,11 @@ def _resolve_sided_target(
             if domain == DOMAIN
         }
         if inferred_side is None and not identifiers.intersection(parent_identifiers):
-            raise ServiceValidationError("The selected bed side is unavailable")
+            raise ServiceValidationError(
+                "The selected bed side is unavailable",
+                translation_domain=DOMAIN,
+                translation_key="side_unavailable",
+            )
     return coordinator, inferred_side
 
 
@@ -275,7 +279,10 @@ def _resolve_sided_targets(
         coordinator, inferred_side = resolved
         if inferred_side is not None and explicit_side is not None and explicit_side != inferred_side:
             raise ServiceValidationError(
-                f"The selected {inferred_side} child device conflicts with side {explicit_side}"
+                f"The selected {inferred_side} child device conflicts with side {explicit_side}",
+                translation_domain=DOMAIN,
+                translation_key="side_selection_conflict",
+                translation_placeholders={"inferred_side": inferred_side, "side": explicit_side},
             )
         key = id(coordinator)
         if key not in by_key:

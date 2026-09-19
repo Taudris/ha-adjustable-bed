@@ -130,6 +130,70 @@ async def test_cancelled_restore_reattaches_entities_after_removal_event(hass):
             assert getattr(current, key) == getattr(row, key)
 
 
+async def test_restore_rejects_already_removed_child_without_waiting(hass):
+    entry, _, originals, _ = migrated_pair(hass)
+    registry = dr.async_get(hass)
+    child = registry.async_get(originals[0].id)
+    registry.async_remove_device(child.id)
+    with pytest.raises(ValueError, match="no longer exists"):
+        async with asyncio.timeout(1):
+            await async_restore_full_device(hass, entry, child, "left")
+
+
+async def test_restore_times_out_missing_removal_event_and_recovers_rows(hass):
+    entry, rows, originals, _ = migrated_pair(hass)
+    registry = dr.async_get(hass)
+    child = registry.async_get(originals[0].id)
+    fire = hass.bus.async_fire_internal
+
+    def omit_remove(event_type, data=None, *args, **kwargs):
+        if event_type == dr.EVENT_DEVICE_REGISTRY_UPDATED and data["action"] == "remove":
+            return
+        fire(event_type, data, *args, **kwargs)
+
+    registry.async_config_entry_unloaded(entry.entry_id)
+    with (
+        patch("custom_components.adjustable_bed.paired_devices.DEVICE_REMOVAL_TIMEOUT", 0.01),
+        patch.object(type(hass.bus), "async_fire_internal", side_effect=omit_remove),
+        pytest.raises(TimeoutError),
+    ):
+        await async_restore_full_device(hass, entry, child, "left")
+    assert isinstance(registry.async_get(child.id), dr.ChildDeviceEntry)
+    for row in rows:
+        assert er.async_get(hass).async_get(row.entity_id).device_id == row.device_id
+
+
+@pytest.mark.parametrize("after", [False, True])
+async def test_child_rollback_failure_preserves_original_error_and_entity_rows(hass, after):
+    entry, rows, originals, _ = migrated_pair(hass)
+    registry = dr.async_get(hass)
+    child = registry.async_get(originals[0].id)
+    create_child = registry.async_get_or_create_child
+
+    def fail(**kwargs):
+        if after:
+            create_child(**kwargs)
+        raise RuntimeError("rollback failed")
+
+    registry.async_config_entry_unloaded(entry.entry_id)
+    with (
+        patch.object(registry, "async_get_or_create", side_effect=RuntimeError("original failure")),
+        patch.object(registry, "async_get_or_create_child", side_effect=fail),
+        pytest.raises(RuntimeError, match="original failure"),
+    ):
+        await async_restore_full_device(hass, entry, child, "left")
+    await hass.async_block_till_done()
+    for row in rows:
+        current = er.async_get(hass).async_get(row.entity_id)
+        assert current.id == row.id
+        assert current.unique_id == row.unique_id
+        if after or row.device_id != child.id:
+            assert current.device_id == row.device_id
+        else:
+            # An absent device cannot own rows. Keep them for the caller's reload.
+            assert current.device_id is None
+
+
 @pytest.mark.parametrize("single_address", [False, True])
 async def test_native_child_service_targets_are_side_safe(hass, single_address):
     from homeassistant.config_entries import ConfigEntryState
@@ -180,16 +244,19 @@ async def test_native_child_service_targets_are_side_safe(hass, single_address):
             (coordinator, "both")
         ]
         assert _resolve_sided_targets(hass, [left.id, right.id], None)[0] == [(coordinator, "both")]
-        with pytest.raises(ServiceValidationError, match="conflicts"):
+        with pytest.raises(ServiceValidationError, match="conflicts") as error:
             _resolve_sided_targets(hass, [left.id], "right")
+        assert error.value.translation_key == "side_selection_conflict"
+        assert error.value.translation_placeholders == {"inferred_side": "left", "side": "right"}
         with pytest.raises(ServiceValidationError, match="conflicts"):
             _resolve_sided_targets(hass, [left.id], "both")
         with pytest.raises(ServiceValidationError) as error:
             _resolve_sided_targets(hass, [left.id, "missing"], None)
         assert error.value.translation_key == "service_device_not_found"
         await coordinator.async_remove_child("left")
-        with pytest.raises(ServiceValidationError, match="side is unavailable"):
+        with pytest.raises(ServiceValidationError, match="side is unavailable") as error:
             _resolve_sided_targets(hass, [left.id], None)
+        assert error.value.translation_key == "side_unavailable"
     finally:
         entry.mock_state(hass, ConfigEntryState.NOT_LOADED)
         await coordinator.async_shutdown()

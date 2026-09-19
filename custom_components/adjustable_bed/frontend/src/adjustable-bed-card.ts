@@ -199,11 +199,14 @@ export class AdjustableBedCard extends LitElement {
   private _renderSections(
     bed: BedEntities,
     graphicTone: BedGraphicTone = "theme",
+    graphicOverride?: typeof nothing | TemplateResult,
   ): (typeof nothing | TemplateResult)[] {
     const c = this._config!;
     const render: Record<string, () => typeof nothing | TemplateResult> = {
       graphic: () =>
-        c.show_graphic !== false ? this._graphic(bed, graphicTone) : nothing,
+        c.show_graphic !== false
+          ? (graphicOverride ?? this._graphic(bed, graphicTone))
+          : nothing,
       motors: () => (c.show_motors !== false ? this._motors(bed) : nothing),
       firmness: () => (c.show_firmness !== false ? this._firmness(bed) : nothing),
       presets: () => (c.show_presets !== false ? this._presets(bed) : nothing),
@@ -325,10 +328,11 @@ export class AdjustableBedCard extends LitElement {
           )}
         </div>
         <div class="pane" role="tabpanel" aria-label=${active.label}>
-          ${combined && this._config?.show_graphic !== false
-            ? this._pairedOverview(sidePanes)
-            : nothing}
-          ${this._renderSections(active.bed, active.graphicTone)}
+          ${this._renderSections(
+            active.bed,
+            active.graphicTone,
+            combined ? this._pairedOverview(sidePanes) : undefined,
+          )}
           ${combined && this._config?.show_lighting !== false
             ? this._combinedLighting(active.bed, sidePanes)
             : nothing}
@@ -739,8 +743,10 @@ export class AdjustableBedCard extends LitElement {
 
   private _motors(bed: BedEntities): typeof nothing | TemplateResult {
     const motors = bed.motors.filter((m) => m.cover || m.up || m.down);
-    // Keep target numbers settable even when the same motor has movement controls.
-    const positionRows = bed.motors.filter((m) => m.position);
+    // Motors with movement controls open their position setter from the label.
+    const positionRows = bed.motors.filter(
+      (m) => m.position && !m.cover && !m.up && !m.down,
+    );
     if (
       motors.length === 0 &&
       positionRows.length === 0 &&
@@ -795,12 +801,19 @@ export class AdjustableBedCard extends LitElement {
     const upId = m.cover ?? m.up;
     const downId = m.cover ?? m.down;
     const canStop = !!m.cover || !!stopId;
+    const label = html`
+      <span>${this._motorName(m)}</span>
+      ${readout ? html`<span class="readout">${readout}</span>` : nothing}
+    `;
     return html`
       <div class="row">
-        <div class="row-label">
-          <span>${this._motorName(m)}</span>
-          ${readout ? html`<span class="readout">${readout}</span>` : nothing}
-        </div>
+        ${m.position
+          ? html`<button
+              class="row-label position-label"
+              aria-label=${this._name(m.position)}
+              @click=${() => this._moreInfo(m.position!)}
+            >${label}</button>`
+          : html`<div class="row-label">${label}</div>`}
         <div class="control-group">
           <button
             class="cg-btn"
@@ -1809,6 +1822,21 @@ export class AdjustableBedCard extends LitElement {
     .row-label .readout {
       color: var(--secondary-text-color);
       font-size: 0.82rem;
+    }
+    .position-label {
+      border: 0;
+      border-radius: 4px;
+      padding: 0;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      text-align: start;
+      cursor: pointer;
+    }
+    .position-label .readout {
+      color: var(--primary-color);
+      text-decoration: underline dotted;
+      text-underline-offset: 3px;
     }
     .control-group {
       display: inline-flex;

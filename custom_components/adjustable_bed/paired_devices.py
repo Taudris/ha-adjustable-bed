@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING
 
 from homeassistant.core import Event, HomeAssistant, callback
@@ -18,6 +19,8 @@ if TYPE_CHECKING:
     from .paired_coordinator import PairedBedCoordinator
 
 KEY_PHYSICAL_DEVICES = "pair_physical_devices"
+DEVICE_REMOVAL_TIMEOUT = 5.0
+_LOGGER = logging.getLogger(__name__)
 _METADATA_FIELDS = (
     "name",
     "manufacturer",
@@ -109,8 +112,13 @@ async def async_restore_full_device(
     """
     registry = dr.async_get(hass)
     entities = er.async_get(hass)
+    if registry.async_get(device.id) is None:
+        raise ValueError(f"Child device {device.id} no longer exists")
     rows = tuple(er.async_entries_for_device(entities, device.id, include_disabled_entities=True))
     removed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    removal_completed = False
+    restore_succeeded = False
+    deadline = asyncio.get_running_loop().time() + DEVICE_REMOVAL_TIMEOUT
 
     @callback
     def on_removed(event: Event[dr.EventDeviceRegistryUpdatedData]) -> None:
@@ -123,7 +131,9 @@ async def async_restore_full_device(
         for row in rows:
             entities.async_update_entity(row.entity_id, device_id=None)
         registry.async_remove_device(device.id)
-        await asyncio.shield(removed)
+        removal_completed = True
+        async with asyncio.timeout_at(deadline):
+            await asyncio.shield(removed)
         metadata = entry.data.get(KEY_PHYSICAL_DEVICES, {}).get(side, {})
         restored = registry.async_get_or_create(
             config_entry_id=entry.entry_id,
@@ -133,22 +143,41 @@ async def async_restore_full_device(
         )
         if restored.id != device.id:
             raise RuntimeError("Home Assistant did not restore the original side device id")
+        restore_succeeded = True
         return restored
     finally:
         try:
             if registry.async_get(device.id) is None:
                 # Roll back a failed restore before reattaching rows. The removal
                 # event must finish first, including on cancellation.
-                if not removed.done():
-                    await asyncio.shield(removed)
+                if removal_completed and not removed.done():
+                    try:
+                        async with asyncio.timeout_at(deadline):
+                            await asyncio.shield(removed)
+                    except TimeoutError:
+                        _LOGGER.warning("Device removal event missing for %s", device.id)
                 registry.async_get_or_create_child(
                     config_entry_id=entry.entry_id,
                     identifiers=set(device.identifiers),
                     parent_device_id=device.parent_device_id,
                     name=device.name,
                 )
-            for row in rows:
-                entities.async_update_entity(row.entity_id, device_id=device.id)
+        except Exception:
+            _LOGGER.exception("Could not restore child device %s during rollback", device.id)
         finally:
-            unsub()
-            registry.async_config_entry_unloaded(entry.entry_id)
+            try:
+                reattach_error: Exception | None = None
+                if registry.async_get(device.id) is not None:
+                    for row in rows:
+                        try:
+                            entities.async_update_entity(row.entity_id, device_id=device.id)
+                        except Exception as err:
+                            reattach_error = reattach_error or err
+                            _LOGGER.exception("Could not reattach entity %s", row.entity_id)
+                else:
+                    _LOGGER.error("Device %s is missing; entity rows retained for recovery", device.id)
+                if restore_succeeded and reattach_error is not None:
+                    raise reattach_error
+            finally:
+                unsub()
+                registry.async_config_entry_unloaded(entry.entry_id)

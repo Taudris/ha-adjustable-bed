@@ -49,7 +49,7 @@ async def test_explicit_scan_is_one_cancellable_progress_operation(hass, cancel)
             await task
             result = await flow.async_step_scan()
             assert result["type"] == FlowResultType.SHOW_PROGRESS_DONE
-            assert result["step_id"] == "user"
+            assert result["step_id"] == "scan_result"
 
 
 def test_reachability_is_redacted_and_optional(hass):
@@ -149,15 +149,19 @@ async def test_scan_failure_returns_to_selection_with_actionable_error(hass):
     with patch(
         "custom_components.adjustable_bed.config_flow.bluetooth.async_request_active_scan",
         side_effect=RuntimeError("unloaded"),
-    ):
+    ) as request:
         result = await flow.async_step_user({CONF_ADDRESS: "scan"})
         task = result["progress_task"]
         assert task is not None
         await task
         result = await flow.async_step_scan()
-    assert result["type"] == FlowResultType.SHOW_PROGRESS_DONE
+        assert result["type"] == FlowResultType.SHOW_PROGRESS_DONE
+        assert result["step_id"] == "scan_result"
+        result = await flow.async_step_scan_result({CONF_ADDRESS: "scan"})
+        request.assert_awaited_once_with(hass)
+    assert result["type"] == FlowResultType.FORM
     assert result["step_id"] == "user"
-    assert flow._scan_error == "scan_failed"
+    assert result["errors"] == {"base": "scan_failed"}
 
 
 @pytest.mark.parametrize("found", [False, True])
@@ -182,7 +186,7 @@ async def test_scan_refreshes_candidates_and_keeps_manual_setup(
         patch(
             "custom_components.adjustable_bed.config_flow.bluetooth.async_request_active_scan",
             side_effect=scan,
-        ),
+        ) as request,
     ):
         first = await flow.async_step_user()
         assert first["type"] == FlowResultType.FORM
@@ -192,13 +196,22 @@ async def test_scan_refreshes_candidates_and_keeps_manual_setup(
         assert task is not None
         await task
         await flow.async_step_scan()
-        refreshed = await flow.async_step_user()
+        refreshed = await flow.async_step_scan_result({CONF_ADDRESS: "scan"})
+        assert refreshed["type"] == FlowResultType.FORM
+        assert refreshed["step_id"] == "user"
+        request.assert_awaited_once_with(hass)
         schema = refreshed["data_schema"]
         assert schema is not None
         assert schema({CONF_ADDRESS: "manual"}) == {CONF_ADDRESS: "manual"}
         assert bool(flow._discovered_devices) is found
         if found:
             assert schema({CONF_ADDRESS: mock_bluetooth_service_info.address})
+        # A subsequent deliberate scan still starts a fresh operation.
+        progress = await flow.async_step_user({CONF_ADDRESS: "scan"})
+        task = progress["progress_task"]
+        assert task is not None
+        await task
+        assert request.await_count == 2
 
 
 async def test_raw_bundle_preserves_reachability_addresses_without_loaded_entry(hass):

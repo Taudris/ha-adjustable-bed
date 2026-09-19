@@ -2396,8 +2396,14 @@ class AdjustableBedConfigFlow(BluetoothOperationMixin, ConfigFlow, domain=DOMAIN
             return OperationResult(outcome=OperationOutcome.SUCCESS)
 
         return await self.async_run_operation_step(
-            step_id="scan", worker=scan, next_step_id="user",
+            step_id="scan", worker=scan, next_step_id="scan_result",
         )
+
+    async def async_step_scan_result(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Refresh selection without replaying the input that started the scan."""
+        return await self.async_step_user()
 
     def _pairable_single_entries(self) -> list[ConfigEntry]:
         """Configured single-bed entries that could be combined into a pair.
