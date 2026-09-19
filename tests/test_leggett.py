@@ -222,7 +222,7 @@ class TestLeggettOkinController:
         descriptions = {description.key: description for description in BUTTON_DESCRIPTIONS}
         assert not _should_add_button(descriptions["preset_zero_g"], controller, True)
         assert not _should_add_button(descriptions["program_memory_3"], controller, True)
-        assert _should_add_button(descriptions["control_mode_press_and_hold"], controller, True)
+        assert not _should_add_button(descriptions["control_mode_press_and_hold"], controller, True)
         assert _should_add_button(descriptions["control_mode_press_and_release"], controller, True)
 
     async def test_massage_wave_mode_is_advertised_and_sends_release(self):
@@ -288,6 +288,7 @@ class TestLeggettOkinController:
         coordinator.motor_pulse_count = 10
         coordinator.motor_pulse_delay_ms = 100
         coordinator.client = self._controller_with_characteristics().client
+        coordinator.cancel_command = asyncio.Event()
         controller = LeggettOkinController(coordinator)
         controller.write_command = AsyncMock()
 
@@ -361,8 +362,11 @@ class TestLeggettOkinController:
     async def test_control_modes_use_the_exact_special_command_lifecycle(
         self, method_name: str, command_hex: str
     ):
-        """Each persistent mode is 55 attempts followed by one explicit zero."""
-        controller = self._controller_with_characteristics()
+        """Prodigy 2 retains the app's 55 attempts and one explicit zero."""
+        controller = LeggettOkinController(
+            self._controller_with_characteristics()._coordinator, app_profile="prodigy2"
+        )
+        controller._wait_hold_deadline = AsyncMock()
         controller.write_command = AsyncMock()
 
         assert controller.supports_control_mode_configuration is True
@@ -585,6 +589,7 @@ class TestLeggettOkinController:
         coordinator.client = self._controller_with_characteristics().client
         controller = LeggettOkinController(coordinator)
         controller.write_command = AsyncMock(side_effect=[None, BleakError("release failed")])
+        coordinator.cancel_command = asyncio.Event()
 
         with pytest.raises(BleakError, match="release failed"):
             await getattr(controller, action)()

@@ -324,7 +324,7 @@ async def test_slow_transport_does_not_extend_held_refresh_past_deadline():
 
 
 async def test_control_mode_zero_waits_for_the_next_tick_after_55_attempts():
-    controller = make_controller()
+    controller = make_controller("prodigy2")
     started = asyncio.get_running_loop().time()
     await controller.set_control_mode_press_and_hold()
     deadline = controller._wait_hold_deadline.await_args.args[0]
@@ -388,3 +388,183 @@ async def test_useries_one_shot_presets_require_explicit_hold():
     with pytest.raises(NotImplementedError, match="leggett_hold_control"):
         await controller.preset_anti_snore()
     controller.write_command.assert_not_awaited()
+
+
+def cu170_status(mask: int) -> bytearray:
+    """Synthetic vector for the 20-byte hardware layout reported in #368."""
+    field = mask.to_bytes(4, "big")
+    return bytearray(b"\x09\x0b" + field + field + b"\xff" + bytes(9))
+
+
+def report_cu170(controller, mask):
+    controller._handle_notification(LEGGETT_OKIN_NOTIFY_CHAR_UUID, cu170_status(mask))
+
+
+def test_cu170_receipt_then_spontaneous_status_uses_latest_state():
+    controller = make_controller()
+    updates = controller._coordinator.handle_controller_state_updates
+    report_cu170(controller, 0)
+    report_cu170(controller, 0)  # Receipt precedes the effect of the toggle.
+    report_cu170(controller, 0xC20000)
+    assert updates.call_args.args[0] == {
+        "leggett_led_mask": 0xC20000,
+        "leggett_status": None,
+        "leggett_alarm_indicator": True,
+        "leggett_sleep_timer_indicator": True,
+        "under_bed_lights_on": True,
+    }
+    assert controller.protocol_diagnostics["alarm_armed"] is True
+    assert controller.protocol_diagnostics["sleep_timer_armed"] is True
+    report_cu170(controller, 0x800000)
+    assert controller.protocol_diagnostics["under_bed_lights_on"] is False
+    assert controller.protocol_diagnostics["alarm_armed"] is False
+    assert controller.protocol_diagnostics["sleep_timer_armed"] is True
+
+
+@pytest.mark.parametrize("mutation", ["short", "footer", "duplicate"])
+def test_malformed_cu170_status_cannot_change_known_state(mutation):
+    controller = make_controller()
+    report_cu170(controller, 0x20000)
+    payload = cu170_status(0)
+    if mutation == "short":
+        payload.pop()
+    elif mutation == "footer":
+        payload[10] = 0
+    else:
+        payload[6] = 1
+    controller._handle_notification(LEGGETT_OKIN_NOTIFY_CHAR_UUID, payload)
+    assert controller.protocol_diagnostics["under_bed_lights_on"] is True
+
+
+@pytest.mark.parametrize("profile", ["prodigy2", "prodigy2l", "useries"])
+def test_cu170_hardware_mapping_does_not_leak_to_other_profiles(profile):
+    controller = make_controller(profile)
+    report_cu170(controller, 0x20000)
+    assert not controller.supports_light_state_feedback
+    assert "under_bed_lights_on" not in (
+        controller._coordinator.handle_controller_state_updates.call_args.args[0]
+    )
+
+
+def test_css_channel_cannot_override_cu170_light_state():
+    controller = make_controller()
+    controller._handle_notification(OKIN_SMART_REMOTE_CSS_NOTIFY_CHAR_UUID, cu170_status(0))
+    assert controller.protocol_diagnostics["under_bed_lights_on"] is None
+    report_cu170(controller, 0x20000)
+    controller._handle_notification(OKIN_SMART_REMOTE_CSS_NOTIFY_CHAR_UUID, cu170_status(0))
+    assert controller.protocol_diagnostics["under_bed_lights_on"] is True
+
+
+async def test_light_on_off_waits_for_spontaneous_state_and_is_idempotent():
+    controller = make_controller()
+    report_cu170(controller, 0)
+    controller._tap_keycode = AsyncMock()
+    task = asyncio.create_task(controller.lights_on())
+    await asyncio.sleep(0)
+    report_cu170(controller, 0)  # Old-state receipt is not confirmation.
+    await asyncio.sleep(0)
+    assert not task.done()
+    report_cu170(controller, 0x20000)
+    await task
+    await controller.lights_on()
+    controller._tap_keycode.assert_awaited_once()
+    task = asyncio.create_task(controller.lights_off())
+    await asyncio.sleep(0)
+    report_cu170(controller, 0)
+    await task
+    await controller.lights_off()
+    assert controller._tap_keycode.await_count == 2
+
+
+async def test_unknown_or_unconfirmed_light_state_never_causes_a_retry_toggle():
+    from homeassistant.exceptions import HomeAssistantError
+
+    controller = make_controller()
+    with pytest.raises(HomeAssistantError, match="unknown"):
+        await controller.lights_on()
+    controller.write_command.assert_not_awaited()
+    report_cu170(controller, 0)
+    controller._tap_keycode = AsyncMock()
+    with (
+        patch("custom_components.adjustable_bed.beds.leggett_okin.LIGHT_STATE_TIMEOUT_S", 0),
+        pytest.raises(HomeAssistantError, match="did not confirm"),
+    ):
+        await controller.lights_on()
+    controller._tap_keycode.assert_awaited_once()
+    with pytest.raises(HomeAssistantError, match="unknown"):
+        await controller.lights_on()
+    controller._tap_keycode.assert_awaited_once()
+
+
+async def test_disconnect_invalidates_cu170_light_state():
+    controller = make_controller()
+    report_cu170(controller, 0x20000)
+    await controller.stop_notify()
+    assert controller.protocol_diagnostics["under_bed_lights_on"] is None
+    controller._coordinator.handle_controller_state_update.assert_called_with(
+        "under_bed_lights_on", None
+    )
+
+
+async def test_tap_waits_one_scheduler_interval_before_release_and_cleans_up_on_cancel():
+    controller = make_controller()
+    waiting = asyncio.Event()
+    release_wait = asyncio.Event()
+    deadlines = []
+
+    async def wait(deadline):
+        deadlines.append(deadline)
+        waiting.set()
+        await release_wait.wait()
+
+    controller._wait_hold_deadline = wait
+    started = asyncio.get_running_loop().time()
+    task = asyncio.create_task(controller.lights_toggle())
+    await waiting.wait()
+    assert deadlines[0] >= started + 0.1
+    assert controller.write_command.await_count == 1
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release = controller.write_command.await_args_list[-1]
+    assert release.args[0] == bytes.fromhex("040200000000")
+    assert release.kwargs["repeat_count"] == 4
+    assert not release.kwargs["cancel_event"].is_set()
+
+
+async def test_cu170_reset_chord_is_not_exposed_and_cannot_be_sent():
+    from homeassistant.exceptions import HomeAssistantError
+
+    from custom_components.adjustable_bed.button import BUTTON_DESCRIPTIONS, _should_add_button
+
+    controller = make_controller()
+    descriptions = {item.key: item for item in BUTTON_DESCRIPTIONS}
+    assert not _should_add_button(descriptions["control_mode_press_and_hold"], controller, True)
+    assert _should_add_button(descriptions["control_mode_press_and_release"], controller, True)
+    with pytest.raises(HomeAssistantError, match="factory-reset"):
+        await controller.set_control_mode_press_and_hold()
+    controller.write_command.assert_not_awaited()
+    await controller.set_control_mode_press_and_release()
+    assert controller.write_command.await_args_list[0].args[0] == bytes.fromhex("040201800000")
+
+
+@pytest.mark.parametrize("error", [None, BleakError("unsubscribe failed"), asyncio.CancelledError()])
+async def test_notifications_during_or_after_shutdown_cannot_restore_state(error):
+    controller = make_controller()
+    controller._notify_started.add(LEGGETT_OKIN_NOTIFY_CHAR_UUID)
+    report_cu170(controller, 0x20000)
+
+    async def unsubscribe(uuid):
+        report_cu170(controller, 0x20000)
+        if error is not None:
+            raise error
+
+    controller.client.stop_notify.side_effect = unsubscribe
+    if isinstance(error, asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError):
+            await controller.stop_notify()
+    else:
+        await controller.stop_notify()
+    report_cu170(controller, 0x20000)
+    assert controller.get_light_state() == {"is_on": None}
+    assert controller.protocol_diagnostics["notification_led_mask"] is None

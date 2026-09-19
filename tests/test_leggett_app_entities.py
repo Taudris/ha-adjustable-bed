@@ -1,15 +1,17 @@
 """Home Assistant entity surfaces for the accepted Prodigy and U-series apps."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.components.cover import CoverEntityFeature
 from homeassistant.const import CONF_ADDRESS, CONF_NAME
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.adjustable_bed.beds.leggett_okin import LeggettOkinController
 from custom_components.adjustable_bed.const import (
     BED_TYPE_LEGGETT_OKIN,
     BED_TYPE_LINAK,
@@ -121,6 +123,13 @@ async def test_profile_limits_axes_memories_and_control_modes(
     hass, mock_coordinator_connected, app_ble, enable_custom_integrations, profile, axes
 ):
     entry = _entry(hass, profile)
+    if profile == "prodigy4":
+        er.async_get(hass).async_get_or_create(
+            "button",
+            DOMAIN,
+            f"{ADDRESS}_control_mode_press_and_hold",
+            config_entry=entry,
+        )
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     assert _keys(hass, entry, "cover") == axes
@@ -137,6 +146,8 @@ async def test_profile_limits_axes_memories_and_control_modes(
     assert {key for key in buttons if key.startswith("control_mode_")} == (
         set()
         if profile == "useries"
+        else {"control_mode_press_and_release"}
+        if profile == "prodigy4"
         else {"control_mode_press_and_hold", "control_mode_press_and_release"}
     )
     subscriptions = {call.args[0] for call in app_ble.start_notify.await_args_list}
@@ -255,3 +266,62 @@ async def test_indicator_readback_applies_only_useries_low_byte_suppression(
     assert int(hass.states.get(mask_id).state) == 0xC000
     assert hass.states.get(alarm_id).state == "on"
     assert hass.states.get(timer_id).state == "on"
+
+
+async def test_cu170_light_uses_live_state_and_keeps_unknown_state_toggle(
+    hass, mock_coordinator_connected, app_ble, enable_custom_integrations
+):
+    entry = _entry(hass, "prodigy4")
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    light_id = _entity_id(hass, "light", "under_bed_lights")
+    assert hass.states.get(light_id).state == "unknown"
+    assert "toggle_light" in _keys(hass, entry, "button")
+    assert "under_bed_lights" not in _keys(hass, entry, "switch")
+
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    controller = coordinator.controller
+    # Synthetic notifications from the reporter's documented hardware layout.
+    for payload, expected in [
+        ("090b0000000000000000ff000000000000000000", "off"),
+        ("090b0002000000020000ff000000000000000000", "on"),
+        ("090b0000000000000000ff000000000000000000", "off"),
+    ]:
+        controller._handle_notification(LEGGETT_OKIN_NOTIFY_CHAR_UUID, bytearray.fromhex(payload))
+        await hass.async_block_till_done()
+        assert hass.states.get(light_id).state == expected
+
+    app_ble.write_gatt_char.reset_mock()
+    await hass.services.async_call("light", "turn_off", {"entity_id": light_id}, blocking=True)
+    app_ble.write_gatt_char.assert_not_awaited()
+
+    # A known-state toggle must fail rather than retain stale telemetry.
+    with (
+        patch.object(controller, "_tap_keycode", new=AsyncMock()) as toggle,
+        patch("custom_components.adjustable_bed.beds.leggett_okin.LIGHT_STATE_TIMEOUT_S", 0),
+        pytest.raises(HomeAssistantError, match="did not confirm"),
+    ):
+        await hass.services.async_call("light", "toggle", {"entity_id": light_id}, blocking=True)
+    toggle.assert_awaited_once()
+    assert hass.states.get(light_id).state == "unknown"
+    # An explicit toggle remains usable before state is known.
+    with patch.object(controller, "_tap_keycode", new=AsyncMock()) as toggle:
+        await hass.services.async_call("light", "toggle", {"entity_id": light_id}, blocking=True)
+        toggle.assert_awaited_once()
+    await controller.stop_notify()
+    await hass.async_block_till_done()
+    assert hass.states.get(light_id).state == "unknown"
+
+    await controller.start_notify()
+    controller._handle_notification(
+        LEGGETT_OKIN_NOTIFY_CHAR_UUID,
+        bytearray.fromhex("090b0002000000020000ff000000000000000000"),
+    )
+    assert hass.states.get(light_id).state == "on"
+    coordinator._on_disconnect(coordinator.client)
+    assert hass.states.get(light_id).state == "unknown"
+    # A new connection must not revive the old coordinator telemetry cache.
+    coordinator._controller = LeggettOkinController(coordinator)
+    coordinator._notify_connection_state_change(True)
+    coordinator.handle_controller_state_updates({"unrelated": 1})
+    assert hass.states.get(light_id).state == "unknown"

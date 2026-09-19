@@ -1105,6 +1105,11 @@ class BedController(ABC):
         return type(self).lights_toggle is not BedController.lights_toggle
 
     @property
+    def supports_light_state_feedback(self) -> bool:
+        """Return True for an on/off light controlled using reported state."""
+        return False
+
+    @property
     def supports_discrete_light_control(self) -> bool:
         """Return True if bed has separate on/off light commands."""
         return False
@@ -1507,6 +1512,11 @@ class BedController(ABC):
     def supports_child_lock(self) -> bool:
         """Return True if the bed can toggle a handset child lock."""
         return False
+
+    @property
+    def supports_control_mode_press_and_hold(self) -> bool:
+        """Return whether selecting hold mode is safe on this controller."""
+        return self.supports_control_mode_configuration
 
     @property
     def supports_control_mode_configuration(self) -> bool:
