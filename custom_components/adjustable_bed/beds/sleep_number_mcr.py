@@ -234,7 +234,6 @@ class SleepNumberMcrController(BedController):
         # without the response bit set (byte 8 & 0x80) or with a different side
         # nibble, which the strict matcher would otherwise discard — leaving the
         # handshake to time out and the connection stuck in a reconnect loop.
-        self._accept_any_response = False
         # When an optional response times out, a delayed notification for the
         # same request key must not satisfy the next command. Keep the key
         # quarantined for a full timeout window after the miss so late replies
@@ -418,18 +417,22 @@ class SleepNumberMcrController(BedController):
             }
         )
         await self._async_read_pump_status()
-        await self._read_favorites()
+        with contextlib.suppress(ValueError):
+            await self._read_favorites()
         if 0x41 in self._nodes:
             self._foundation_features, state = decode_system(await self._mcr_request(0x42, 0x25))
             self._publish(state)
             await self._read_foundation()
             if self.supports_lights:
-                await self._async_read_underbed_light_state()
+                with contextlib.suppress(ValueError):
+                    await self._async_read_underbed_light_state()
             if self.supports_massage:
                 for side in ("left", "right"):
-                    await self._read_massage(side)
+                    with contextlib.suppress(ValueError):
+                        await self._read_massage(side)
             for side in self.footwarming_climate_sides:
-                await self._read_warming(side)
+                with contextlib.suppress(ValueError):
+                    await self._read_warming(side)
 
     async def set_sleep_number_setting_for_side(self, side: str, value: int) -> None:
         if side not in self.sleep_number_setting_sides:
@@ -1318,7 +1321,6 @@ class SleepNumberMcrController(BedController):
         timeout: float = 0.9,
         cancel_event: asyncio.Event | None = None,
         require_response: bool = True,
-        accept_any_response: bool = False,
     ) -> list[_McrFrame]:
         """Retry a missing response three times, as the MCR BlobCall does."""
         for attempt in range(4):
@@ -1333,7 +1335,6 @@ class SleepNumberMcrController(BedController):
                     timeout=timeout,
                     cancel_event=cancel_event,
                     require_response=require_response,
-                    accept_any_response=accept_any_response,
                 )
             except _ResponseTimeout:
                 if attempt == 3:
@@ -1352,7 +1353,6 @@ class SleepNumberMcrController(BedController):
         timeout: float = 0.9,
         cancel_event: asyncio.Event | None = None,
         require_response: bool = True,
-        accept_any_response: bool = False,
     ) -> list[_McrFrame]:
         """Write an MCR frame and wait for the matching notification response.
 
@@ -1389,7 +1389,6 @@ class SleepNumberMcrController(BedController):
         # parsing on the event loop sees the new key.
         self._outstanding_request_key = request_key
         self._outstanding_node = command_type
-        self._accept_any_response = accept_any_response
         self._response_buffer.clear()
         self._response_frames.clear()
         self._response_event.clear()
@@ -1452,7 +1451,6 @@ class SleepNumberMcrController(BedController):
         finally:
             self._outstanding_request_key = None
             self._outstanding_node = None
-            self._accept_any_response = False
 
     async def _async_write_frame(
         self, frame: bytes, *, cancel_event: asyncio.Event | None = None
@@ -1493,15 +1491,6 @@ class SleepNumberMcrController(BedController):
         raw = bytes(data)
         self.forward_raw_notification(SLEEP_NUMBER_MCR_TX_CHAR_UUID, raw)
         self._response_buffer.extend(raw)
-        if self._accept_any_response and self._outstanding_request_key is not None:
-            # Init handshake: mirror the reference implementation that works
-            # against this hardware. ANY notification confirms the bed is alive
-            # and primed, so wake the waiter immediately. This deliberately
-            # bypasses the strict (function_code, side, is_response) correlation
-            # below, which some firmware violates for the init echo (no response
-            # bit, or a different side nibble) — without this the frame is
-            # discarded before it reaches _response_frames and init times out.
-            self._response_event.set()
         parsed_frame = False
         for frame in self._extract_response_frames():
             parsed_frame = True

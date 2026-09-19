@@ -628,3 +628,26 @@ async def test_position_plan_rejects_ambiguous_axis_and_invalid_percentage(contr
         pytest.raises(ServiceValidationError),
     ):
         await _set_position_plan(coordinator, coordinator, [], motor, position)
+
+
+@pytest.mark.parametrize("failure", [ValueError("unsupported"), TimeoutError("transport")])
+async def test_optional_mcr_hydration_isolates_only_payload_failures(controller, failure):
+    from unittest.mock import patch
+
+    controller._mcr_request = AsyncMock(side_effect=[b"\x41", b"\x01\x00\x01\x00", b"system"])
+    controller._async_read_pump_status = AsyncMock()
+    controller._read_favorites = AsyncMock()
+    controller._read_foundation = AsyncMock()
+    controller._async_read_underbed_light_state = AsyncMock()
+    controller._read_massage = AsyncMock(side_effect=failure)
+    controller._read_warming = AsyncMock(side_effect=ValueError("payload"))
+    with patch("custom_components.adjustable_bed.beds.sleep_number_mcr.decode_system",
+               return_value=(controller._foundation_features, {})):
+        if isinstance(failure, TimeoutError):
+            with pytest.raises(TimeoutError):
+                await controller.query_config()
+            controller._read_warming.assert_not_awaited()
+        else:
+            await controller.query_config()
+            assert controller._read_massage.await_count == 2
+            assert controller._read_warming.await_count == 2
