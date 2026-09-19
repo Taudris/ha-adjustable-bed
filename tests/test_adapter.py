@@ -202,3 +202,46 @@ class TestReadBleDeviceInfo:
 
         assert manufacturer == "WLT"
         assert model == "WLT825X_H35"
+
+
+async def test_selection_uses_preferred_scanners_device_and_skips_excluded(hass):
+    from types import SimpleNamespace
+
+    from custom_components.adjustable_bed.adapter import select_adapter
+    from custom_components.adjustable_bed.bluetooth_transport import ConnectionPath
+
+    devices = [
+        SimpleNamespace(scanner=SimpleNamespace(source=source), ble_device=object())
+        for source in ("best", "preferred")
+    ]
+    with (
+        patch("custom_components.adjustable_bed.adapter.async_connection_paths", return_value=(
+            ConnectionPath(source="best", rssi=-40),
+            ConnectionPath(source="preferred", rssi=None),
+        )),
+        patch("custom_components.adjustable_bed.adapter.bluetooth.async_scanner_devices_by_address", return_value=devices),
+        patch("custom_components.adjustable_bed.adapter.get_ble_device_with_fallback") as fallback,
+    ):
+        selected = await select_adapter(hass, "AA:BB:CC:DD:EE:FF", "preferred")
+        assert selected.device is devices[1].ble_device
+        assert selected.source == "preferred"
+        assert selected.rssi is None
+        selected = await select_adapter(hass, "AA:BB:CC:DD:EE:FF", "preferred", {"preferred"})
+        assert selected.device is devices[0].ble_device
+        selected = await select_adapter(hass, "AA:BB:CC:DD:EE:FF", "auto", {"preferred", "best"})
+        assert selected.device is None
+        fallback.assert_not_called()
+
+
+async def test_removed_scanner_cannot_reintroduce_excluded_path(hass):
+    from custom_components.adjustable_bed.adapter import select_adapter
+    from custom_components.adjustable_bed.bluetooth_transport import ConnectionPath
+
+    with (
+        patch("custom_components.adjustable_bed.adapter.async_connection_paths", return_value=(ConnectionPath(source="gone"),)),
+        patch("custom_components.adjustable_bed.adapter.bluetooth.async_scanner_devices_by_address", side_effect=KeyError("gone")),
+        patch("custom_components.adjustable_bed.adapter.get_ble_device_with_fallback") as fallback,
+    ):
+        result = await select_adapter(hass, "AA:BB:CC:DD:EE:FF", "auto", {"excluded"})
+        assert result.device is None
+        fallback.assert_not_called()

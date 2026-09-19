@@ -25,7 +25,7 @@ from uuid import uuid4
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.device_registry import ChildDeviceInfo, DeviceInfo
 
 from .beds.base import BedController, SideBoundController
 from .command_scheduler import (
@@ -53,6 +53,7 @@ from .const import (
     requires_sequential_pairing,
 )
 from .entity_runtime import ControllerCommand, EntityRuntime, EntityRuntimeView
+from .paired_devices import child_device_info
 
 if TYPE_CHECKING:
     from bleak import BleakClient
@@ -1789,6 +1790,14 @@ class PairedSideProxy(EntityRuntimeView):
     @property
     def _entity_source(self) -> EntityRuntime:
         return self._pair_child
+
+    @property
+    def device_info(self) -> ChildDeviceInfo:
+        return child_device_info(self._pair_parent, self._pair_side)
+
+    @property
+    def entity_side(self) -> str:
+        return self._pair_side
 
     async def async_execute_controller_command(
         self, command_fn: ControllerCommand, *, cancel_running: bool = True,

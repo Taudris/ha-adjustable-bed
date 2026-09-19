@@ -25,6 +25,7 @@ from homeassistant.loader import async_get_integration
 from .adapter import RSSI_UNAVAILABLE, get_discovered_service_info
 from .ble_auth import is_ble_authentication_error
 from .ble_diagnostics import BLEDiagnosticRunner
+from .bluetooth_diagnostics import connection_reachability
 from .const import (
     ADAPTER_AUTO,
     CONF_BED_TYPE,
@@ -38,7 +39,7 @@ from .const import (
 )
 from .detection import detect_bed_type_detailed
 from .diagnostic_payloads import format_mapping_payloads
-from .redaction import redact_pins_only
+from .redaction import redact_pins_only, redact_string
 from .support_report import (
     _get_bluetooth_info,
     _get_connection_info,
@@ -188,7 +189,12 @@ async def _build_bluetooth_section(
     if coordinator is not None:
         info = await _get_bluetooth_info(hass, coordinator)
     else:
-        info = {"last_advertisement": None, "scanners": []}
+        info = {
+            "last_advertisement": None, "scanners": [],
+            "reachability": connection_reachability(hass, address),
+        }
+    if isinstance(reason := info.get("reachability"), str):
+        info["reachability"] = redact_string(reason)
 
     info["last_advertisement"] = diagnostics_report.get("advertisement")
     info["advertisements_by_source"] = diagnostics_report.get("advertisements_by_source", [])

@@ -20,6 +20,7 @@ from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.adjustable_bed import (
+    _async_ensure_paired_device_registry,
     _async_release_absorbed_singles,
     _async_update_listener,
     _build_paired_children,
@@ -687,9 +688,7 @@ class TestPairedSetup:
         row = ent_reg.async_get(row_id)
         assert row is not None
         assert row.config_entry_id == entry.entry_id
-        device = _device_for_entry_and_identifier(
-            dr.async_get(hass), entry.entry_id, (DOMAIN, LEFT_ADDR)
-        )
+        device = dr.async_get(hass).async_get_child_device_by_identifier((DOMAIN, LEFT_ADDR), entry.entry_id)
         assert device is not None
         assert device.config_entry_id == entry.entry_id
 
@@ -708,11 +707,11 @@ class TestPairedSetup:
         parent = _device_for_entry_and_identifier(registry, entry.entry_id, (DOMAIN, PAIR_ID))
         assert parent is not None
 
-        left = _device_for_entry_and_identifier(registry, entry.entry_id, (DOMAIN, LEFT_ADDR))
-        right = _device_for_entry_and_identifier(registry, entry.entry_id, (DOMAIN, RIGHT_ADDR))
+        left = registry.async_get_child_device_by_identifier((DOMAIN, LEFT_ADDR), entry.entry_id)
+        right = registry.async_get_child_device_by_identifier((DOMAIN, RIGHT_ADDR), entry.entry_id)
         assert left is not None and right is not None
-        assert left.via_device_id == parent.id
-        assert right.via_device_id == parent.id
+        assert left.parent_device_id == parent.id
+        assert right.parent_device_id == parent.id
 
     async def test_paired_entry_exposes_per_side_covers_and_combined_stop(
         self,
@@ -874,7 +873,7 @@ class TestPairedSetup:
         dev_reg = dr.async_get(hass)
         left_device = next(
             device
-            for device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id)
+            for device in (*dr.async_entries_for_config_entry(dev_reg, entry.entry_id), *dr.async_child_entries_for_config_entry(dev_reg, entry.entry_id))
             if any(i[0] == DOMAIN and i[1].upper() == LEFT_ADDR.upper() for i in device.identifiers)
         )
 
@@ -903,7 +902,7 @@ class TestPairedSetup:
         def device_for(addr: str):
             return next(
                 device
-                for device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id)
+                for device in (*dr.async_entries_for_config_entry(dev_reg, entry.entry_id), *dr.async_child_entries_for_config_entry(dev_reg, entry.entry_id))
                 if any(i[0] == DOMAIN and i[1].upper() == addr.upper() for i in device.identifiers)
             )
 
@@ -930,7 +929,7 @@ class TestPairedSetup:
         dev_reg = dr.async_get(hass)
         parent = next(
             device
-            for device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id)
+            for device in (*dr.async_entries_for_config_entry(dev_reg, entry.entry_id), *dr.async_child_entries_for_config_entry(dev_reg, entry.entry_id))
             if (DOMAIN, PAIR_ID) in device.identifiers
         )
         with pytest.raises(ServiceValidationError, match="Angle sensing is disabled"):
@@ -1834,12 +1833,12 @@ class TestPairBedsConversion:
             (DOMAIN, pair.data[CONF_PAIR_ID]),
         )
         assert parent is not None
-        left_after = _device_for_entry_and_identifier(dev_reg, pair.entry_id, (DOMAIN, LEFT_ADDR))
+        left_after = dev_reg.async_get_child_device_by_identifier((DOMAIN, LEFT_ADDR), pair.entry_id)
         assert left_after is not None
         assert left_after.id == left_device_id  # same device, not recreated
         assert left_after.config_entry_id == pair.entry_id
         assert left_after.name_by_user == "Left headboard"
-        assert left_after.via_device_id == parent.id
+        assert left_after.parent_device_id == parent.id
 
         # Reverse the conversion. The original entry ids and side registry
         # ownership return, while the exact same entity/device rows and user
@@ -2261,6 +2260,7 @@ class TestSideServiceRouting:
             version=4,
         )
         entry.add_to_hass(hass)
+        entry.mock_state(hass, ConfigEntryState.LOADED)
         children = _build_paired_children(hass, entry)
         for child in children.values():
             await child.async_prime_offline_controller()
@@ -2346,6 +2346,7 @@ class TestSideServiceRouting:
             version=4,
         )
         entry.add_to_hass(hass)
+        entry.mock_state(hass, ConfigEntryState.LOADED)
         children = _build_paired_children(hass, entry)
         for child in children.values():
             await child.async_prime_offline_controller()
@@ -2891,6 +2892,7 @@ class TestOfflineSideEntities:
         for child in children.values():
             await child.async_prime_offline_controller()
         coordinator = PairedBedCoordinator(hass, entry, children)
+        _async_ensure_paired_device_registry(hass, entry, coordinator)
         hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
         registry = er.async_get(hass)

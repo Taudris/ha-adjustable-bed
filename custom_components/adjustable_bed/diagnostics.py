@@ -12,6 +12,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.loader import async_get_integration
 
 from .adapter import find_service_info_by_address
+from .bluetooth_diagnostics import connection_reachability
 from .const import (
     CONF_BED_TYPE,
     CONF_DISABLE_ANGLE_SENSING,
@@ -71,6 +72,7 @@ async def _async_paired_diagnostics(
         sides[side] = {
             "address": getattr(child, "address", None),
             "connected": child.is_connected,
+            "reachability": connection_reachability(hass, child.address),
             "controller_type": (
                 type(child_controller).__name__
                 if child_controller is not None
@@ -275,6 +277,8 @@ async def async_get_config_entry_diagnostics(
         "auto_discovery_disabled": await async_is_discovery_disabled(hass),
         "auto_discovery_log": auto_discovery_log,
     }
+
+    data["reachability"] = connection_reachability(hass, coordinator.address) if coordinator else None
 
     # Redact sensitive data (partial MAC redaction - keeps OUI for debugging)
     return redact_data(data)  # type: ignore[no-any-return]

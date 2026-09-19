@@ -34,6 +34,7 @@ export interface DeviceRegistryEntry {
   name?: string;
   name_by_user?: string;
   // Set on a paired side's child device, pointing at the synthetic parent.
+  parent_device_id?: string | null;
   via_device_id?: string | null;
 }
 

@@ -2204,6 +2204,7 @@ class TestServices:
             entry_id="calibrated_service_entry",
         )
         entry.add_to_hass(hass)
+        entry.mock_state(hass, ConfigEntryState.LOADED)
 
         device_registry = dr.async_get(hass)
         device = device_registry.async_get_or_create(
@@ -2254,6 +2255,8 @@ class TestServices:
         coordinator.async_seek_position.assert_awaited_once()
         assert coordinator.async_seek_position.await_args.kwargs["position_key"] == "back"
         assert coordinator.async_seek_position.await_args.kwargs["target_angle"] == 75
+
+        entry.mock_state(hass, ConfigEntryState.NOT_LOADED)
 
     async def test_reverie_get_max_angle_uses_protocol_specific_back_limit(
         self,
@@ -2313,6 +2316,7 @@ class TestServices:
             entry_id="tight_calibration_service_entry",
         )
         entry.add_to_hass(hass)
+        entry.mock_state(hass, ConfigEntryState.LOADED)
 
         device_registry = dr.async_get(hass)
         device = device_registry.async_get_or_create(
@@ -2359,6 +2363,8 @@ class TestServices:
         # A failed validation must release the bed it reconnected for the check,
         # so it doesn't sit connected with no idle timer.
         coordinator.async_ensure_connected.assert_awaited_with(reset_timer=True)
+
+        entry.mock_state(hass, ConfigEntryState.NOT_LOADED)
 
     async def test_set_position_service_rejects_kaidi_head_and_feet(
         self,

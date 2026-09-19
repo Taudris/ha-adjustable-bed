@@ -386,3 +386,25 @@ test("resolvePairedParentId resolves a side device up to its parent", () => {
   // A stale via_device_id (parent gone from the registry) stays on the device.
   expect(resolvePairedParentId(hass, "stale")).toBe("stale");
 });
+
+test("native children retain side ordering and normalize single-address entity keys", () => {
+  const hass = hassWith([
+    entry("cover.left", "back_left", "left"),
+    entry("cover.right", "back_right", "right"),
+    entry("cover.both", "back_both", "parent"),
+    entry("button.memory_left", "preset_memory_1_left", "left"),
+  ]);
+  hass.devices = {
+    parent: { id: "parent", name: "Bed" },
+    left: { id: "left", name_by_user: "Zed", parent_device_id: "parent" },
+    right: { id: "right", name_by_user: "Amy", parent_device_id: "parent" },
+  };
+  expect(pairedChildDeviceIds(hass, "parent")).toEqual(["left", "right"]);
+  expect(resolvePairedParentId(hass, "left")).toBe("parent");
+  for (const id of ["left", "right", "parent"]) {
+    const bed = bedEntitiesForDevice(hass, id);
+    expect(bed.motors[0]?.key).toBe("back");
+    expect(bed.motors).toHaveLength(1);
+  }
+  expect(bedEntitiesForDevice(hass, "left").memory[0]?.goto).toBe("button.memory_left");
+});

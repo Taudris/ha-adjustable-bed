@@ -13,6 +13,7 @@ from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothServiceInfoBleak
 from homeassistant.core import HomeAssistant
 
+from .bluetooth_transport import async_connection_paths
 from .const import (
     ADAPTER_AUTO,
     DEVICE_INFO_CHARS,
@@ -180,149 +181,40 @@ async def select_adapter(
     preferred_adapter: str | None,
     exclude_adapters: set[str] | None = None,
 ) -> AdapterSelectionResult:
-    """Select the best Bluetooth adapter for connection.
+    """Choose an observed path, retaining HA's ranking for automatic selection.
 
-    This function handles adapter discovery and selection logic:
-    - If a preferred adapter is configured, looks for device from that adapter
-    - Otherwise, selects the adapter with the best RSSI (strongest signal)
-    - Falls back to default Home Assistant lookup if needed
-    - Can exclude specific adapters (e.g., after connection slot exhaustion)
-
-    Args:
-        hass: Home Assistant instance
-        address: The BLE device address to find
-        preferred_adapter: Preferred adapter source, or None/ADAPTER_AUTO for automatic
-        exclude_adapters: Set of adapter sources to skip (e.g., adapters that ran
-            out of connection slots). Only affects auto-selection, not preferred adapter.
-
-    Returns:
-        AdapterSelectionResult with device, source, rssi, and available sources
+    A selected BLEDevice is a routing hint: HA's wrapper may choose a different
+    backend during connect. The coordinator records the actual source afterward.
     """
-    device: BLEDevice | None = None
-    source: str | None = None
-    rssi: int | None = None
-    connectable: bool | None = None
-    available_sources: list[str] = []
-
+    paths = async_connection_paths(hass, address)
+    available = [f"{path.source} (RSSI: {path.rssi})" for path in paths]
+    candidates = [path for path in paths if path.source not in (exclude_adapters or ())]
+    candidates.sort(key=lambda path: not path.can_connect)
     if preferred_adapter and preferred_adapter != ADAPTER_AUTO:
-        # Look for device from specific adapter/source
-        _LOGGER.info(
-            "Looking for device %s from preferred adapter: %s",
-            address,
-            preferred_adapter,
-        )
-
-        # Log all sources that can see this device
+        candidates.sort(key=lambda path: (not path.can_connect, path.source != preferred_adapter))
+    for path in candidates:
+        # Resolve from the chosen scanner only. A generic fallback here could
+        # silently hand us the excluded/exhausted adapter again.
         try:
-            for service_info in bluetooth.async_discovered_service_info(hass, connectable=True):
-                if service_info.address.upper() == address.upper():
-                    svc_source = getattr(service_info, "source", "unknown")
-                    svc_rssi = getattr(service_info, "rssi", "N/A")
-                    available_sources.append(f"{svc_source} (RSSI: {svc_rssi})")
-
-                    if svc_source == preferred_adapter:
-                        device = service_info.device
-                        source = svc_source
-                        rssi = svc_rssi if isinstance(svc_rssi, int) else None
-                        connectable = True
-                        _LOGGER.info(
-                            "✓ Found device %s via preferred adapter %s (RSSI: %s)",
-                            address,
-                            preferred_adapter,
-                            svc_rssi,
-                        )
-                        break
-
-            if available_sources:
-                _LOGGER.info(
-                    "Adapters that can see device %s: %s",
-                    address,
-                    ", ".join(available_sources),
-                )
-
-            if device is None and available_sources:
-                _LOGGER.warning(
-                    "⚠ Device %s not found via preferred adapter %s, falling back to automatic selection",
-                    address,
-                    preferred_adapter,
-                )
-        except Exception as err:
-            _LOGGER.debug("Error looking up device from specific adapter: %s", err)
-
-    # Fall back to auto selection if no preferred adapter or device not found
-    # Auto mode: pick the adapter with the best RSSI (strongest signal)
-    if device is None:
-        best_rssi = RSSI_UNAVAILABLE
-        best_source: str | None = None
-        # Capture discovery snapshot once and reuse for both RSSI selection and device lookup
-        try:
-            discovered_services = list(
-                bluetooth.async_discovered_service_info(hass, connectable=True)
+            scanner_devices = bluetooth.async_scanner_devices_by_address(
+                hass, address.upper(), connectable=path.connectable
             )
-        except (OSError, TimeoutError) as err:
-            _LOGGER.debug("Error during auto adapter selection: %s", err)
-            discovered_services = []
-
-        # Find the adapter with best RSSI, respecting exclusions
-        for svc_info in discovered_services:
-            if svc_info.address.upper() == address.upper():
-                svc_rssi = getattr(svc_info, "rssi", None)
-                # Safely coerce RSSI to int, handling None/malformed values
-                try:
-                    rssi_value = int(svc_rssi) if svc_rssi is not None else RSSI_UNAVAILABLE
-                except (ValueError, TypeError):
-                    rssi_value = RSSI_UNAVAILABLE
-                svc_source = getattr(svc_info, "source", "unknown")
-                available_sources.append(f"{svc_source} (RSSI: {rssi_value})")
-                _LOGGER.debug("Auto-select candidate: source=%s, rssi=%s", svc_source, rssi_value)
-                if exclude_adapters and svc_source in exclude_adapters:
-                    _LOGGER.debug(
-                        "Skipping excluded adapter %s (RSSI: %s)", svc_source, rssi_value
-                    )
-                    continue
-                if rssi_value > best_rssi:
-                    best_rssi = rssi_value
-                    best_source = svc_source
-
-        if best_source:
-            _LOGGER.info("Auto-selected adapter %s with best RSSI %d", best_source, best_rssi)
-            # Get device from the best adapter using the same snapshot
-            for svc_info in discovered_services:
-                if (
-                    svc_info.address.upper() == address.upper()
-                    and getattr(svc_info, "source", None) == best_source
-                ):
-                    device = svc_info.device
-                    source = best_source
-                    rssi = best_rssi if best_rssi != RSSI_UNAVAILABLE else None
-                    connectable = True
-                    break
-
-        # Final fallback to default lookup
-        if device is None:
-            device, connectable = get_ble_device_with_fallback(
-                hass,
-                address,
-                allow_non_connectable=True,
-            )
-            if device:
-                fallback_source = "unknown"
-                if hasattr(device, "details") and isinstance(device.details, dict):
-                    fallback_source = device.details.get("source", "unknown")
-                source = fallback_source
-                info_message = "Using fallback adapter selection, device found via: %s"
-                log_args: tuple[object, ...] = (fallback_source,)
-                if connectable is False:
-                    info_message += " (scanner currently marks it non-connectable)"
-                _LOGGER.info(info_message, *log_args)
-
-    return AdapterSelectionResult(
-        device=device,
-        source=source,
-        rssi=rssi,
-        connectable=connectable,
-        available_sources=available_sources,
+        except (KeyError, RuntimeError):
+            _LOGGER.debug("Scanner disappeared while selecting %s", path.source)
+            continue
+        for scanner_device in scanner_devices:
+            if scanner_device.scanner.source == path.source:
+                return AdapterSelectionResult(
+                    scanner_device.ble_device, path.source, path.rssi,
+                    path.connectable, available,
+                )
+    if exclude_adapters:
+        return AdapterSelectionResult(None, None, None, None, available)
+    device, connectable = get_ble_device_with_fallback(
+        hass, address, allow_non_connectable=True
     )
+    source = device.details.get("source") if device and isinstance(device.details, dict) else None
+    return AdapterSelectionResult(device, source, None, connectable, available)
 
 
 def detect_esphome_proxy(hass: HomeAssistant, address: str) -> bool:
