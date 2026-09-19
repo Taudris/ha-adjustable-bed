@@ -77,6 +77,9 @@ seconds per readiness request, including after interrupted startup. Cancellation
 does not mark the session ready unless a write was acknowledged, and deferred
 subscriptions resume on the next command. Queued commands remain serialized and
 STOP invalidates older pending movement.
+Memory recall and flat presets have a 30-second elapsed hold limit after
+connection readiness. Slow Bluetooth acknowledgements cannot extend that hold;
+STOP cleanup still runs when the limit expires or a command is cancelled.
 
 ## Implemented features
 

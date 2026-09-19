@@ -1326,6 +1326,62 @@ class TestLinakMovement:
 class TestLinakPresets:
     """Test Linak preset commands."""
 
+    @pytest.mark.parametrize("stop_fails", [False, True])
+    async def test_preset_elapsed_limit_releases_after_slow_proxy_write(
+        self, hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client,
+        stop_fails,
+    ):
+        """The duration starts after readiness and cleanup failures remain visible."""
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        await coordinator.async_connect()
+        controller = coordinator.controller
+        _mark_session_ready(coordinator)
+        readiness_calls = 0
+
+        async def readiness(*_args, **_kwargs):
+            nonlocal readiness_calls
+            readiness_calls += 1
+            if readiness_calls == 1:
+                await asyncio.sleep(.04)
+
+        async def write(_uuid, command, **_kwargs):
+            if command == LinakCommands.PRESET_MEMORY_1:
+                await asyncio.Event().wait()
+            elif stop_fails:
+                raise BleakError("release failed")
+
+        mock_bleak_client.write_gatt_char.side_effect = write
+        with (
+            patch("custom_components.adjustable_bed.beds.linak.LINAK_MEMORY_RECALL_DURATION_S", .02),
+            patch.object(controller, "_await_control_ready", side_effect=readiness),
+        ):
+            async with asyncio.timeout(.5):
+                if stop_fails:
+                    with pytest.raises(BleakError, match="release failed"):
+                        await controller.preset_memory(1)
+                else:
+                    await controller.preset_memory(1)
+
+        assert _written_commands(mock_bleak_client) == [
+            LinakCommands.PRESET_MEMORY_1, LinakCommands.MOVE_STOP,
+        ]
+
+    @pytest.mark.parametrize("error_type", [TimeoutError, asyncio.CancelledError])
+    async def test_preset_preserves_transport_timeout_and_cancellation(
+        self, hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client,
+        error_type,
+    ):
+        """Only the preset's own elapsed deadline is normal completion."""
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        await coordinator.async_connect()
+        _mark_session_ready(coordinator)
+        mock_bleak_client.write_gatt_char.side_effect = [error_type(), None]
+        with pytest.raises(error_type):
+            await coordinator.controller.preset_memory(1)
+        assert _written_commands(mock_bleak_client) == [
+            LinakCommands.PRESET_MEMORY_1, LinakCommands.MOVE_STOP,
+        ]
+
     @pytest.mark.parametrize(
         "memory_num,expected_command",
         [

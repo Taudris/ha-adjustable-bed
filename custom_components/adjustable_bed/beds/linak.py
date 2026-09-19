@@ -1786,18 +1786,30 @@ class LinakController(BedController):
         await self._held_preset(LinakCommands.MOVE_ALL_UP)
 
     async def _held_preset(self, command: bytes) -> None:
-        """Hold a favorite-like command for the app's 30 second ceiling."""
+        """Hold a favorite-like command for at most 30 seconds after startup."""
         interval_ms = (
             LINAK_PERFORMANCE_HOLD_INTERVAL_MS
             if self._profile is LinakProfile.PERFORMANCE
             else LINAK_BED_CONTROL_HOLD_INTERVAL_MS
         )
         repeat_count = max(1, LINAK_MEMORY_RECALL_DURATION_S * 1000 // interval_ms)
-        await self._preset_with_stop(
-            command,
-            repeat_count=repeat_count,
-            repeat_delay_ms=interval_ms,
-        )
+        await self._await_control_ready()
+        # Counting repeats alone adds every proxy acknowledgement to the hold
+        # duration. The elapsed ceiling must still release the bed promptly.
+        hold_timeout = asyncio.timeout(LINAK_MEMORY_RECALL_DURATION_S)
+        try:
+            try:
+                async with hold_timeout:
+                    await self.write_command(
+                        command,
+                        repeat_count=repeat_count,
+                        repeat_delay_ms=interval_ms,
+                    )
+            except TimeoutError:
+                if not hold_timeout.expired():
+                    raise
+        finally:
+            await self._send_stop()
 
     async def preset_memory(self, memory_num: int) -> None:
         """Go to memory preset."""
