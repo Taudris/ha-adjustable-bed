@@ -92,6 +92,15 @@ class RecordingChild:
         # STOP landing mid-connect).
         self._connect_gate = asyncio.Event()
         self._block_connect = block_connect
+        self.connection_holds = 0
+
+    @contextlib.contextmanager
+    def hold_command_connection(self):
+        self.connection_holds += 1
+        try:
+            yield
+        finally:
+            self.connection_holds -= 1
 
     def request_command_cancel(self, resource=None, *, resources=None) -> None:
         del resource, resources
@@ -251,6 +260,29 @@ async def _noop(_controller):
 
 
 class TestSideRouting:
+    @pytest.mark.parametrize("fail_right", [False, True])
+    async def test_combined_command_holds_early_side_through_group_cleanup(self, fail_right):
+        log = []
+        left = ScheduledRecordingChild(SIDE_LEFT, log)
+        right = ScheduledRecordingChild(SIDE_RIGHT, log, block=True, fail_command=fail_right)
+        coord = _make({SIDE_LEFT: left, SIDE_RIGHT: right})
+        task = asyncio.create_task(coord.async_execute_controller_command(_noop, side=SIDE_BOTH))
+        try:
+            async with asyncio.timeout(1):
+                while (SIDE_RIGHT, "command") not in log or not left.scheduler.recent_records:
+                    await asyncio.sleep(0)
+            assert left.connection_holds == right.connection_holds == 1
+            right._gate.set()
+            if fail_right:
+                with pytest.raises(PairedSideError):
+                    await task
+            else:
+                await task
+            assert left.connection_holds == right.connection_holds == 0
+        finally:
+            right._gate.set()
+            await asyncio.gather(task, return_exceptions=True)
+
     async def test_both_success_runs_each_side_once_no_stop(self):
         log: list = []
         coord, _, _ = _pair(log)
@@ -1040,6 +1072,9 @@ class TestSideProxy:
 
 class SingleAddressInner:
     """One physical coordinator double used by the Phase 3 routing tests."""
+
+    def hold_command_connection(self):
+        return contextlib.nullcontext()
 
     def __init__(self, controller_type):
         self.address = "AA:BB:CC:DD:EE:50"

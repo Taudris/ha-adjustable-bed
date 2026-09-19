@@ -11,7 +11,15 @@ import secrets
 import time
 import traceback
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Coroutine, Mapping
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Coroutine,
+    Iterator,
+    Mapping,
+)
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 from uuid import uuid4
@@ -216,6 +224,8 @@ _INITIAL_POSITION_READ_TOTAL_TIMEOUT = 40.0
 _INITIAL_POSITION_READ_RETRY_DELAY = 3.0
 _INITIAL_POSITION_READ_MAX_ATTEMPTS = 6
 _PASSIVE_POSITION_RECONCILIATION_IDLE_MARGIN = 15.0
+# Share a Linak connection across rapid taps, then give the physical remote back its link.
+_LINAK_COMMAND_BURST_GRACE_SECONDS = 1.0
 # One reconnect gives a stale preserved OKIN profile another chance to reveal
 # the CST/RF ECO BT discriminator without making known receivers pay DIS
 # timeouts forever.
@@ -436,6 +446,7 @@ class AdjustableBedCoordinator:
         self._reconnect_timer: asyncio.TimerHandle | None = None
         self._lock = asyncio.Lock()
         self._command_lock = asyncio.Lock()  # Separate lock for command serialization
+        self._command_connection_holds = 0
         self._command_scheduler = DeviceCommandScheduler(self._address.replace(":", "_"))
         self._connecting: bool = False  # Track if we're actively connecting
         self._intentional_disconnect: bool = (
@@ -2214,8 +2225,36 @@ class AdjustableBedCoordinator:
         return False
 
     def _disconnect_after_operation_enabled(self) -> bool:
-        """Return True when commands should disconnect immediately after completion."""
+        """Return True when completed commands should promptly release the connection."""
         return self._disconnect_after_command and not self._uses_persistent_connection()
+
+    async def _async_release_command_connection(self) -> None:
+        """Allow a short Linak command burst before releasing the physical remote's link."""
+        if self._bed_type == BED_TYPE_LINAK:
+            self._reset_disconnect_timer()
+        else:
+            await self.async_disconnect()
+
+    def _idle_disconnect_delay(self) -> float:
+        """Keep Linak's remote handoff short when disconnect-after-command is enabled."""
+        if self._bed_type == BED_TYPE_LINAK and self._disconnect_after_operation_enabled():
+            return _LINAK_COMMAND_BURST_GRACE_SECONDS
+        return self._idle_disconnect_seconds
+
+    @contextlib.contextmanager
+    def hold_command_connection(self) -> Iterator[None]:
+        """Start Linak's remote handoff only after every side of a linked action settles."""
+        if self._bed_type != BED_TYPE_LINAK or not self._disconnect_after_operation_enabled():
+            yield
+            return
+        self._command_connection_holds += 1
+        self._cancel_disconnect_timer()
+        try:
+            yield
+        finally:
+            self._command_connection_holds -= 1
+            if not self._command_connection_holds and self.is_connected:
+                self._reset_disconnect_timer()
 
     def _auto_reconnect_enabled(self) -> bool:
         """Return True when unexpected disconnects should schedule a reconnect timer."""
@@ -3895,6 +3934,9 @@ class AdjustableBedCoordinator:
             return None
         if not self._passive_position_reconciliation_enabled:
             return None
+        if self._bed_type == BED_TYPE_LINAK and self._disconnect_after_operation_enabled():
+            # Polling would take the link back from the physical remote while idle.
+            return None
         if requested_interval_s is None or requested_interval_s <= 0:
             return None
 
@@ -4192,6 +4234,9 @@ class AdjustableBedCoordinator:
 
     def _reset_disconnect_timer(self) -> None:
         """Reset the disconnect timer."""
+        if self._command_connection_holds:
+            self._cancel_disconnect_timer()
+            return
         if self._uses_persistent_connection():
             self._cancel_disconnect_timer()
             _LOGGER.debug(
@@ -4201,13 +4246,14 @@ class AdjustableBedCoordinator:
             return
 
         self._cancel_disconnect_timer()
+        delay = self._idle_disconnect_delay()
         _LOGGER.debug(
-            "Setting idle disconnect timer for %s (%d seconds)",
+            "Setting idle disconnect timer for %s (%.1f seconds)",
             self._address,
-            self._idle_disconnect_seconds,
+            delay,
         )
         self._disconnect_timer = self.hass.loop.call_later(
-            self._idle_disconnect_seconds,
+            delay,
             self._schedule_idle_disconnect,
         )
 
@@ -4257,11 +4303,13 @@ class AdjustableBedCoordinator:
         # can take over, and reconnect on demand on the next command. Logged at DEBUG
         # to avoid spamming the log during normal use.
         _LOGGER.debug(
-            "Idle timeout reached (%d seconds), disconnecting from %s",
-            self._idle_disconnect_seconds,
+            "Idle timeout reached (%.1f seconds), disconnecting from %s",
+            self._idle_disconnect_delay(),
             self._address,
         )
         async with self._command_lock:
+            if self._command_connection_holds:
+                return
             if self._position_hydration_running:
                 # Commands may re-arm the timer between hydration attempts.
                 # The final hydration cleanup starts a fresh timer.
@@ -4485,13 +4533,13 @@ class AdjustableBedCoordinator:
                 _LOGGER.info("Stop command sent")
             finally:
                 if self._client is not None and self._client.is_connected:
-                    # Disconnect immediately if configured to do so
+                    # Release promptly, retaining Linak's short burst handoff.
                     if self._disconnect_after_operation_enabled():
                         _LOGGER.debug(
                             "Disconnecting after stop command (disconnect_after_command=True) for %s",
                             self._address,
                         )
-                        await self.async_disconnect()
+                        await self._async_release_command_connection()
                     else:
                         # Otherwise, reset the idle disconnect timer
                         self._reset_disconnect_timer()
@@ -4550,7 +4598,7 @@ class AdjustableBedCoordinator:
                 operation_name,
                 self._address,
             )
-            await self.async_disconnect()
+            await self._async_release_command_connection()
             return
 
         if command_preempted:
@@ -5704,6 +5752,6 @@ class AdjustableBedCoordinator:
                             "Disconnecting after seek (disconnect_after_command=True) for %s",
                             self._address,
                         )
-                        await self.async_disconnect()
+                        await self._async_release_command_connection()
                     else:
                         self._reset_disconnect_timer()

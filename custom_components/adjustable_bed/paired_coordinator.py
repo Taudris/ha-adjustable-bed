@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncIterator, Callable, Collection, Coroutine, Mapping
+from collections.abc import AsyncIterator, Callable, Collection, Coroutine, Iterator, Mapping
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -447,14 +447,15 @@ class PairedBedCoordinator:
                 self._active_children = active_children
                 self._active_group_resources = command_scope
                 try:
-                    await self._run_both_concurrent(
-                        action,
-                        targets,
-                        op,
-                        cancel_running=cancel_running,
-                        resources=command_scope,
-                        entry_cancel=entry_cancel,
-                    )
+                    with self._hold_command_connections(targets):
+                        await self._run_both_concurrent(
+                            action,
+                            targets,
+                            op,
+                            cancel_running=cancel_running,
+                            resources=command_scope,
+                            entry_cancel=entry_cancel,
+                        )
                 finally:
                     self._active_children = set()
                     self._active_group_resources = frozenset()
@@ -979,10 +980,11 @@ class PairedBedCoordinator:
         """
         if self._connection_mode == PAIR_CONNECTION_MODE_SEQUENTIAL:
             targets = [(side, child) for side, child in targets if child.is_connected]
-        results = await asyncio.gather(
-            *(child.async_stop_command() for _, child in targets),
-            return_exceptions=True,
-        )
+        with self._hold_command_connections(targets):
+            results = await asyncio.gather(
+                *(child.async_stop_command() for _, child in targets),
+                return_exceptions=True,
+            )
         errors: dict[str, BaseException] = {}
         for (side, child), result in zip(targets, results, strict=True):
             if isinstance(result, BaseException):
@@ -991,6 +993,14 @@ class PairedBedCoordinator:
                     "STOP failed on %s side (%s): %s", side, child.address, result
                 )
         return errors
+
+    @contextlib.contextmanager
+    def _hold_command_connections(self, targets: Collection[tuple[str, BedChild]]) -> Iterator[None]:
+        """Keep early-finishing Linak sides available through combined action cleanup."""
+        with contextlib.ExitStack() as stack:
+            for _, child in targets:
+                stack.enter_context(child.hold_command_connection())
+            yield
 
     # ------------------------------------------------------------------ lifecycle
     async def async_connect(self) -> bool:
@@ -1191,6 +1201,9 @@ class SingleAddressSideCoordinator(EntityRuntimeView):
 
     def pause_disconnect_timer(self) -> None:
         return self._single_inner.pause_disconnect_timer()
+
+    def hold_command_connection(self) -> contextlib.AbstractContextManager[None]:
+        return self._single_inner.hold_command_connection()
 
     def resume_disconnect_timer(self) -> None:
         return self._single_inner.resume_disconnect_timer()

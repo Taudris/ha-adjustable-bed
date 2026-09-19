@@ -65,7 +65,8 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-LINAK_CONTROL_READY_TIMEOUT_S = 6.0
+# Live proxy connections can need more than six seconds before accepting writes.
+LINAK_CONTROL_READY_TIMEOUT_S = 15.0
 LINAK_CONTROL_READY_RETRY_DELAY_S = 0.75
 LINAK_PROTOCOL_READ_TIMEOUT_S = 0.75
 LINAK_INITIAL_POSITION_RETRY_ATTEMPTS = 3
@@ -1214,13 +1215,20 @@ class LinakController(BedController):
     async def _await_control_ready(self, cancel_event: asyncio.Event | None = None) -> None:
         """Wait until Linak accepts control writes after a fresh BLE connect."""
         if self._session_ready:
-            if self._capability_discovery_deferred:
-                await self.async_discover_capabilities()
+            await self._finish_control_setup()
             return
 
         effective_cancel = cancel_event or self._coordinator.cancel_command
-        deadline = self._session_started_monotonic + LINAK_CONTROL_READY_TIMEOUT_S
+        # A query can be cancelled during startup, or the first command can
+        # arrive long after connection. Give this request its own retry budget.
+        wait_started = monotonic()
+        deadline = wait_started + LINAK_CONTROL_READY_TIMEOUT_S
         attempt = 0
+
+        def mark_ready() -> None:
+            # The write helper also returns normally when cancelled without
+            # writing. Only an acknowledged probe proves that control is ready.
+            self._session_ready = True
 
         while True:
             if effective_cancel is not None and effective_cancel.is_set():
@@ -1250,6 +1258,7 @@ class LinakController(BedController):
                     repeat_delay_ms=0,
                     cancel_event=cancel_event,
                     log_errors=False,
+                    on_write=mark_ready,
                 )
             except BleakError as err:
                 if not self._is_authentication_window_error(err):
@@ -1260,7 +1269,7 @@ class LinakController(BedController):
                     _LOGGER.error(
                         "Linak control stayed unavailable for %s after %.2fs",
                         self._coordinator.address,
-                        session_age,
+                        monotonic() - wait_started,
                     )
                     raise
 
@@ -1274,13 +1283,9 @@ class LinakController(BedController):
                 await asyncio.sleep(delay)
                 continue
 
-            self._session_ready = True
-            if self._capability_discovery_deferred:
-                await self.async_discover_capabilities()
-            if self._deferred_position_notifications:
-                await self._ensure_position_notifications_started()
-            if self._deferred_protocol_notifications:
-                await self._start_protocol_notifications()
+            if not self._session_ready:
+                return
+            await self._finish_control_setup()
             _LOGGER.debug(
                 "Linak control ready for %s after %.2fs (%d probe attempts)",
                 self._coordinator.address,
@@ -1288,6 +1293,16 @@ class LinakController(BedController):
                 attempt,
             )
             return
+
+    async def _finish_control_setup(self) -> None:
+        """Resume deferred setup even if a previous command was cancelled after its probe."""
+        discovery_was_deferred = self._capability_discovery_deferred
+        if discovery_was_deferred:
+            await self.async_discover_capabilities()
+        if discovery_was_deferred or self._deferred_position_notifications:
+            await self._ensure_position_notifications_started()
+        if self._deferred_protocol_notifications:
+            await self._start_protocol_notifications()
 
     async def write_command(
         self,

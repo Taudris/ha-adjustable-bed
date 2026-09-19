@@ -84,7 +84,7 @@ L600 is not a protocol name**: confirmed L600 hardware includes both OKIN CB24
 |---------|-------|---------|-------------|
 | **Disable Angle Sensing** | On/Off | On | Disables position feedback to allow physical remote to work |
 | **Position Mode** | Speed / Accuracy | Speed | How position updates after commands |
-| **Disconnect After Command** | On/Off | On for most beds | Disconnect immediately after each command |
+| **Disconnect After Command** | On/Off | On for most beds | Release the connection promptly after commands |
 | **Idle Disconnect Seconds** | 10-300 | 40 | Auto-disconnect timeout when idle |
 | **Stop Discovering New Bluetooth Devices** | On/Off | Off | Suppress automatic discovery of new beds (integration-wide) |
 
@@ -102,6 +102,8 @@ L600 is not a protocol name**: confirmed L600 hardware includes both OKIN CB24
 **Disconnect After Command**
 - On by default: these beds accept a single BLE connection, so holding it locks your physical remote and the vendor app out until the idle timeout expires
 - Off by default for beds whose protocol needs the link held open or whose controller must retain connection-scoped state between commands
+- Linak retains the link for one second between rapid commands, then releases it for the physical remote. Its explicit Disconnect button releases it immediately.
+- With this option enabled, Linak also skips background position polling to leave the remote's connection available while idle.
 - Turn it off if you prefer faster response on rapid consecutive commands over handing the connection back right away
 - Changing it later only affects the bed whose options you edit; beds added before this became the default keep whatever they were set up with
 

@@ -59,6 +59,25 @@ post-connect readiness retry handles the controllers' transient `Insufficient
 authentication` window instead. There is no application PIN, passkey,
 challenge, token or protocol encryption.
 
+### Rapid commands and the physical remote
+
+Keep **Disconnect after command** enabled when using the physical remote. Linak
+holds the connection for one second after an operation, so rapid follow-up taps
+reuse the authenticated link. Combined actions retain both links until both
+sides finish, then start the handoff together. A new command renews this short
+window; the explicit **Disconnect** button bypasses it.
+Turning the option off uses the configured idle timeout instead.
+With quick disconnect enabled, background position polling is also suppressed
+so it cannot reclaim the remote's connection while idle. Position feedback
+refreshes during HA operations; remote-only movements appear on the next connection.
+
+A fresh connection can take around 12 seconds to accept control writes through
+a Bluetooth proxy. The integration retries the safe STOP probe for up to 15
+seconds per readiness request, including after interrupted startup. Cancellation
+does not mark the session ready unless a write was acknowledged, and deferred
+subscriptions resume on the next command. Queued commands remain serialized and
+STOP invalidates older pending movement.
+
 ## Implemented features
 
 | Feature | Bed Control | Performance Series |

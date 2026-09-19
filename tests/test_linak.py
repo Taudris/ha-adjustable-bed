@@ -274,6 +274,101 @@ class TestLinakController:
             LinakCommands.MOVE_HEAD_DOWN,
         ]
 
+    async def test_cancelled_readiness_probe_does_not_authenticate_session(
+        self, hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client
+    ):
+        """Cancellation during notification setup must not count as a successful write."""
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        await coordinator.async_connect()
+        controller = coordinator.controller
+        cancel = asyncio.Event()
+        controller._deferred_position_notifications.add(LINAK_POSITION_BACK_UUID)
+
+        async def cancel_during_notifications():
+            cancel.set()
+
+        with patch.object(
+            controller, "_ensure_position_notifications_started",
+            side_effect=cancel_during_notifications,
+        ):
+            await controller.write_command(LinakCommands.MOVE_HEAD_UP, cancel_event=cancel)
+
+        assert not controller._session_ready
+        assert _written_commands(mock_bleak_client) == []
+
+    async def test_readiness_retry_budget_starts_with_the_request(
+        self, hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client
+    ):
+        """An older idle session or cancelled query must not exhaust a new STOP's retry budget."""
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        await coordinator.async_connect()
+        controller = coordinator.controller
+        controller._session_started_monotonic = 0
+        mock_bleak_client.write_gatt_char.side_effect = [
+            BleakError("Insufficient authentication"), None, None,
+        ]
+        with (
+            patch("custom_components.adjustable_bed.beds.linak.monotonic", return_value=100),
+            patch("custom_components.adjustable_bed.beds.linak.asyncio.sleep", new=AsyncMock()),
+        ):
+            await controller.stop_all()
+
+        assert controller._session_ready
+        assert _written_commands(mock_bleak_client) == [LinakCommands.MOVE_STOP] * 3
+
+    @pytest.mark.parametrize("ready_after", [8.0, None])
+    async def test_readiness_handles_slow_authentication_with_a_bounded_wait(
+        self, hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client,
+        ready_after,
+    ):
+        """Allow the observed slow startup, but still report a persistently rejected link."""
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        await coordinator.async_connect()
+        controller = coordinator.controller
+        clock = 100.0
+
+        async def advance(delay):
+            nonlocal clock
+            clock += delay
+
+        async def write(*_args, **_kwargs):
+            if ready_after is None or clock < 100 + ready_after:
+                raise BleakError("Insufficient authentication")
+
+        mock_bleak_client.write_gatt_char.side_effect = write
+        with (
+            patch("custom_components.adjustable_bed.beds.linak.monotonic", side_effect=lambda: clock),
+            patch("custom_components.adjustable_bed.beds.linak.asyncio.sleep", side_effect=advance),
+        ):
+            if ready_after is None:
+                with pytest.raises(BleakError, match="Insufficient authentication"):
+                    await controller.stop_all()
+                assert not controller._session_ready
+                assert clock == 115
+            else:
+                await controller.stop_all()
+                assert controller._session_ready
+                assert 108 <= clock < 115
+
+    async def test_command_resumes_setup_cancelled_after_successful_probe(
+        self, hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client
+    ):
+        """An accepted STOP survives cancellation, while deferred subscriptions still resume."""
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        await coordinator.async_connect()
+        controller = coordinator.controller
+        controller._deferred_protocol_notifications.add(LINAK_CONFIG_CHAR_UUID)
+        with patch.object(
+            controller, "_start_protocol_notifications",
+            side_effect=[asyncio.CancelledError(), None],
+        ) as subscribe:
+            with pytest.raises(asyncio.CancelledError):
+                await controller.stop_all()
+            assert controller._session_ready
+            await controller.stop_all()
+        assert subscribe.await_count == 2
+        assert _written_commands(mock_bleak_client) == [LinakCommands.MOVE_STOP] * 2
+
     async def test_seek_position_step_refreshes_without_intermediate_release(
         self,
         hass: HomeAssistant,
@@ -893,6 +988,7 @@ class TestLinakCorpusProfiles:
         mock_bleak_client.read_gatt_char.side_effect = read
         coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
 
+        coordinator._disable_angle_sensing = False
         await coordinator.async_connect()
         assert mask_attempts == 1
         assert coordinator.controller._capability_discovery_deferred is True
@@ -909,6 +1005,8 @@ class TestLinakCorpusProfiles:
             120.0
         )
         assert mock_config_entry.data["capabilities"]["linak"]["actuator_mask"] == 0xC0
+        subscribed_uuids = {call.args[0] for call in mock_bleak_client.start_notify.call_args_list}
+        assert {LINAK_POSITION_BACK_UUID, LINAK_POSITION_LEG_UUID} <= subscribed_uuids
         assert _written_commands(mock_bleak_client) == [
             LinakCommands.MOVE_STOP,
             LinakCommands.MOVE_HEAD_UP,

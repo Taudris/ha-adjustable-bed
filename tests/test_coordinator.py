@@ -1304,6 +1304,25 @@ class TestCoordinatorConnection:
 
         assert coordinator._resolve_passive_position_reconciliation_interval(120.0) == 195.0
 
+    @pytest.mark.parametrize("disconnect_after_command", [True, False])
+    async def test_linak_remote_handoff_controls_passive_polling(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry,
+        disconnect_after_command: bool,
+    ) -> None:
+        """Quick handoff must not periodically reclaim the remote's BLE link."""
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        coordinator._bed_type = BED_TYPE_LINAK
+        coordinator._disable_angle_sensing = False
+        coordinator._passive_position_reconciliation_enabled = True
+        coordinator._disconnect_after_command = disconnect_after_command
+        coordinator._idle_disconnect_seconds = 40
+
+        assert coordinator._resolve_passive_position_reconciliation_interval(120.0) == (
+            None if disconnect_after_command else 120.0
+        )
+
     async def test_passive_position_reconciliation_can_be_disabled_by_config(
         self,
         hass: HomeAssistant,
@@ -5716,7 +5735,7 @@ class TestStopAfterCancel:
         entry.add_to_hass(hass)
         coordinator = AdjustableBedCoordinator(hass, entry)
         await coordinator.async_connect()
-        coordinator.async_disconnect = AsyncMock()
+        coordinator._async_release_command_connection = AsyncMock()
 
         async def command(_controller) -> None:
             return None
@@ -5735,7 +5754,7 @@ class TestStopAfterCancel:
             resources=["motor:back", "motor:legs"],
         )
 
-        coordinator.async_disconnect.assert_awaited_once()
+        coordinator._async_release_command_connection.assert_awaited_once()
 
     async def test_non_preemptible_controller_query_finishes_before_new_command(
         self,
@@ -5996,6 +6015,7 @@ class TestStopAfterCancel:
             title=mock_config_entry.title,
             data={
                 **mock_config_entry.data,
+                CONF_BED_TYPE: BED_TYPE_KEESON,
                 CONF_DISABLE_ANGLE_SENSING: False,
                 CONF_DISCONNECT_AFTER_COMMAND: True,
             },
@@ -6066,7 +6086,7 @@ class TestStopAfterCancel:
 
         coordinator = AdjustableBedCoordinator(hass, entry)
         await coordinator.async_connect()
-        coordinator.async_disconnect = AsyncMock()
+        coordinator._async_release_command_connection = AsyncMock()
 
         command_started = asyncio.Event()
 
@@ -6086,7 +6106,63 @@ class TestStopAfterCancel:
         await coordinator.async_execute_controller_command(replacement_command)
         await first_task
 
-        assert coordinator.async_disconnect.await_count == 1
+        assert coordinator._async_release_command_connection.await_count == 1
+
+    async def test_linak_burst_reuses_link_then_releases_it_for_remote(
+        self, hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client
+    ):
+        """Rapid taps renew the short handoff timer instead of reconnecting or holding for 40s."""
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        coordinator._disconnect_after_command = True
+        await coordinator.async_connect()
+        command = AsyncMock()
+        await coordinator.async_execute_controller_command(command)
+        first_timer = coordinator._disconnect_timer
+        assert first_timer is not None
+        assert first_timer.when() - hass.loop.time() == pytest.approx(1.0, abs=0.1)
+        mock_bleak_client.disconnect.assert_not_awaited()
+
+        await coordinator.async_execute_controller_command(command)
+        assert first_timer.cancelled()
+        assert coordinator._disconnect_timer is not first_timer
+        assert command.await_count == 2
+        mock_bleak_client.disconnect.assert_not_awaited()
+
+        # Fire the handoff without sleeping; it uses the same serialized idle lane.
+        coordinator._cancel_disconnect_timer()
+        await coordinator._async_idle_disconnect()
+        mock_bleak_client.disconnect.assert_awaited_once()
+        assert not coordinator.is_connected
+
+    async def test_linak_explicit_disconnect_does_not_wait_for_burst_grace(
+        self, hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client
+    ):
+        """The explicit Disconnect action releases the remote immediately."""
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        coordinator._disconnect_after_command = True
+        await coordinator.async_connect()
+        await coordinator.async_execute_controller_command(AsyncMock())
+        await coordinator.async_disconnect()
+        assert coordinator._disconnect_timer is None
+        mock_bleak_client.disconnect.assert_awaited_once()
+
+    async def test_linak_group_holds_delay_handoff_until_outer_cleanup(
+        self, hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client
+    ):
+        """An early-finishing side remains available for a linked STOP or follow-up."""
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        coordinator._disconnect_after_command = True
+        await coordinator.async_connect()
+        with coordinator.hold_command_connection():
+            with coordinator.hold_command_connection():
+                await coordinator.async_execute_controller_command(AsyncMock())
+                assert coordinator._disconnect_timer is None
+            assert coordinator._disconnect_timer is None
+            await coordinator._async_idle_disconnect()
+            mock_bleak_client.disconnect.assert_not_awaited()
+        assert coordinator._disconnect_timer is not None
+        assert coordinator._disconnect_timer.when() - hass.loop.time() == pytest.approx(1, abs=.1)
+        await coordinator.async_disconnect()
 
     async def test_stop_after_movement_always_sent(
         self,
