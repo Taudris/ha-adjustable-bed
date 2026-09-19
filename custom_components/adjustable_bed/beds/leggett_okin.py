@@ -28,6 +28,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, cast
 
 from bleak.exc import BleakError
+from homeassistant.exceptions import HomeAssistantError
 
 from ..const import (
     DEVICE_INFO_READ_TIMEOUT,
@@ -142,6 +143,13 @@ FLAT_HOLD_S = 30.0
 CONTROL_MODE_FRAME_COUNT = 55
 CONTROL_MODE_FRAME_DELAY_MS = 100
 
+# CU170 hardware observations in issue #368, distinct from the app's UI masks.
+CU170_LIGHT_MASK = 0x00020000
+CU170_ALARM_MASK = 0x00400000
+CU170_SLEEP_MASK = 0x00800000
+# Integration response timeout, not a firmware timing requirement.
+LIGHT_STATE_TIMEOUT_S = 3.0
+
 
 def _build_revision_0_command(command_value: int) -> bytes:
     """Build the APK's revision-0 E5 FE 16 command frame."""
@@ -225,7 +233,11 @@ class LeggettOkinController(BedController):
         self._protocol_revision = self._detect_protocol_revision()
         self._notification_led_mask: int | None = None
         self._notification_status: int | None = None
+        self._cu170_status_mask: int | None = None
+        self._light_is_on: bool | None = None
+        self._light_state_changed = asyncio.Event()
         self._notify_started: set[str] = set()
+        self._notifications_stopped = False
         self._settings_initialized = False
         _LOGGER.debug(
             "LeggettOkinController initialized (protocol revision: %s)",
@@ -247,6 +259,11 @@ class LeggettOkinController(BedController):
     def supports_lights(self) -> bool:
         """Return True - Okin beds support under-bed lighting."""
         return True
+
+    @property
+    def supports_light_state_feedback(self) -> bool:
+        """Only the Prodigy CE hardware has a verified light-state mapping."""
+        return self._app_profile == "prodigy4"
 
     @property
     def supports_discrete_light_control(self) -> bool:
@@ -291,6 +308,11 @@ class LeggettOkinController(BedController):
     @property
     def supports_control_mode_configuration(self) -> bool:
         return self._profile.settings
+
+    @property
+    def supports_control_mode_press_and_hold(self) -> bool:
+        """CU170 hardware treats the app's SET+FLAT chord as a factory reset."""
+        return self._profile.settings and self._app_profile != "prodigy4"
 
     @property
     def supports_sleep_timer(self) -> bool:
@@ -443,8 +465,17 @@ class LeggettOkinController(BedController):
             ),
             "notification_led_mask": f"0x{led_mask:08x}" if led_mask is not None else None,
             "notification_status": self._notification_status,
-            "alarm_armed": bool(display_mask & 0x4000) if display_mask is not None else None,
-            "sleep_timer_armed": bool(display_mask & 0x8000) if display_mask is not None else None,
+            "alarm_armed": (
+                bool(self._cu170_status_mask & CU170_ALARM_MASK)
+                if self._cu170_status_mask is not None
+                else bool(display_mask & 0x4000) if display_mask is not None else None
+            ),
+            "sleep_timer_armed": (
+                bool(self._cu170_status_mask & CU170_SLEEP_MASK)
+                if self._cu170_status_mask is not None
+                else bool(display_mask & 0x8000) if display_mask is not None else None
+            ),
+            "under_bed_lights_on": self._light_is_on,
             "notification_characteristics": sorted(self._notify_started),
             "settings_initialized": self._settings_initialized,
         }
@@ -604,6 +635,7 @@ class LeggettOkinController(BedController):
             return
 
         self._protocol_revision = self._detect_protocol_revision()
+        self._notifications_stopped = False
         characteristic_uuids = self._available_characteristic_uuids() or frozenset()
         candidates = (LEGGETT_OKIN_NOTIFY_CHAR_UUID,)
         if self._profile.settings:
@@ -688,6 +720,41 @@ class LeggettOkinController(BedController):
         characteristic_uuid = str(getattr(sender, "uuid", sender)).lower()
         payload = bytes(data)
         self.forward_raw_notification(characteristic_uuid, payload)
+        if self._notifications_stopped:
+            return
+        if (
+            self.supports_light_state_feedback
+            and characteristic_uuid == LEGGETT_OKIN_NOTIFY_CHAR_UUID.lower()
+            and payload[:2] == b"\x09\x0b"
+        ):
+            # Receipts contain the pre-command state; subsequent spontaneous
+            # notifications contain the new state. Process both, without
+            # consuming one notification as an acknowledgement of one write.
+            if (
+                len(payload) != 20
+                or payload[10] != 0xFF
+                or payload[2:6] != payload[6:10]
+            ):
+                return
+            mask = int.from_bytes(payload[2:6], "big")
+            self._cu170_status_mask = mask
+            self._light_is_on = bool(mask & CU170_LIGHT_MASK)
+            self._notification_led_mask = mask
+            self._notification_status = None
+            self._light_state_changed.set()
+            self.forward_controller_state_updates(
+                {
+                    "leggett_led_mask": mask,
+                    "leggett_status": None,
+                    "leggett_alarm_indicator": bool(mask & CU170_ALARM_MASK),
+                    "leggett_sleep_timer_indicator": bool(mask & CU170_SLEEP_MASK),
+                    "under_bed_lights_on": bool(mask & CU170_LIGHT_MASK),
+                }
+            )
+            return
+        # The optional settings channel must not replace live CU170 status.
+        if self._cu170_status_mask is not None:
+            return
         parsed = parse_leggett_okin_feedback(payload)
         if parsed is None:
             return
@@ -703,28 +770,33 @@ class LeggettOkinController(BedController):
         )
 
     async def stop_notify(self) -> None:
-        """Stop every active Prodigy CE status subscription."""
+        """Stop subscriptions and discard feedback, including on failed shutdown."""
         self._notify_callback = None
+        self._notifications_stopped = True
         self._device_information_read.clear()
         self._protocol_revision = None
         client = self.client
-        if client is None or not client.is_connected:
+        try:
+            if client is not None and client.is_connected:
+                for characteristic_uuid in tuple(self._notify_started):
+                    try:
+                        async with self._ble_lock:
+                            await client.stop_notify(characteristic_uuid)
+                    except BleakError as err:
+                        _LOGGER.debug(
+                            "Could not stop Leggett Okin notifications on %s: %s",
+                            characteristic_uuid,
+                            err,
+                        )
+        finally:
             self._notify_started.clear()
             self._settings_initialized = False
-            return
-
-        for characteristic_uuid in tuple(self._notify_started):
-            try:
-                async with self._ble_lock:
-                    await client.stop_notify(characteristic_uuid)
-            except BleakError as err:
-                _LOGGER.debug(
-                    "Could not stop Leggett Okin notifications on %s: %s",
-                    characteristic_uuid,
-                    err,
-                )
-        self._notify_started.clear()
-        self._settings_initialized = False
+            self._cu170_status_mask = None
+            self._light_is_on = None
+            self._notification_led_mask = None
+            self._notification_status = None
+            if self.supports_light_state_feedback:
+                self.forward_controller_state_update("under_bed_lights_on", None)
 
     def motor_pulse_settings(self) -> tuple[int, int]:
         """Keep movement streams at the proven CU170 cadence."""
@@ -1027,6 +1099,14 @@ class LeggettOkinController(BedController):
         """Send one of the APK's persistent handset-control mode commands."""
         if not self.supports_control_mode_configuration:
             raise NotImplementedError("Control-mode settings are absent from this app profile")
+        if (
+            command == LeggettOkinCommands.CONTROL_MODE_PRESS_AND_HOLD
+            and not self.supports_control_mode_press_and_hold
+        ):
+            raise HomeAssistantError(
+                "Press-and-hold mode selection is disabled for Prodigy CE: "
+                "the SET+FLAT command can factory-reset the bed and erase its presets"
+            )
         completed = False
         deadline = (
             asyncio.get_running_loop().time()
@@ -1065,29 +1145,66 @@ class LeggettOkinController(BedController):
         """Send a keycode as a short press, then release it.
 
         Lights and massage are ordinary held keycodes in the app, not one-shot
-        recalls: a tap is one frame followed by the zero burst. Sending the
-        frame alone can leave the key asserted, so the next press of the same
+        recalls: a tap leaves one 100 ms interval after writing before release.
+        Sending the frame alone can leave the key asserted, so the next press of the same
         control may not register.
         """
         completed = False
         try:
             await self.write_command(self._build_command(command))
+            deadline = (
+                asyncio.get_running_loop().time() + LEGGETT_OKIN_PULSE_DEFAULTS[1] / 1000
+            )
+            await self._wait_hold_deadline(deadline)
             completed = True
         finally:
             await self._send_release_frames(context, raise_on_error=completed)
 
     # Light methods
+    def get_light_state(self) -> dict[str, Any]:
+        """Return only feedback from this connection, never a persisted guess."""
+        return {"is_on": self._light_is_on}
+
     async def lights_toggle(self) -> None:
-        """Toggle lights."""
-        await self._tap_keycode(LeggettOkinCommands.TOGGLE_LIGHTS, "lights_toggle")
+        """Toggle once, confirming the result when the initial state is known."""
+        if self.supports_light_state_feedback and self._light_is_on is not None:
+            await self._set_light_state(not self._light_is_on)
+        else:
+            await self._tap_keycode(LeggettOkinCommands.TOGGLE_LIGHTS, "lights_toggle")
 
     async def lights_on(self) -> None:
-        """Turn on lights (via toggle - no discrete control)."""
-        await self.lights_toggle()
+        """Turn on using verified state, without blindly inverting the light."""
+        await self._set_light_state(True)
 
     async def lights_off(self) -> None:
-        """Turn off lights (via toggle - no discrete control)."""
-        await self.lights_toggle()
+        """Turn off using verified state, without blindly inverting the light."""
+        await self._set_light_state(False)
+
+    async def _set_light_state(self, is_on: bool) -> None:
+        if not self.supports_light_state_feedback:
+            await self.lights_toggle()
+            return
+        if self._light_is_on is None:
+            raise HomeAssistantError(
+                "Light state is unknown. Use Toggle Light or the physical remote "
+                "to obtain a current status notification."
+            )
+        if self._light_is_on == is_on:
+            return
+        try:
+            await self._tap_keycode(LeggettOkinCommands.TOGGLE_LIGHTS, "lights_toggle")
+            async with asyncio.timeout(LIGHT_STATE_TIMEOUT_S):
+                while self._light_is_on != is_on:
+                    self._light_state_changed.clear()
+                    await self._light_state_changed.wait()
+        except TimeoutError as err:
+            self._light_is_on = None
+            self.forward_controller_state_update("under_bed_lights_on", None)
+            raise HomeAssistantError("The bed did not confirm the requested light state") from err
+        except (asyncio.CancelledError, BleakError, ConnectionError):
+            self._light_is_on = None
+            self.forward_controller_state_update("under_bed_lights_on", None)
+            raise
 
     # Massage methods
     #

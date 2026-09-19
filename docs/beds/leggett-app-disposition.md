@@ -86,7 +86,9 @@ Each ID names the one-based command row in its accepted `analysis.json`.
 L, P and C each have one protocol. U1/U2/U3 identify the R0 BLE, R1 BLE and
 Classic protocols respectively. All 154 structured rows appear exactly once:
 28 L + 27 P + 30 C + 23 U1 + 23 U2 + 23 U3. Dispositions total
-109 `IMPLEMENTED`, 22 `ALREADY_IMPLEMENTED`, and 23 `EXCLUDED`.
+108 `IMPLEMENTED`, 22 `ALREADY_IMPLEMENTED`, and 24 `EXCLUDED`.
+The C:23 exclusion is a subsequent hardware-evidence correction from #368;
+accepted artifact identities and analysis completion counts are unchanged.
 P's combined rows are implemented for their BLE facet; their Classic facet is
 explicitly excluded under X1 below.
 
@@ -169,7 +171,7 @@ explicitly excluded under X1 below.
 | `C:20` | favorite index 2 ui snore recall | `ALREADY_IMPLEMENTED` | Existing Prodigy CE control; baseline tests listed below. |
 | `C:21` | favorite index 3 ui fav 3 recall | `ALREADY_IMPLEMENTED` | Existing Prodigy CE control; baseline tests listed below. |
 | `C:22` | favorite store sequence | `IMPLEMENTED` | Profile-specific control, lifecycle, and capability exposure. |
-| `C:23` | press and hold settings mode | `IMPLEMENTED` | Existing values/counts retained; final explicit zero corrected to the next 100 ms tick. |
+| `C:23` | press and hold settings mode | `EXCLUDED` | CU170 hardware evidence in #368 identifies this exact SET+FLAT chord as factory reset. Hide the button and reject the command for Prodigy CE, preserving presets. |
 | `C:24` | press and release settings mode | `IMPLEMENTED` | Existing values/counts retained; final explicit zero corrected to the next 100 ms tick. |
 | `C:25` | alarm timer | `IMPLEMENTED` | Member-specific timer builder and service; normal special burst has ten attempts and no new idle release. |
 | `C:26` | alarm cancel | `IMPLEMENTED` | Member-specific timer builder and service; normal special burst has ten attempts and no new idle release. |
@@ -261,7 +263,7 @@ exposes native timers and bounded held controls through the coordinator.
 | --- | --- | --- | --- |
 | `prodigy2l` | Head, feet, lumbar | Favorite 1, Favorite 2, fixed Snore, Favorite 3 | Settings notification/init and both mode commands |
 | `prodigy2` | Head, feet, pillow | Favorite 1, Favorite 2, fixed Snore, Favorite 3 | Settings notification/init and both mode commands; BLE only here |
-| `prodigy4` | Head, feet, pillow, lumbar | Favorite 1, Favorite 2, fixed Snore, Favorite 3 | Settings notification/init and both mode commands |
+| `prodigy4` | Head, feet, pillow, lumbar | Favorite 1, Favorite 2, fixed Snore, Favorite 3 | Settings notification/init and press-and-release mode; SET+FLAT excluded after #368 hardware evidence |
 | `useries` | Head, feet, pillow | Two held memory recalls, held Snore and held SET | LED notification only; no settings service, mode commands, lumbar or direct third/fourth memory recall |
 
 All profiles have Flat, underbed-light toggle, head/foot massage intensity
@@ -274,8 +276,8 @@ remote-code or model query is inferred from these apps.
 The following 21 rows cover non-command behavior and exclusions. They are
 separate from the 154 command rows: ten `IMPLEMENTED`, four
 `ALREADY_IMPLEMENTED`, and seven `EXCLUDED`. The combined discovery ledger
-therefore contains 175 rows: 119 implemented, 26 already implemented and
-30 excluded. Candidate and comparison tables below cross-reference these rows
+therefore contains 175 rows: 118 implemented, 26 already implemented and
+31 excluded. Candidate and comparison tables below cross-reference these rows
 and do not add duplicate findings to that total.
 
 | ID | Discovery and evidence | Disposition | Integration result |
@@ -512,3 +514,20 @@ actuator labels, timer behavior on R0 hardware, and actual LED/status meanings.
 Those physical checks are deferred external validation, not unfinished
 implementation or a request for the maintainer to obtain hardware. Raw APKs,
 decompiled code, frozen reports and validation evidence stay machine-local.
+
+## CU170 hardware follow-up, issue #368
+
+The [August hardware report](https://github.com/kristofferR/ha-adjustable-bed/issues/368#issuecomment-5481326088)
+supplements the accepted static evidence: the main channel's 20-byte `09 0B`
+frame reports light state (`0x20000`), alarm (`0x400000`), and sleep timer
+(`0x800000`). The Prodigy CE implementation recognizes that layout and publishes
+a feedback-driven light. Old-state receipts and spontaneous new-state updates
+are both consumed; other profiles keep the app parser. See
+[the protocol documentation](leggett-okin.md#notifications) for validation,
+unknown-state behavior, and remaining physical validation.
+
+The app calls C:23 a mode change, but hardware identifies its SET+FLAT bits as a
+destructive reset. Physical evidence takes precedence for Prodigy CE. The report
+itself remains frozen: this changes the integration disposition, not the app's
+recovered behavior. Light/massage taps also retain a full 100 ms interval before
+release, addressing the later report of light toggles failing on fast links.

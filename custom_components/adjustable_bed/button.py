@@ -284,7 +284,7 @@ BUTTON_DESCRIPTIONS: tuple[AdjustableBedButtonEntityDescription, ...] = (
         entity_category=EntityCategory.CONFIG,
         press_fn=lambda ctrl: ctrl.set_control_mode_press_and_hold(),
         cancel_movement=True,
-        required_capability="supports_control_mode_configuration",
+        required_capability="supports_control_mode_press_and_hold",
     ),
     AdjustableBedButtonEntityDescription(
         key="control_mode_press_and_release",

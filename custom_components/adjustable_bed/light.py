@@ -111,7 +111,8 @@ def _light_entities_for(
         return [AdjustableBedLight(coordinator, LIGHT_DESCRIPTION)]
 
     if (
-        coordinator.bed_type == BED_TYPE_SLEEP_NUMBER_MCR
+        controller.supports_light_state_feedback
+        or coordinator.bed_type == BED_TYPE_SLEEP_NUMBER_MCR
         and controller.supports_discrete_light_control
     ):
         _async_remove_stale_switch_entity(hass, coordinator)
@@ -325,7 +326,7 @@ class AdjustableBedLight(AdjustableBedEntity, RestoreEntity, LightEntity):
         self.async_write_ha_state()
 
 class AdjustableBedOnOffLight(AdjustableBedEntity, RestoreEntity, LightEntity):
-    """On/off under-bed light for BAM/MCR-style beds."""
+    """On/off under-bed light, optionally driven solely by device feedback."""
 
     entity_description: LightEntityDescription
 
@@ -343,30 +344,54 @@ class AdjustableBedOnOffLight(AdjustableBedEntity, RestoreEntity, LightEntity):
         self._set_sided_translation_key(description.translation_key, description.key)
         self._attr_unique_id = coordinator.entity_unique_id(description.key)
         self._attr_is_on: bool | None = None
+        controller = coordinator.capability_controller
+        self._feedback_only = controller is not None and controller.supports_light_state_feedback
         self._unregister_callback: Callable[[], None] | None = None
+        self._unregister_connection: Callable[[], None] | None = None
 
     async def async_added_to_hass(self) -> None:
         """Subscribe to controller-state updates for the light."""
         await super().async_added_to_hass()
-        if (last_state := await self.async_get_last_state()) is not None:
+        if not self._feedback_only and (last_state := await self.async_get_last_state()) is not None:
             self._attr_is_on = last_state.state == STATE_ON
         self._unregister_callback = self._coordinator.register_controller_state_callback(
             self._handle_controller_state_update
         )
+        if self._feedback_only:
+            self._unregister_connection = self._coordinator.register_connection_state_callback(
+                self._handle_connection_state_update
+            )
 
     async def async_will_remove_from_hass(self) -> None:
         """Clean up controller-state callback registration."""
         if self._unregister_callback is not None:
             self._unregister_callback()
             self._unregister_callback = None
+        if self._unregister_connection is not None:
+            self._unregister_connection()
+            self._unregister_connection = None
         await super().async_will_remove_from_hass()
+
+    @callback
+    def _handle_connection_state_update(self, connected: bool) -> None:
+        """Invalidate feedback across both clean and unexpected disconnects."""
+        if not connected:
+            self._attr_is_on = None
+            self.async_write_ha_state()
+        else:
+            self._handle_controller_state_update({})
 
     @callback
     def _handle_controller_state_update(self, state: dict[str, Any]) -> None:
         """Update state from controller light telemetry when available."""
-        if "under_bed_lights_on" not in state:
+        if self._feedback_only:
+            controller = self._coordinator.controller
+            value = controller.get_light_state().get("is_on") if controller is not None else None
+        elif "under_bed_lights_on" in state:
+            value = state["under_bed_lights_on"]
+        else:
             return
-        self._attr_is_on = bool(state["under_bed_lights_on"])
+        self._attr_is_on = None if value is None else bool(value)
         self.async_write_ha_state()
 
     async def async_turn_on(self, **kwargs: object) -> None:
@@ -376,8 +401,9 @@ class AdjustableBedOnOffLight(AdjustableBedEntity, RestoreEntity, LightEntity):
             lambda ctrl: ctrl.lights_on(),
             cancel_running=False,
         )
-        self._attr_is_on = True
-        self.async_write_ha_state()
+        if not self._feedback_only:
+            self._attr_is_on = True
+            self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: object) -> None:
         """Turn the under-bed light off."""
@@ -386,5 +412,16 @@ class AdjustableBedOnOffLight(AdjustableBedEntity, RestoreEntity, LightEntity):
             lambda ctrl: ctrl.lights_off(),
             cancel_running=False,
         )
-        self._attr_is_on = False
-        self.async_write_ha_state()
+        if not self._feedback_only:
+            self._attr_is_on = False
+            self.async_write_ha_state()
+
+    async def async_toggle(self, **kwargs: object) -> None:
+        """Use the native toggle even before feedback has established state."""
+        if not self._feedback_only:
+            await super().async_toggle(**kwargs)
+            return
+        await self._coordinator.async_execute_controller_command(
+            lambda ctrl: ctrl.lights_toggle(),
+            cancel_running=False,
+        )

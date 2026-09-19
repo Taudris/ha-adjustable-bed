@@ -178,24 +178,62 @@ LED/status bitmask from operations 6, 7, 8, 9, and 11, but only assigns UI
 meaning to sleep timer (`0x8000`) and alarm (`0x4000`). No parsed value ever
 influences a later command.
 
-There is **no position, angle, percentage, motor-state or error feedback of any
-kind** in either app. CU170 hardware testing confirms that the opaque bitmask
-contains light state, but the app never labels that bit and the available
-captures do not include a paired light-off/light-on notification. The exact
-mask and polarity therefore still require that capture. Until then the
-integration keeps the light as a blind toggle rather than guessing.
+There is **no position, angle, percentage or motor-state feedback**. The
+[CU170 hardware report in #368](https://github.com/kristofferR/ha-adjustable-bed/issues/368#issuecomment-5481326088)
+provides the physical meaning absent from the app analysis. In the Prodigy CE
+profile, the integration recognizes a 20-byte status frame on the main status
+characteristic: `09 0B`, two identical big-endian status dwords, `FF`, and nine
+uninterpreted trailing bytes. Invalid length, footer or duplicated fields are
+ignored. Other app profiles retain their artifact-derived parser.
 
-The integration subscribes to the main status characteristic and, for the
-Prodigy profiles when present, the optional Smart Remote CSS status characteristic.
-It runs the app's exact
-operations 6/7/8/9/11 parser and records the resulting opaque LED mask, signed
-status byte, and the two app-labelled alarm/sleep bits in protocol diagnostics.
-Raw LED-mask and signed-status sensors expose the parsed values. Available
-standard Device Information strings are read for diagnostics. No unlabeled bit
-is assigned a new physical meaning.
-Alarm and sleep-timer indicator binary sensors use the independently proven app
-masks. U Series applies its app's low-byte suppression to those indicators while
-preserving the raw mask unchanged.
+| CU170 status mask | Meaning |
+|---|---|
+| `0x00020000` | Under-bed light on |
+| `0x00400000` | Alarm armed |
+| `0x00800000` | Sleep timer armed |
+
+The receipt for a toggle contains the **old** light state. A separate spontaneous
+notification contains the **new** state, including changes from the physical
+remote. Every valid notification is processed; notifications are not counted as
+one receipt per write. Alarm and sleep indicators use the hardware masks after
+a CU170 status frame is recognized, rather than the app's `0x4000`/`0x8000`
+labels. CSS settings notifications cannot overwrite this hardware status.
+
+Prodigy CE exposes an under-bed **light entity** backed by those notifications.
+On/off actions only toggle when the known state differs from the requested
+state, then wait up to three seconds for confirmation. A missing confirmation
+leaves the light unknown and reports an error without retrying the toggle.
+State is not restored from an earlier Home Assistant session and is cleared on
+disconnect. **Toggle Light** remains available, as does `light.toggle`, even
+before the first status update. If an on/off action reports unknown state, use
+either toggle or the physical remote to obtain a live notification.
+
+Light and massage taps now leave one 100 ms command interval before the release
+burst. Previously the first zero could follow the press immediately, making
+the light toggle too short to register. This uses the accepted app cadence;
+the precise minimum hardware debounce interval is not established.
+
+The integration also retains raw LED-mask and signed-status sensors for the
+app parser, and reads available standard Device Information strings for
+diagnostics. CU170 frames have no decoded signed-status field. Other profiles
+retain the app's alarm and sleep masks; U Series applies its app's low-byte
+suppression while preserving the raw mask.
+
+### Remaining hardware observations
+
+The reporter measured one light pulse when memory storage arms and three when
+a preset is saved. Those pulses also affect the real light state. Programming
+continues to use the accepted app's bounded five-second arm and two-second slot
+sequence. An acknowledgement-driven optimization needs paired raw traces of
+both initial light states to distinguish the initial dark interval, pulses,
+and final restoration safely. It must never combine SET with FLAT, the reported
+factory-reset chord. The existing store path sends each key separately.
+
+The CU170 can be configured for latched or hold-required presets. Memory recalls
+use the app's short recall burst; `adjustable_bed.leggett_hold_control` supplies
+an explicit held duration for boxes in hold-required mode. Flat retains its
+bounded held-command behavior. Hardware validation of this change remains for
+users after a beta or release; maintainers do not need to acquire a bed.
 
 ## Sleep and alarm timers
 
@@ -220,7 +258,14 @@ does not expose these settings or initialize the optional CSS channel.
 | Press-and-hold | `0x08010000` | 55 attempts at 100 ms, then one zero frame |
 | Press-and-release | `0x01800000` | 55 attempts at 100 ms, then one zero frame |
 
-Home Assistant exposes these as configuration buttons rather than a select,
+**Prodigy CE exception:** #368 reports that SET+FLAT (`0x08010000`) factory-resets
+the CU170 and wipes its saved presets. For this profile, Home Assistant removes
+the press-and-hold configuration button and refuses the command even when
+called through an old entity. Use the physical remote's documented procedure
+for mode changes. The press-and-release button remains available.
+
+For the other Prodigy profiles, Home Assistant exposes both configuration
+buttons rather than a select,
 because neither notification channel reports the currently active mode. On
 boxes with the optional Smart Remote CSS service, notification setup also sends
 the app's raw `01 02` initialization write.
@@ -231,13 +276,13 @@ Command values, framing, timing, notification parsing and release semantics
 come from the accepted Phase 4 clean-room analysis of `com.leggett.prodigy4`
 1.2.0 (versionCode 18, artifact SHA-256 `45922c518c9e8070…`), traced from layout
 binding to the GATT boundary and independently audited. The report is COMPLETE;
-the missing light-bit meaning is explicitly deferred physical validation, not
-an unresolved APK-analysis path. The [whole-cluster disposition](leggett-app-disposition.md)
+the hardware status mapping above supplements that frozen app evidence and does
+not modify or replace the accepted analysis. The [whole-cluster disposition](leggett-app-disposition.md)
 records all four accepted report identities, previously implemented behavior,
 remaining findings, exact app differences and transport exclusions.
 
 Unverified against hardware, and worth a capture if you have the equipment:
 which frame revision real units use, whether preset recall truly ends without a
 terminator, whether changing control mode also resets editable favorites on all
-firmware, and which opaque notification-mask bit and polarity represent the
-under-bed light.
+firmware, and whether the corrected tap interval registers reliably on both
+local adapters and wireless proxies.
