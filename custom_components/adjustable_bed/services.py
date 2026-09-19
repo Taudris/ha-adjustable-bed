@@ -34,6 +34,7 @@ from .const import (
     BED_TYPE_LEGGETT_OKIN,
     BED_TYPE_LINAK,
     BED_TYPE_LOGICDATA_APP,
+    BED_TYPE_SLEEP_NUMBER_MCR,
     BED_TYPE_SLEEPYS_BOX25,
     CONF_BED_TYPE,
     CONF_MOTOR_COUNT,
@@ -156,6 +157,11 @@ JIECANG_WAKE_PRESETS = ("flat", "zero_g", "anti_snore", "memory_1", "memory_2")
 JIECANG_ALARM_PRESETS = (*JIECANG_WAKE_PRESETS, "yoga")
 
 LOGICDATA_ALARM_PRESETS = ("flat", "zero_g", "anti_snore", "memory_1", "memory_2")
+
+POSITION_MOTOR_OPTIONS = (
+    "back", "legs", "head", "feet", "lumbar",
+    "left_back", "right_back", "left_legs", "right_legs",
+)
 
 TIMED_MOVE_MOTOR_OPTIONS = (
     "tv_lift",
@@ -710,9 +716,22 @@ async def _set_position_plan(
             BED_TYPE_KEESON,
             BED_TYPE_ERGOMOTION,
             BED_TYPE_SLEEPYS_BOX25,
+            BED_TYPE_SLEEP_NUMBER_MCR,
         ) or (bed_type == BED_TYPE_KAIDI and supports_direct_position_control)
 
-        if bed_type == BED_TYPE_KAIDI and supports_direct_position_control:
+        if bed_type == BED_TYPE_SLEEP_NUMBER_MCR:
+            motor_configs = {
+                spec.position_key: {
+                    "position_key": spec.position_key,
+                    "move_up_fn": spec.open_fn,
+                    "move_down_fn": spec.close_fn,
+                    "move_stop_fn": spec.stop_fn,
+                    "max_value": spec.native_max_value,
+                }
+                for spec in controller.position_number_specs
+            }
+            valid_motors = set(motor_configs)
+        elif bed_type == BED_TYPE_KAIDI and supports_direct_position_control:
             valid_motors = {"back", "legs"}
             motor_configs = {
                 "back": {
@@ -2027,8 +2046,10 @@ async def async_register_services(hass: HomeAssistant) -> None:
         return  # Services already registered
 
     from .rmcontrol_services import async_register_rmcontrol_services
+    from .sleep_number_services import async_register_sleep_number_services
 
     async_register_rmcontrol_services(hass)
+    async_register_sleep_number_services(hass)
 
     hass.services.async_register(
         DOMAIN,
@@ -2072,7 +2093,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
         schema=vol.Schema(
             {
                 vol.Required(CONF_DEVICE_ID): cv.ensure_list,
-                vol.Required(ATTR_MOTOR): vol.In(["back", "legs", "head", "feet", "lumbar"]),
+                vol.Required(ATTR_MOTOR): vol.In(POSITION_MOTOR_OPTIONS),
                 # No max cap here - per-motor validation handles bed-specific limits
                 vol.Required(ATTR_POSITION): vol.All(vol.Coerce(float), vol.Range(min=0)),
                 **SIDE_FIELD,
@@ -2089,7 +2110,7 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 vol.Required(ATTR_POSITIONS): vol.All(
                     [
                         {
-                            vol.Required(ATTR_MOTOR): vol.In(["back", "legs", "head", "feet", "lumbar"]),
+                            vol.Required(ATTR_MOTOR): vol.In(POSITION_MOTOR_OPTIONS),
                             vol.Required(ATTR_POSITION): vol.All(
                                 vol.Coerce(float), vol.Range(min=0)
                             ),

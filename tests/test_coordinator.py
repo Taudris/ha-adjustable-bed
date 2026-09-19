@@ -60,6 +60,7 @@ from custom_components.adjustable_bed.const import (
     CONF_PREFERRED_ADAPTER,
     CONF_PROTOCOL_VARIANT,
     CONF_RICHMAT_REMOTE,
+    CONF_SLEEP_NUMBER_MCR_CLIENT_ID,
     DEFAULT_MOTOR_PULSE_COUNT,
     DEFAULT_MOTOR_PULSE_DELAY_MS,
     DEVICE_INFO_CHARS,
@@ -76,6 +77,7 @@ from custom_components.adjustable_bed.const import (
     OKIN_SMART_REMOTE_CSS_SERVICE_UUID,
     OKIN_SMART_REMOTE_CSS_WRITE_CHAR_UUID,
     RICHMAT_REMOTE_AUTO,
+    SLEEP_NUMBER_AUTH_CHAR_UUID,
 )
 from custom_components.adjustable_bed.coordinator import (
     BOND_LATCH_RETEST_AFTER,
@@ -3052,8 +3054,124 @@ class TestDisconnectCommandSerialization:
         await coordinator.async_disconnect()
 
 
+class TestSleepNumberAuthentication:
+    """Only valid Auth reads prove the session, never a successful pair call."""
+
+    @pytest.mark.parametrize(
+        "moving,stopping",
+        [("motor:back", "motor:legs"), ("side:right:motor:back", "side:left:motor:legs")],
+    )
+    @pytest.mark.parametrize("grouped", [False, True])
+    async def test_global_halt_preempts_other_motor_before_taking_wire_lock(
+        self, hass: HomeAssistant, mock_config_entry, mock_coordinator_connected,
+        moving: str, stopping: str, grouped: bool,
+    ):
+        del mock_coordinator_connected
+        hass.config_entries.async_update_entry(
+            mock_config_entry, data={**mock_config_entry.data, CONF_BED_TYPE: BED_TYPE_SLEEP_NUMBER}
+        )
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        assert await coordinator.async_connect()
+        started = asyncio.Event()
+        events: list[str] = []
+
+        async def movement(_controller):
+            started.set()
+            await coordinator.cancel_command.wait()
+            events.append("movement_cleanup")
+
+        async def halt(_controller):
+            events.append("halt")
+
+        async def run_movement():
+            await coordinator.async_execute_controller_command(movement, resource=moving)
+
+        task = asyncio.create_task(
+            coordinator.async_execute_command_group([run_movement], resources=[moving])
+            if grouped else run_movement()
+        )
+        await started.wait()
+        async with asyncio.timeout(1):
+            await coordinator.async_execute_controller_command(halt, resource=stopping)
+            await task
+        assert events == ["movement_cleanup", "halt"]
+        await coordinator.async_disconnect()
+
+    async def test_malformed_auth_does_not_cache_successful_pair_request(
+        self, hass: HomeAssistant, mock_coordinator_connected, mock_bleak_client
+    ):
+        del mock_coordinator_connected
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={
+                CONF_ADDRESS: TEST_ADDRESS,
+                CONF_NAME: "Sleep Number",
+                CONF_BED_TYPE: BED_TYPE_SLEEP_NUMBER,
+                CONF_DISABLE_ANGLE_SENSING: True,
+            },
+        )
+        entry.add_to_hass(hass)
+        coordinator = AdjustableBedCoordinator(hass, entry)
+        coordinator._max_retries = 1
+        mock_bleak_client.read_gatt_char = AsyncMock(return_value=b"\x00\x00")
+        assert not await coordinator.async_connect()
+        mock_bleak_client.pair.assert_awaited_once()
+        mock_bleak_client.start_notify.assert_not_awaited()
+        assert not entry.data.get(CONF_BLE_BOND_ESTABLISHED)
+
+    @pytest.mark.parametrize("auth", [b"\x00\x00", bytes.fromhex("123456789abcdef0123456789abcdef0")])
+    async def test_live_pairing_requires_session_proof(
+        self, hass: HomeAssistant, mock_bleak_client, auth: bytes
+    ):
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={
+                CONF_ADDRESS: TEST_ADDRESS,
+                CONF_NAME: "Sleep Number",
+                CONF_BED_TYPE: BED_TYPE_SLEEP_NUMBER,
+            },
+        )
+        entry.add_to_hass(hass)
+        coordinator = AdjustableBedCoordinator(hass, entry)
+        coordinator._client = mock_bleak_client
+        mock_bleak_client.read_gatt_char = AsyncMock(return_value=auth)
+        result = await coordinator.async_pair_now()
+        assert result is (len(auth) == 16)
+        assert bool(entry.data.get(CONF_BLE_BOND_ESTABLISHED)) is result
+        mock_bleak_client.read_gatt_char.assert_awaited_once_with(SLEEP_NUMBER_AUTH_CHAR_UUID)
+        mock_bleak_client.start_notify.assert_not_awaited()
+
+
 class TestSleepNumberMcrCoordinatorLifecycle:
     """Test Sleep Number MCR coordinator lifecycle behavior."""
+
+    @pytest.mark.parametrize("stored_id", [None, 0, True, -1, 2**64, 123456789])
+    async def test_client_identity_persists_across_connections(
+        self, hass: HomeAssistant, mock_coordinator_connected, stored_id
+    ):
+        """Binding reuses a valid random identity rather than minting one per session."""
+        del mock_coordinator_connected
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={
+                CONF_ADDRESS: "AA:BB:CC:DD:EE:52",
+                CONF_NAME: "MCR",
+                CONF_BED_TYPE: BED_TYPE_SLEEP_NUMBER_MCR,
+                CONF_SLEEP_NUMBER_MCR_CLIENT_ID: stored_id,
+                CONF_DISABLE_ANGLE_SENSING: True,
+            },
+        )
+        entry.add_to_hass(hass)
+        coordinator = AdjustableBedCoordinator(hass, entry)
+        assert await coordinator.async_connect()
+        identity = entry.data[CONF_SLEEP_NUMBER_MCR_CLIENT_ID]
+        assert type(identity) is int and 0 < identity < 2**64
+        if stored_id == 123456789:
+            assert identity == stored_id
+        await coordinator.async_disconnect()
+        assert await coordinator.async_connect()
+        assert entry.data[CONF_SLEEP_NUMBER_MCR_CLIENT_ID] == identity
+        await coordinator.async_disconnect()
 
     async def test_sleep_number_mcr_ignores_disconnect_after_command(
         self,

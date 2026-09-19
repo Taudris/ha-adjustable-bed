@@ -7,6 +7,7 @@ import contextlib
 import inspect
 import logging
 import random
+import secrets
 import time
 import traceback
 from collections import deque
@@ -138,6 +139,7 @@ from .const import (
     CONF_RMCONTROL_PRODUCT,
     CONF_RMCONTROL_SIDE,
     CONF_SIDE,
+    CONF_SLEEP_NUMBER_MCR_CLIENT_ID,
     CONNECTION_PROFILES,
     DEFAULT_BACK_MAX_ANGLE,
     DEFAULT_CONNECTION_PROFILE,
@@ -1671,6 +1673,8 @@ class AdjustableBedCoordinator:
             if self._client is not None and self._client.is_connected:
                 pairing_details: dict[str, Any] = {}
                 if await self._async_pair_on_live_link(pairing_details):
+                    if self._bed_type == BED_TYPE_SLEEP_NUMBER:
+                        return await self._async_verify_bonded() and self._ble_bond_established
                     self._mark_ble_bond_established()
                     await delete_pairing_required_issue(self.hass, self._address)
                     return True
@@ -1715,7 +1719,12 @@ class AdjustableBedCoordinator:
 
         probe_uuid = DEVICE_INFO_CHARS["model_number"]
         try:
-            await asyncio.wait_for(client.read_gatt_char(probe_uuid), DEVICE_INFO_READ_TIMEOUT)
+            if self._bed_type == BED_TYPE_SLEEP_NUMBER:
+                from .sleep_number_auth import async_read_sleep_number_session
+
+                await async_read_sleep_number_session(client)
+            else:
+                await asyncio.wait_for(client.read_gatt_char(probe_uuid), DEVICE_INFO_READ_TIMEOUT)
         except BleakError as err:
             if _is_ble_authentication_error(err):
                 # We run inside _async_connect_locked, which holds self._lock —
@@ -1763,6 +1772,12 @@ class AdjustableBedCoordinator:
             self._record_bond_verification("timed_out", err, attempt_details)
             return True
 
+        return await self._async_record_verified_bond(attempt_details)
+
+    async def _async_record_verified_bond(
+        self, attempt_details: dict[str, Any] | None = None
+    ) -> bool:
+        """Record a successful protocol-specific authenticated read."""
         # Read succeeded → the encrypted link works → we are bonded. Record which
         # transport carried that proof, so a later unpair or recovery knows where
         # the bond actually lives instead of guessing (issue #459).
@@ -2741,12 +2756,7 @@ class AdjustableBedCoordinator:
                     # the post-connect bond probe) fail. This also covers the
                     # no-pair verify retry after a failed pair attempt, which must
                     # see live services to confirm the bond instead of looping.
-                    #
-                    # Sleep Number Climate 360 does not pair (see BEDS_REQUIRING_PAIRING)
-                    # but the SleepIQ app refreshes the GATT cache on every connect, so
-                    # force fresh discovery to keep parity and ensure the app-layer
-                    # priming reads always see the live characteristic handles.
-                    disable_cache = bed_requires_pairing or self._bed_type == BED_TYPE_SLEEP_NUMBER
+                    disable_cache = bed_requires_pairing
                     try:
                         self._client = await establish_connection(
                             BleakClient,
@@ -2759,7 +2769,7 @@ class AdjustableBedCoordinator:
                             pair=use_pairing and not pair_after_service_discovery,
                             use_services_cache=not disable_cache,
                         )
-                        # LP Control requests the Android bond only after the
+                        # LP Control and Sleep Number request the bond after the
                         # unbonded GATT link has reported SERVICES_DISCOVERED.
                         # establish_connection() returns after Bleak has loaded
                         # the service collection, so pairing here preserves that
@@ -2775,7 +2785,8 @@ class AdjustableBedCoordinator:
                         # If we get here with pairing enabled, mark it as supported
                         if use_pairing and bond_created:
                             self._pairing_supported = True
-                            self._mark_ble_bond_established()
+                            if self._bed_type != BED_TYPE_SLEEP_NUMBER:
+                                self._mark_ble_bond_established()
                             pairing_details["adapter_pairing_supported"] = True
                             pairing_details["connection_result"] = "pairing_connection_succeeded"
                         elif use_pairing:
@@ -3139,6 +3150,20 @@ class AdjustableBedCoordinator:
                         sorted(manufacturer_data),
                     )
 
+                if self._bed_type == BED_TYPE_SLEEP_NUMBER_MCR:
+                    client_id = self.entry.data.get(CONF_SLEEP_NUMBER_MCR_CLIENT_ID)
+                    if type(client_id) is not int or not 0 < client_id < 2**64:
+                        # The app persists a random client identity; it is not
+                        # the bed's MAC address or the assigned session address.
+                        self._begin_internal_entry_update(self._ble_bond_established)
+                        self._async_persist_config(
+                            {
+                                **self.entry.data,
+                                CONF_SLEEP_NUMBER_MCR_CLIENT_ID: secrets.randbits(64) or 1,
+                            },
+                            keys={CONF_SLEEP_NUMBER_MCR_CLIENT_ID},
+                        )
+
                 stored_capabilities = self.entry.data.get("capabilities")
                 stored_capability_snapshot: Mapping[str, Any] | None = None
                 if isinstance(stored_capabilities, dict):
@@ -3219,6 +3244,11 @@ class AdjustableBedCoordinator:
                 # Sleep Number MCR performs its notify+init startup earlier.
                 if self._bed_type != BED_TYPE_SLEEP_NUMBER_MCR:
                     await self.async_start_notify()
+                    if self._bed_type == BED_TYPE_SLEEP_NUMBER:
+                        # Its notification startup first validates the Auth
+                        # session. Reuse that proof instead of reading Auth
+                        # again after subscriptions have been established.
+                        await self._async_record_verified_bond(attempt_details)
 
                 # Notification startup may finish deferred capability discovery
                 # after the BLE authentication window, so schedule from the final
@@ -4351,6 +4381,18 @@ class AdjustableBedCoordinator:
                 if self._client is not None and self._client.is_connected:
                     self._reset_disconnect_timer()
 
+    def _protocol_command_resources(self, resources: frozenset[str]) -> frozenset[str]:
+        """Keep Fuzion movements in the same scope as their global halt."""
+        if self._bed_type == BED_TYPE_SLEEP_NUMBER and any(
+            item == "*"
+            or item.startswith("motor:")
+            or ":motor:" in item
+            or (item.startswith("side:") and item.endswith(":*"))
+            for item in resources
+        ):
+            return command_resources("*")
+        return resources
+
     def request_command_cancel(
         self,
         resource: str | None = None,
@@ -4372,7 +4414,7 @@ class AdjustableBedCoordinator:
         )
         self._cancel_counter += 1
         self._cancel_command.set()
-        self._command_scheduler.request_cancel(command_scope)
+        self._command_scheduler.request_cancel(self._protocol_command_resources(command_scope))
 
     async def async_stop_command(self) -> None:
         """Immediately stop any running command and send stop to bed."""
@@ -4812,7 +4854,7 @@ class AdjustableBedCoordinator:
 
         return CommandIntent(
             scheduled,
-            resources=command_scope,
+            resources=self._protocol_command_resources(command_scope),
             kind=kind,
             replacement_key=(resource or "*") if resources is None else None,
             cancel_running=cancel_running,
@@ -4899,7 +4941,7 @@ class AdjustableBedCoordinator:
 
         intent = CommandIntent(
             scheduled,
-            resources=command_resources(*resources),
+            resources=self._protocol_command_resources(command_resources(*resources)),
             kind=CommandKind.GROUP,
             cancel_running=cancel_running,
             group_id=group_id or uuid4().hex,

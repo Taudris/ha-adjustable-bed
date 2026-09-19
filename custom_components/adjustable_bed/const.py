@@ -153,6 +153,7 @@ CONF_BLE_BOND_CONTEXT: Final = "ble_bond_context"
 # CONF_BLE_BOND_CONTEXT, which is built solely from positive proof and is what
 # authorizes removing a host bond; nothing unproven may ever look like that.
 CONF_BLE_BOND_ATTEMPTED_SOURCE: Final = "ble_bond_attempted_source"
+CONF_SLEEP_NUMBER_MCR_CLIENT_ID: Final = "sleep_number_mcr_client_id"
 # Bond state belongs to one BLE address, not to a config entry: whatever a side
 # proved or removed while it was part of a paired bed stays true afterwards.
 RUNTIME_BOND_KEYS: Final = (
@@ -470,7 +471,6 @@ OFFLINE_CAPABILITY_SAFE_BED_TYPES: Final = frozenset(
         BED_TYPE_SERTA,
         BED_TYPE_OKIN_FFE,
         BED_TYPE_BEDTECH,
-        BED_TYPE_SLEEP_NUMBER_MCR,
         BED_TYPE_SLEEPYS_BOX15,
         BED_TYPE_SLEEPYS_BOX24,
         BED_TYPE_SVANE,
@@ -2188,16 +2188,11 @@ ALL_PROTOCOL_VARIANTS: Final = [
 # Bed types that require BLE pairing before they can be controlled
 # These beds use encrypted connections and must be paired at the OS level.
 #
-# NOTE: Sleep Number Climate 360 / FlexFit (Fuzion "bamkey") is deliberately
-# NOT listed here. The official SleepIQ app never creates an OS-level BLE bond
-# (there is no createBond/ensureBond call in the decompiled Fuzion BLE manager,
-# and the Auth characteristic is read-only). The bed "authenticates" purely at
-# the application layer by reading the Auth + TransferInfo characteristics after
-# every connect — handled by SleepNumberController._ensure_bed_presence_channel_primed().
-# Forcing OS-level pair=True made ESP-IDF/ESPHome Bluetooth proxies return
-# "auth fail reason=82" and leave the link wedged in the ESTABLISHED state, which
-# broke every subsequent reconnect until the proxy was factory reset (issue #318).
+# Sleep Number 5.4.11 explicitly bonds after GATT discovery, then reads its
+# session Auth UUID before subscribing. Do not use connect(pair=True) for it:
+# the ordering differs, and re-pairing existing bonds caused failures in #318.
 BEDS_REQUIRING_PAIRING: Final[set[str]] = {
+    BED_TYPE_SLEEP_NUMBER,
     BED_TYPE_OKIN_UUID,
     BED_TYPE_OKIN_CST,
     BED_TYPE_OKIN_RF_ECO_BT,
@@ -2246,11 +2241,11 @@ def requires_pairing_after_service_discovery(
 ) -> bool:
     """Return True when GATT discovery must precede the BLE bond request.
 
-    LP Control connects and discovers services before calling the Android
+    LP Control and Sleep Number connect and discover services before calling the Android
     bonding API. BlueZ's usual ``pair=True`` path instead invokes
     ``Device1.Pair`` without first making the ordinary unbonded GATT connection.
     """
-    if bed_type == BED_TYPE_LEGGETT_GEN2:
+    if bed_type in (BED_TYPE_LEGGETT_GEN2, BED_TYPE_SLEEP_NUMBER):
         return True
     return bed_type == BED_TYPE_LEGGETT_PLATT and protocol_variant == LEGGETT_VARIANT_GEN2
 
@@ -2313,9 +2308,8 @@ BEDS_WITH_ANGLE_SENSING: Final = frozenset(
 # Includes all angle sensing beds plus beds that report percentage positions
 # Note: BED_TYPE_KEESON is NOT included here because only the ergomotion variant supports
 # position feedback - this is handled specially in number.py with variant checking
-# Note: BED_TYPE_SLEEP_NUMBER_MCR (BAM beds) is NOT included - the MCR controller only
-# reports sleep-number values and bed presence over BLE, never motor angle/position
-# feedback, so it must not get angle sensors or position-seeking number entities (#322).
+# Sleep Number MCR exposes positions only when foundation discovery proves the
+# corresponding actuator exists; its controller supplies the per-side specs.
 BEDS_WITH_POSITION_FEEDBACK: Final = frozenset(
     {
         BED_TYPE_LINAK,
@@ -2327,6 +2321,7 @@ BEDS_WITH_POSITION_FEEDBACK: Final = frozenset(
         BED_TYPE_JENSEN,
         BED_TYPE_LIMOSS,
         BED_TYPE_SLEEP_NUMBER,
+        BED_TYPE_SLEEP_NUMBER_MCR,
         BED_TYPE_VIBRADORM,
         BED_TYPE_SLEEPYS_BOX25,
         BED_TYPE_SLEEPSTAR,
@@ -2351,8 +2346,7 @@ def bed_type_has_position_feedback(bed_type: str | None, protocol_variant: str |
 
 
 # Bed types that may have angle sensing enabled in an existing entry but report no
-# degree-angle data. Sleep Number MCR/BAM reports only sleep-number values and bed
-# presence, while CST, RF ECO BT and the Jiecang apps expose no reliable position feedback. Skip
+# degree-angle data. CST, RF ECO BT and the Jiecang apps expose no reliable position feedback. Skip
 # their entity creation and remove stale sensors from earlier profiles so they do
 # not remain "unknown" forever (#322, #344, #501).
 BEDS_WITHOUT_ANGLE_FEEDBACK: Final = frozenset(
@@ -2362,7 +2356,6 @@ BEDS_WITHOUT_ANGLE_FEEDBACK: Final = frozenset(
         BED_TYPE_LEGGETT_LP_LEGACY,
         BED_TYPE_OKIN_CST,
         BED_TYPE_OKIN_RF_ECO_BT,
-        BED_TYPE_SLEEP_NUMBER_MCR,
     }
 )
 
@@ -2380,6 +2373,7 @@ BEDS_WITH_PERCENTAGE_POSITIONS: Final = frozenset(
         BED_TYPE_OKIN_FFE,
         BED_TYPE_JENSEN,
         BED_TYPE_SLEEP_NUMBER,
+        BED_TYPE_SLEEP_NUMBER_MCR,
         BED_TYPE_SLEEPYS_BOX25,
         BED_TYPE_SLEEPSTAR,
     }

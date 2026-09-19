@@ -22,6 +22,7 @@ from .const import (
     BED_TYPE_JIECANG_APP,
     BED_TYPE_LINAK,
     BED_TYPE_LOGICDATA_APP,
+    BED_TYPE_SLEEP_NUMBER_MCR,
     BED_TYPE_SLEEPSTAR,
     BED_TYPE_SOLACE,
     BEDS_WITHOUT_ANGLE_FEEDBACK,
@@ -131,6 +132,12 @@ NUMBER_DESCRIPTIONS: tuple[AdjustableBedNumberEntityDescription, ...] = (
         max_angle=45.0,
         min_motors=4,
     ),
+)
+
+
+_POSITION_ENTITY_KEYS = frozenset(
+    [description.key for description in NUMBER_DESCRIPTIONS]
+    + [f"{axis}_position_{side}" for axis in ("back", "legs") for side in ("left", "right")]
 )
 
 
@@ -325,15 +332,13 @@ def _number_entities_for(
     # existing installs do not keep dead orphaned numbers (#322, #344).
     if bed_type in BEDS_WITHOUT_ANGLE_FEEDBACK:
         _async_remove_stale_position_entities(hass, coordinator)
-    elif bed_type == BED_TYPE_LINAK and controller is not None:
+    elif bed_type in (BED_TYPE_LINAK, BED_TYPE_SLEEP_NUMBER_MCR) and controller is not None:
         supported_keys = {spec.key for spec in controller.position_number_specs}
         _async_remove_stale_position_entities(
             hass,
             coordinator,
             stale_keys=frozenset(
-                description.key
-                for description in NUMBER_DESCRIPTIONS
-                if description.key not in supported_keys
+                key for key in _POSITION_ENTITY_KEYS if key not in supported_keys
             ),
         )
     elif bed_type == BED_TYPE_SLEEPSTAR:
@@ -651,11 +656,9 @@ def _async_remove_stale_position_entities(
     that now linger as dead orphaned numbers (#322, #344).
     """
     registry = er.async_get(hass)
-    for description in NUMBER_DESCRIPTIONS:
-        if stale_keys is not None and description.key not in stale_keys:
-            continue
+    for key in _POSITION_ENTITY_KEYS if stale_keys is None else stale_keys:
         entity_id = registry.async_get_entity_id(
-            "number", DOMAIN, coordinator.entity_unique_id(description.key)
+            "number", DOMAIN, coordinator.entity_unique_id(key)
         )
         if entity_id is not None:
             registry.async_remove(entity_id)

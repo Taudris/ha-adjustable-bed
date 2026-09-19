@@ -7,9 +7,9 @@ import re
 _BLE_AUTHENTICATION_ERROR_MARKERS: tuple[str, ...] = (
     "insufficient authentication",
     "insufficient authorization",
-    "gatt error 5",
+    "insufficient encryption",
 )
-_BLE_AUTHENTICATION_ERROR_CODE_RE = re.compile(r"\berror=5\b")
+_BLE_AUTHENTICATION_ERROR_CODE_RE = re.compile(r"\b(?:error=|gatt error )(?:5|15)\b")
 
 
 def is_ble_authentication_error(err: BaseException) -> bool:

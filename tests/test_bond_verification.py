@@ -29,6 +29,9 @@ from custom_components.adjustable_bed.const import (
     BED_TYPE_OKIMAT,
     BED_TYPE_OKIN_CST,
     BED_TYPE_OKIN_UUID,
+    BED_TYPE_SLEEP_NUMBER,
+    BED_TYPE_SLEEP_NUMBER_MCR,
+    SLEEP_NUMBER_AUTH_CHAR_UUID,
 )
 
 _LOCAL = ConnectionPath(source="hci0", transport=TransportClass.LOCAL, adapter="hci0")
@@ -79,6 +82,39 @@ class TestVerifierApplicability:
 
 class TestVerificationOutcomes:
     """Four outcomes, because "not an auth error" is not "verified"."""
+
+    @pytest.mark.parametrize("path", [_LOCAL, _PROXY])
+    async def test_sleep_number_session_verifies_the_actual_transport(self, path) -> None:
+        client = _client()
+        client.read_gatt_char.return_value = bytes.fromhex("00112233445566778899aabbccddeeff")
+        evidence = await async_verify_authenticated_access(
+            client, bed_type=BED_TYPE_SLEEP_NUMBER, protocol_variant=None,
+            path=path, operation="setup_pairing",
+        )
+        assert evidence.status is BondVerificationStatus.VERIFIED
+        assert evidence.owner.source == path.source
+        client.read_gatt_char.assert_awaited_once_with(SLEEP_NUMBER_AUTH_CHAR_UUID)
+        assert not has_evidence_backed_verifier(BED_TYPE_SLEEP_NUMBER_MCR, None)
+
+    @pytest.mark.parametrize("value", [b"\x00\x00", bytes(16), bytes(15) + b"\x01"])
+    async def test_sleep_number_invalid_auth_is_not_bond_proof(self, value: bytes) -> None:
+        client = _client()
+        client.read_gatt_char.return_value = value
+        evidence = await async_verify_authenticated_access(
+            client, bed_type=BED_TYPE_SLEEP_NUMBER, protocol_variant=None,
+            path=_PROXY, operation="setup_pairing",
+        )
+        assert not evidence.proves_bond
+        assert evidence.status is BondVerificationStatus.AUTH_FAILED
+
+    async def test_sleep_number_encryption_error_is_a_failed_bond(self) -> None:
+        evidence = await async_verify_authenticated_access(
+            _client(BleakError("error=15 description=Insufficient encryption")),
+            bed_type=BED_TYPE_SLEEP_NUMBER, protocol_variant=None,
+            path=_PROXY, operation="setup_pairing",
+        )
+        assert evidence.status is BondVerificationStatus.AUTH_FAILED
+        assert evidence.owner.transport is TransportClass.PROXY
 
     async def test_a_successful_read_verifies_the_bond(self) -> None:
         evidence = await async_verify_authenticated_access(

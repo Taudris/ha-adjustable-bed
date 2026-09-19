@@ -1162,8 +1162,11 @@ class TestSleepNumberEntities:
             registry.async_get_entity_id("number", DOMAIN, "AA:BB:CC:DD:EE:57_sleep_number_setting")
             is None
         )
-        assert registry.async_get_entity_id("cover", DOMAIN, "AA:BB:CC:DD:EE:57_back") is None
-        assert registry.async_get_entity_id("cover", DOMAIN, "AA:BB:CC:DD:EE:57_legs") is None
+        for side in ("left", "right"):
+            for axis in ("back", "legs"):
+                assert registry.async_get_entity_id(
+                    "cover", DOMAIN, f"AA:BB:CC:DD:EE:57_{axis}_{side}"
+                ) is not None
         assert (
             registry.async_get_entity_id(
                 "binary_sensor",
@@ -3165,12 +3168,17 @@ class TestSensorEntities:
                 registry.async_get_entity_id("sensor", DOMAIN, f"AA:BB:CC:DD:EE:60_{axis}_angle")
                 is None
             )
-        # And no position-seeking number entities (MCR cannot read positions).
-        for axis in ("back", "legs", "head", "feet"):
-            assert (
-                registry.async_get_entity_id("number", DOMAIN, f"AA:BB:CC:DD:EE:60_{axis}_position")
-                is None
-            )
+        # Foundation positions are native percentages, with independent sides.
+        for side in ("left", "right"):
+            for axis in ("back", "legs"):
+                entity_id = registry.async_get_entity_id(
+                    "number", DOMAIN, f"AA:BB:CC:DD:EE:60_{axis}_position_{side}"
+                )
+                assert entity_id is not None
+                state = hass.states.get(entity_id)
+                assert state is not None
+                assert state.attributes["unit_of_measurement"] == "%"
+                assert state.attributes["max"] == 100
 
     async def test_sleep_number_mcr_removes_pre_existing_stale_angle_entities(
         self,

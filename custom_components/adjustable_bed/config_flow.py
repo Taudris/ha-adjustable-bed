@@ -4189,7 +4189,7 @@ class AdjustableBedConfigFlow(BluetoothOperationMixin, ConfigFlow, domain=DOMAIN
             and requires_pairing_after_service_discovery(bed_type, protocol_variant)
         )
 
-        # LP Control first connects and discovers GATT, then asks Android to
+        # LP Control and Sleep Number discover GATT, then ask Android to
         # create the bond. BlueZ's pair=True path calls Device1.Pair instead of
         # making the app's ordinary unbonded GATT connection first.
         # Hold the address lock for the whole client lifetime, not just the

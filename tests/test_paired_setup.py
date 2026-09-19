@@ -2932,15 +2932,16 @@ class TestOfflineSideEntities:
         child._controller = live
         assert child.capability_controller is live
 
-    async def test_unsafe_bed_type_side_is_not_offline_minted(self, hass: HomeAssistant):
+    @pytest.mark.parametrize("bed_type", [BED_TYPE_OCTO, "sleep_number_mcr"])
+    async def test_unsafe_bed_type_side_is_not_offline_minted(self, hass: HomeAssistant, bed_type: str):
         # A bed type that is NOT capability-deterministic offline (auto-variant /
         # connect-corrected / post-connect query) must NOT be offline-minted, so
         # it can't register entities from a wrong profile. It keeps today's
         # behaviour (no offline entities until it connects).
         data = _paired_entry_data()
-        data[CONF_BED_TYPE] = BED_TYPE_OCTO
+        data[CONF_BED_TYPE] = bed_type
         for child in data[CONF_PAIR_CHILDREN]:
-            child[CONF_BED_TYPE] = BED_TYPE_OCTO
+            child[CONF_BED_TYPE] = bed_type
         entry = MockConfigEntry(
             domain=DOMAIN, title="Octo", data=data, unique_id="pair_octo", version=4
         )
@@ -2950,6 +2951,14 @@ class TestOfflineSideEntities:
 
         await left.async_prime_offline_controller()
         assert left.capability_controller is None
+
+        from unittest.mock import MagicMock
+
+        live = MagicMock()
+        left._controller = live
+        left.cache_capability_controller()
+        left._controller = None
+        assert left.capability_controller is live
 
     async def test_leggett_platt_explicit_variant_side_is_offline_minted(self, hass: HomeAssistant):
         # Even if a child descriptor still carries the UMBRELLA leggett_platt with

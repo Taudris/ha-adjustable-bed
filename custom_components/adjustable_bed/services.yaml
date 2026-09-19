@@ -216,9 +216,17 @@ set_position:
               value: feet
             - label: Lumbar
               value: lumbar
+            - label: Left back (Sleep Number MCR)
+              value: left_back
+            - label: Right back (Sleep Number MCR)
+              value: right_back
+            - label: Left legs (Sleep Number MCR)
+              value: left_legs
+            - label: Right legs (Sleep Number MCR)
+              value: right_legs
     position:
       name: Position
-      description: Target position (0-68° for back/head, 0-45° for legs/feet, 0-100% for Keeson/Ergomotion/BOX25 Star).
+      description: Target position (0-68° for back/head, 0-45° for legs/feet, 0-100% for Keeson/Ergomotion/BOX25 Star/Sleep Number MCR).
       required: true
       selector:
         number:
@@ -252,7 +260,7 @@ set_positions:
           integration: adjustable_bed
     positions:
       name: Positions
-      description: One target per motor.
+      description: One target per motor. Sleep Number MCR uses left_back, right_back, left_legs, or right_legs with 0-100% targets.
       required: true
       example:
         - motor: back
@@ -985,3 +993,114 @@ generate_support_bundle:
       default: true
       selector:
         boolean:
+
+sleep_number_command:
+  name: Sleep Number command
+  description: Run a validated Sleep Number BLE control or query. Supported commands depend on the bed. Optional response data contains per-side results. See the Sleep Number service documentation for exact parameters.
+  fields:
+    device_id:
+      name: Device
+      required: true
+      selector:
+        device:
+          integration: adjustable_bed
+    side:
+      name: Physical side
+      description: For a paired bed, select left, right or both. A child device defaults to its own side.
+      selector:
+        select:
+          options: [left, right, both]
+    command:
+      name: Command
+      required: true
+      selector:
+        select:
+          options:
+            - cancel_current_diagnostic_run
+            - cancel_target_preset
+            - create_temperature_program
+            - delete_temperature_program
+            - firmness_favorite
+            - firmness_favorites
+            - foot_warming
+            - foot_warming_status
+            - foundation_status
+            - get_active_temperature_programs
+            - get_actuator_movement_status
+            - get_actuator_position
+            - get_bed_configuration
+            - get_central_devices_metadata
+            - get_current_preset
+            - get_favorite_sleep_number
+            - get_footwarming_presence
+            - get_footwarming_settings
+            - get_frosty_mode
+            - get_frosty_presence
+            - get_fuzion_remote_mac_addresses
+            - get_heidi_mode
+            - get_heidi_presence
+            - get_manifest_name
+            - get_responsive_air_enabled_status
+            - get_simple_diagnostic_run_results
+            - get_sleep_number_controls
+            - get_sleepiq_privacy_state
+            - get_system_configuration
+            - get_system_settings_applied_status
+            - get_system_status
+            - get_temperature_programs
+            - get_target_preset_with_timer
+            - get_temperature_program_info
+            - get_temperature_program_settings
+            - get_underbed_light_auto_mode_status
+            - get_underbed_light_settings
+            - gets_actuator_homing_state
+            - halt_all_actuators
+            - head_tilt
+            - interrupt_sleep_number_adjustment
+            - kid_outlet
+            - kid_outlet_status
+            - light_intensity
+            - massage
+            - massage_status
+            - mcr_status
+            - migrate_routines_to_temperature_programs
+            - outlet
+            - outlet_status
+            - pinch_status
+            - position
+            - preset_reset
+            - preset_save
+            - preset_timer
+            - reboot_system
+            - responsive_air
+            - responsive_air_status
+            - routine_migration_status
+            - sense_and_do
+            - sense_and_do_status
+            - set_actuator_target_position
+            - set_actuator_target_position_with_timer
+            - set_articulation_preset_settings
+            - set_bed_presence
+            - set_favorite_sleep_number
+            - set_footwarming_settings
+            - set_frosty_mode
+            - set_heidi_mode
+            - set_responsive_air_enabled_status
+            - set_sleepiq_privacy_state
+            - set_system_time
+            - set_target_preset_with_timer
+            - set_target_preset_without_timer
+            - set_temperature_program
+            - set_underbed_light_auto_mode
+            - set_underbed_light_settings
+            - software_versions
+            - start_sleep_number_adjustment
+            - starts_actuator_homing
+            - stop
+            - underbed_auto
+            - underbed_auto_status
+    parameters:
+      name: Parameters
+      description: Command-specific fields. Unknown fields and unsupported values are rejected. A parameter side cannot override the selected physical side.
+      selector:
+        object:
