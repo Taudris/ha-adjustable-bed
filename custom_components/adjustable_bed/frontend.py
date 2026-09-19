@@ -15,6 +15,7 @@ from functools import partial
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from aiohttp import web
 from homeassistant.components.frontend import DOMAIN as FRONTEND_DOMAIN
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.http.server import StaticPathConfig
@@ -26,6 +27,7 @@ from homeassistant.components.lovelace.const import DOMAIN as LOVELACE_DOMAIN
 from homeassistant.components.lovelace.resources import ResourceStorageCollection
 from homeassistant.const import CONF_ID, CONF_TYPE, CONF_URL
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.http import HomeAssistantView
 from homeassistant.setup import async_when_setup
 
 from .const import DOMAIN
@@ -38,6 +40,33 @@ DATA_FRONTEND_REGISTERED = "frontend_registered"
 URL_BASE = "/adjustable_bed_frontend"
 CARD_FILENAME = "adjustable-bed-card.js"
 CARD_URL = f"{URL_BASE}/{CARD_FILENAME}"
+
+
+class CardLoaderView(HomeAssistantView):
+    """Resolve permanent and previously published URLs to the current bundle."""
+
+    url = CARD_URL
+    extra_urls = [f"{URL_BASE}/{{cache_key}}/{CARD_FILENAME}"]
+    name = "adjustable_bed:card_loader"
+    requires_auth = False
+
+    def __init__(self, card_url: str) -> None:
+        self._module = f"import {json.dumps(card_url)};\n"
+
+    async def get(
+        self, request: web.Request, cache_key: str | None = None
+    ) -> web.Response:
+        """Never cache the pointer to a bundle that changes after an upgrade.
+
+        The exact current bundle URL has its own static route. Old URLs kept
+        by a browser, WebView or YAML dashboard reach this loader instead of
+        returning 404. The URL parameter is never used as a filesystem path.
+        """
+        return web.Response(
+            text=self._module,
+            content_type="text/javascript",
+            headers={"Cache-Control": "no-store"},
+        )
 
 
 def _dist_dir() -> Path:
@@ -92,9 +121,8 @@ async def _async_register_lovelace_resource(
 ) -> bool:
     """Create or update the card's durable Lovelace resource.
 
-    ``add_extra_js_url`` only injects modules into a newly loaded frontend
-    document. A storage resource lets Lovelace load the card independently of
-    that initial page render and preserves registration across restarts. YAML
+    A storage resource lets Lovelace load the card independently of frontend
+    module events and preserves registration across restarts. YAML
     resource collections cannot be changed, so callers fall back to the
     frontend module hook for those installations.
     """
@@ -204,13 +232,14 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
     try:
         await hass.http.async_register_static_paths(
             [
-                # Preserve the legacy query-based URL while resources migrate.
-                StaticPathConfig(CARD_URL, card_path, False),
                 # Put the content identity in the path. Some webview and proxy
                 # caches normalize query parameters before looking up assets.
                 StaticPathConfig(card_url, card_path, True),
             ]
         )
+        # Register the exact static route first, then the loader's fallback for
+        # older content paths. Keep the resource URL stable across upgrades.
+        hass.http.register_view(CardLoaderView(card_url))
     except Exception:  # noqa: BLE001 - never let the card break setup
         _LOGGER.warning(
             "Could not serve the Adjustable Bed Lovelace card; bed control is "
@@ -228,12 +257,12 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
     async_when_setup(
         hass,
         FRONTEND_DOMAIN,
-        partial(_async_add_frontend_module, card_url=card_url),
+        partial(_async_add_frontend_module, card_url=CARD_URL),
     )
     async_when_setup(
         hass,
         LOVELACE_DOMAIN,
-        partial(_async_add_lovelace_resource, card_url=card_url),
+        partial(_async_add_lovelace_resource, card_url=CARD_URL),
     )
 
     _LOGGER.debug("Registered Adjustable Bed card routes and loading hooks (v%s)", version)
