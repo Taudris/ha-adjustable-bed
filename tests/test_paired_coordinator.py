@@ -1004,11 +1004,12 @@ class TestSideProxy:
         assert proxy.address == child.address
         assert proxy.name == "Left"
 
-    def test_writes_delegate_to_child(self):
-        # timed_move temporarily tunes _motor_pulse_count on its coordinator.
+    def test_entity_view_cannot_mutate_child_private_state(self):
+        # Pulse overrides belong to scheduler operations, not entity views.
         _, child, proxy = self._proxy()
+        child._motor_pulse_count = 10
         proxy._motor_pulse_count = 7
-        assert child._motor_pulse_count == 7
+        assert child._motor_pulse_count == 10
 
     async def test_command_routes_through_parent_with_side(self):
         parent, _, proxy = self._proxy()
@@ -1018,7 +1019,8 @@ class TestSideProxy:
 
         await proxy.async_execute_controller_command(cmd, cancel_running=False)
         parent.async_execute_controller_command.assert_awaited_once_with(
-            cmd, side=SIDE_LEFT, cancel_running=False
+            cmd, side=SIDE_LEFT, cancel_running=False, skip_disconnect=False,
+            resource=None, resources=None,
         )
 
     async def test_seek_and_stop_route_through_parent_with_side(self):

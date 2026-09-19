@@ -8,7 +8,7 @@ import logging
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.const import (
@@ -49,6 +49,9 @@ from .support_report import (
     _get_system_info,
 )
 
+if TYPE_CHECKING:
+    from .paired_coordinator import BedChild
+
 _LOGGER = logging.getLogger(__name__)
 
 _REPORT_VERSION = "2.3"
@@ -69,7 +72,7 @@ async def generate_support_bundle(
     address: str,
     capture_duration: int,
     include_logs: bool,
-    coordinator: Any | None = None,
+    coordinator: BedChild | None = None,
     entry: ConfigEntry | None = None,
     device_id: str | None = None,
 ) -> dict[str, Any]:
@@ -178,7 +181,7 @@ async def _build_bluetooth_section(
     hass: HomeAssistant,
     address: str,
     diagnostics_report: dict[str, Any],
-    coordinator: Any | None,
+    coordinator: BedChild | None,
 ) -> dict[str, Any]:
     """Build the support bundle Bluetooth section."""
     info: dict[str, Any]
@@ -553,7 +556,7 @@ def _build_pairing_assessment(
     diagnostics_report: dict[str, Any],
     *,
     entry: ConfigEntry | None,
-    coordinator: Any | None,
+    coordinator: BedChild | None,
 ) -> dict[str, Any]:
     """Turn raw GATT authentication evidence into a clear pairing verdict."""
     detection = diagnostics_report.get("detection", {})

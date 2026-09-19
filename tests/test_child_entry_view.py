@@ -15,7 +15,7 @@ def test_serves_child_data_and_delegates_to_parent():
 
     # .data is the per-side child config, not the parent's data.
     assert view.data == {"address": "AA:BB", "side": "left"}
-    # Everything else proxies to the real parent entry.
+    # Explicit identity properties come from the real parent entry.
     assert view.entry_id == "parent-id"
     assert view.title == "Master Bed"
     assert view.version == 4

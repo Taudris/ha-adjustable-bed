@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.light import (
     ATTR_RGB_COLOR,
@@ -22,10 +22,10 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from .const import BED_TYPE_SLEEP_NUMBER_MCR, DOMAIN
-from .coordinator import AdjustableBedCoordinator
 from .entity import AdjustableBedEntity
 from .entity_discovery import async_setup_dynamic_entities
-from .paired_coordinator import PairedBedCoordinator, PairedSideProxy
+from .entity_runtime import EntityRuntime
+from .paired_coordinator import entity_runtimes
 
 if TYPE_CHECKING:
     from .beds.base import BedController
@@ -77,23 +77,15 @@ async def async_setup_entry(
 ) -> None:
     """Set up Adjustable Bed light entities."""
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    if isinstance(coordinator, PairedBedCoordinator):
-        for side, child in coordinator.children.items():
-            proxy = cast("AdjustableBedCoordinator", PairedSideProxy(coordinator, child, side))
-            async_setup_dynamic_entities(
-                entry,
-                proxy,
-                async_add_entities,
-                partial(_light_entities_for, hass, proxy),
-            )
-        return
-    async_setup_dynamic_entities(
-        entry, coordinator, async_add_entities, lambda: _light_entities_for(hass, coordinator)
-    )
+    for runtime in entity_runtimes(coordinator):
+        async_setup_dynamic_entities(
+            entry, runtime, async_add_entities,
+            partial(_light_entities_for, hass, runtime),
+        )
 
 
 def _light_entities_for(
-    hass: HomeAssistant, coordinator: AdjustableBedCoordinator
+    hass: HomeAssistant, coordinator: EntityRuntime
 ) -> list[LightEntity]:
     """Build light entities for a single (child or standalone) coordinator."""
     controller = coordinator.capability_controller
@@ -124,7 +116,7 @@ def _light_entities_for(
 
 
 def _async_remove_stale_light_entity(
-    hass: HomeAssistant, coordinator: AdjustableBedCoordinator
+    hass: HomeAssistant, coordinator: EntityRuntime
 ) -> None:
     """Remove stale light entities when the controller no longer supports them."""
     registry = er.async_get(hass)
@@ -138,7 +130,7 @@ def _async_remove_stale_light_entity(
 
 
 def _async_remove_stale_switch_entity(
-    hass: HomeAssistant, coordinator: AdjustableBedCoordinator
+    hass: HomeAssistant, coordinator: EntityRuntime
 ) -> None:
     """Remove the legacy switch when a light entity owns under-bed lights."""
     registry = er.async_get(hass)
@@ -160,7 +152,7 @@ class AdjustableBedLight(AdjustableBedEntity, RestoreEntity, LightEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: LightEntityDescription,
     ) -> None:
         """Initialize the light."""
@@ -335,7 +327,7 @@ class AdjustableBedOnOffLight(AdjustableBedEntity, RestoreEntity, LightEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: LightEntityDescription,
     ) -> None:
         """Initialize the on/off light."""

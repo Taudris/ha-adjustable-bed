@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.climate import (
     ClimateEntity,
@@ -19,9 +19,9 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
-from .coordinator import AdjustableBedCoordinator
 from .entity import AdjustableBedEntity
-from .paired_coordinator import PairedBedCoordinator, PairedSideProxy
+from .entity_runtime import EntityRuntime
+from .paired_coordinator import entity_runtimes
 
 if TYPE_CHECKING:
     from .beds.base import BedController
@@ -154,25 +154,15 @@ async def async_setup_entry(
 ) -> None:
     """Set up Adjustable Bed climate entities."""
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    if isinstance(coordinator, PairedBedCoordinator):
-        entities: list[AdjustableBedClimate] = []
-        for side, child in coordinator.children.items():
-            entities.extend(
-                _climate_entities_for(
-                    hass,
-                    cast(
-                        "AdjustableBedCoordinator",
-                        PairedSideProxy(coordinator, child, side),
-                    ),
-                )
-            )
-        async_add_entities(entities)
-        return
-    async_add_entities(_climate_entities_for(hass, coordinator))
+    async_add_entities([
+        entity
+        for runtime in entity_runtimes(coordinator)
+        for entity in _climate_entities_for(hass, runtime)
+    ])
 
 
 def _climate_entities_for(
-    hass: HomeAssistant, coordinator: AdjustableBedCoordinator
+    hass: HomeAssistant, coordinator: EntityRuntime
 ) -> list[AdjustableBedClimate]:
     """Build climate entities for a single (child or standalone) coordinator."""
     controller = coordinator.capability_controller
@@ -220,7 +210,7 @@ def _climate_entities_for(
 
 def _async_remove_stale_split_climate_entity(
     hass: HomeAssistant,
-    coordinator: AdjustableBedCoordinator,
+    coordinator: EntityRuntime,
     key: str,
 ) -> None:
     """Remove a legacy non-sided climate entity when split entities exist."""
@@ -258,7 +248,7 @@ class AdjustableBedClimate(AdjustableBedEntity, ClimateEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: AdjustableBedClimateEntityDescription,
     ) -> None:
         """Initialize the climate entity."""

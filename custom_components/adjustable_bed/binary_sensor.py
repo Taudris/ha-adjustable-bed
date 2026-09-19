@@ -22,13 +22,13 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
-from .coordinator import AdjustableBedCoordinator
 from .entity import AdjustableBedEntity
 from .entity_discovery import (
     async_remove_retired_rmcontrol_telemetry,
     async_setup_dynamic_entities,
 )
-from .paired_coordinator import PairedBedCoordinator
+from .entity_runtime import EntityRuntime
+from .paired_coordinator import entity_runtimes
 
 if TYPE_CHECKING:
     from .beds.base import BedController, ControllerStateBinarySensorSpec
@@ -68,31 +68,16 @@ async def async_setup_entry(
 ) -> None:
     """Set up Adjustable Bed binary sensor entities."""
     coordinator = hass.data[DOMAIN][entry.entry_id]
-
-    # Paired beds get a per-side BLE-connectivity sensor (and any per-side
-    # presence sensors) built against each child coordinator.
-    if isinstance(coordinator, PairedBedCoordinator):
-        for child in coordinator.children.values():
-            async_remove_retired_rmcontrol_telemetry(hass, entry, child, "binary_sensor")
-            async_setup_dynamic_entities(
-                entry,
-                child,
-                async_add_entities,
-                partial(_binary_sensor_entities_for, hass, child),
-            )
-        return
-
-    async_remove_retired_rmcontrol_telemetry(hass, entry, coordinator, "binary_sensor")
-    async_setup_dynamic_entities(
-        entry,
-        coordinator,
-        async_add_entities,
-        lambda: _binary_sensor_entities_for(hass, coordinator),
-    )
+    for runtime in entity_runtimes(coordinator):
+        async_remove_retired_rmcontrol_telemetry(hass, entry, runtime, "binary_sensor")
+        async_setup_dynamic_entities(
+            entry, runtime, async_add_entities,
+            partial(_binary_sensor_entities_for, hass, runtime),
+        )
 
 
 def _binary_sensor_entities_for(
-    hass: HomeAssistant, coordinator: AdjustableBedCoordinator
+    hass: HomeAssistant, coordinator: EntityRuntime
 ) -> list[BinarySensorEntity]:
     """Build binary-sensor entities for a single (child or standalone) coordinator."""
     # capability_controller so an offline paired side still exposes bed_presence
@@ -147,7 +132,7 @@ def _binary_sensor_entities_for(
 
 def _async_remove_stale_presence_entity(
     hass: HomeAssistant,
-    coordinator: AdjustableBedCoordinator,
+    coordinator: EntityRuntime,
 ) -> None:
     """Remove the legacy single-side presence entity when split sensors exist."""
     registry = er.async_get(hass)
@@ -162,7 +147,7 @@ def _async_remove_stale_presence_entity(
 
 def _async_remove_stale_controller_state_binary_sensor_entities(
     hass: HomeAssistant,
-    coordinator: AdjustableBedCoordinator,
+    coordinator: EntityRuntime,
     *,
     keys: frozenset[str],
 ) -> None:
@@ -183,7 +168,7 @@ class AdjustableBedConnectionSensor(AdjustableBedEntity, BinarySensorEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: AdjustableBedBinarySensorEntityDescription,
     ) -> None:
         """Initialize the binary sensor."""
@@ -256,7 +241,7 @@ class AdjustableBedConnectionSensor(AdjustableBedEntity, BinarySensorEntity):
         else:
             attrs["state_detail"] = "disconnected"
 
-        side = getattr(self._coordinator, "entity_side", None)
+        side = self._coordinator.entity_side
         if side is not None:
             attrs["bed_side"] = side
 
@@ -268,7 +253,7 @@ class AdjustableBedControllerStateBinarySensor(AdjustableBedEntity, BinarySensor
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         spec: ControllerStateBinarySensorSpec,
     ) -> None:
         """Initialize a controller-state binary sensor."""
@@ -323,7 +308,7 @@ class AdjustableBedPresenceSensor(AdjustableBedEntity, BinarySensorEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: AdjustableBedBinarySensorEntityDescription,
     ) -> None:
         """Initialize the presence sensor."""

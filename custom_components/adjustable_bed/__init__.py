@@ -7,7 +7,7 @@ import contextlib
 import logging
 from collections.abc import Callable, Mapping
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any
 
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import (
@@ -458,8 +458,7 @@ def _build_paired_children(
             continue
         child_data = effective_child_data(entry.data, side, entry.options)
         view = ChildEntryView(entry, child_data, _make_child_persist_cb(hass, entry, side))
-        # The view duck-types a ConfigEntry for the coordinator's purposes.
-        children[side] = AdjustableBedCoordinator(hass, cast("ConfigEntry", view))
+        children[side] = AdjustableBedCoordinator(hass, view)
     return children
 
 
@@ -1008,7 +1007,7 @@ async def _async_setup_paired_entry(hass: HomeAssistant, entry: ConfigEntry) -> 
         # abort (timeout / no-side-connected) so a paired bonding bed (OKIN/Leggett)
         # whose sides all fail to pair still prompts the user instead of silently
         # retrying forever.
-        for child in coordinator.children.values():
+        for child in children.values():
             if not child.is_connected:
                 await _maybe_create_pairing_issue_for(hass, child)
 
@@ -1100,12 +1099,14 @@ async def _async_setup_paired_entry(hass: HomeAssistant, entry: ConfigEntry) -> 
     # whose controller needs a live connection (auto-detected variants) stay as
     # before until they connect.
     for child in coordinator.children.values():
+        assert isinstance(child, AdjustableBedCoordinator)
         await child.async_prime_offline_controller()
     await hass.config_entries.async_forward_entry_setups(entry, PAIRED_PLATFORMS)
 
     # Seed each connected child's positions, like the single-bed path does, so
     # per-side covers don't sit at "unknown" until the first movement.
     for child in coordinator.children.values():
+        assert isinstance(child, AdjustableBedCoordinator)
         if child.is_connected:
             child._schedule_position_hydration()
 

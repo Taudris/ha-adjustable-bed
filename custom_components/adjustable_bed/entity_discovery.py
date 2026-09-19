@@ -9,12 +9,12 @@ from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
-from .coordinator import AdjustableBedCoordinator
+from .entity_runtime import EntityRuntime
 
 
 def async_setup_dynamic_entities(
     entry: ConfigEntry,
-    coordinator: AdjustableBedCoordinator,
+    coordinator: EntityRuntime,
     async_add_entities: AddEntitiesCallback,
     build_entities: Callable[[], Iterable[Entity]],
 ) -> None:
@@ -38,7 +38,7 @@ def async_setup_dynamic_entities(
 def async_remove_retired_rmcontrol_telemetry(
     hass: HomeAssistant,
     entry: ConfigEntry,
-    coordinator: AdjustableBedCoordinator,
+    coordinator: EntityRuntime,
     domain: str,
 ) -> None:
     """Retire RMControl telemetry after switching to a static controller."""

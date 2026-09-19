@@ -17,10 +17,10 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import (
     DOMAIN,
 )
-from .coordinator import AdjustableBedCoordinator
 from .entity import AdjustableBedEntity
 from .entity_discovery import async_setup_dynamic_entities
-from .paired_coordinator import PairedBedCoordinator, PairedSideProxy
+from .entity_runtime import EntityRuntime
+from .paired_coordinator import entity_runtimes
 
 if TYPE_CHECKING:
     from .beds.base import BedController
@@ -145,23 +145,15 @@ async def async_setup_entry(
 ) -> None:
     """Set up Adjustable Bed select entities."""
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    if isinstance(coordinator, PairedBedCoordinator):
-        for side, child in coordinator.children.items():
-            proxy = cast("AdjustableBedCoordinator", PairedSideProxy(coordinator, child, side))
-            async_setup_dynamic_entities(
-                entry,
-                proxy,
-                async_add_entities,
-                partial(_select_entities_for, hass, proxy),
-            )
-        return
-    async_setup_dynamic_entities(
-        entry, coordinator, async_add_entities, lambda: _select_entities_for(hass, coordinator)
-    )
+    for runtime in entity_runtimes(coordinator):
+        async_setup_dynamic_entities(
+            entry, runtime, async_add_entities,
+            partial(_select_entities_for, hass, runtime),
+        )
 
 
 def _select_entities_for(
-    hass: HomeAssistant, coordinator: AdjustableBedCoordinator
+    hass: HomeAssistant, coordinator: EntityRuntime
 ) -> list[SelectEntity]:
     """Build select entities for a single (child or standalone) coordinator."""
     has_massage = coordinator.has_massage
@@ -322,7 +314,7 @@ def _select_entities_for(
 
 def _async_remove_stale_select_entity(
     hass: HomeAssistant,
-    coordinator: AdjustableBedCoordinator,
+    coordinator: EntityRuntime,
     key: str,
 ) -> None:
     """Remove a select registry entry the current controller no longer provides."""
@@ -343,7 +335,7 @@ class AdjustableBedMassageTimerSelect(AdjustableBedEntity, SelectEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: SelectEntityDescription,
         timer_options: list[int],
     ) -> None:
@@ -415,7 +407,7 @@ class AdjustableBedControllerStateSelect(AdjustableBedEntity, SelectEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: AdjustableBedControllerStateSelectDescription,
         timer_options: list[str],
     ) -> None:
@@ -489,7 +481,7 @@ class AdjustableBedSideStateSelect(AdjustableBedEntity, SelectEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: AdjustableBedSideStateSelectDescription,
         options: list[str],
     ) -> None:

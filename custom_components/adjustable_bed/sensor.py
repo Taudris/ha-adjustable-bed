@@ -32,13 +32,13 @@ from .const import (
     DOMAIN,
     KEESON_VARIANT_ERGOMOTION,
 )
-from .coordinator import AdjustableBedCoordinator
 from .entity import AdjustableBedEntity
 from .entity_discovery import (
     async_remove_retired_rmcontrol_telemetry,
     async_setup_dynamic_entities,
 )
-from .paired_coordinator import PairedBedCoordinator
+from .entity_runtime import EntityRuntime
+from .paired_coordinator import entity_runtimes
 
 if TYPE_CHECKING:
     from .beds.base import ControllerStateSensorSpec
@@ -142,24 +142,16 @@ async def async_setup_entry(
 ) -> None:
     """Set up Adjustable Bed sensor entities."""
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    if isinstance(coordinator, PairedBedCoordinator):
-        for child in coordinator.children.values():
-            async_remove_retired_rmcontrol_telemetry(hass, entry, child, "sensor")
-            async_setup_dynamic_entities(
-                entry,
-                child,
-                async_add_entities,
-                partial(_sensor_entities_for, hass, child),
-            )
-        return
-    async_remove_retired_rmcontrol_telemetry(hass, entry, coordinator, "sensor")
-    async_setup_dynamic_entities(
-        entry, coordinator, async_add_entities, lambda: _sensor_entities_for(hass, coordinator)
-    )
+    for runtime in entity_runtimes(coordinator):
+        async_remove_retired_rmcontrol_telemetry(hass, entry, runtime, "sensor")
+        async_setup_dynamic_entities(
+            entry, runtime, async_add_entities,
+            partial(_sensor_entities_for, hass, runtime),
+        )
 
 
 def _sensor_entities_for(
-    hass: HomeAssistant, coordinator: AdjustableBedCoordinator
+    hass: HomeAssistant, coordinator: EntityRuntime
 ) -> list[SensorEntity]:
     """Build sensor entities for a single (child or standalone) coordinator."""
     entry = coordinator.entry  # ChildEntryView for a paired child; real entry otherwise
@@ -255,7 +247,7 @@ def _sensor_entities_for(
 
 def _async_remove_stale_angle_entities(
     hass: HomeAssistant,
-    coordinator: AdjustableBedCoordinator,
+    coordinator: EntityRuntime,
     *,
     position_keys: set[str] | None = None,
 ) -> None:
@@ -273,7 +265,7 @@ def _async_remove_stale_angle_entities(
 
 def _async_remove_stale_sensor_entities(
     hass: HomeAssistant,
-    coordinator: AdjustableBedCoordinator,
+    coordinator: EntityRuntime,
     *,
     keys: tuple[str, ...],
 ) -> None:
@@ -294,7 +286,7 @@ class AdjustableBedAngleSensor(AdjustableBedEntity, SensorEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: AdjustableBedSensorEntityDescription,
     ) -> None:
         """Initialize the sensor."""
@@ -341,7 +333,7 @@ class AdjustableBedMassageSensor(AdjustableBedEntity, SensorEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: AdjustableBedMassageSensorEntityDescription,
     ) -> None:
         """Initialize the massage sensor."""
@@ -408,7 +400,7 @@ class AdjustableBedControllerStateSensor(AdjustableBedEntity, SensorEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         spec: ControllerStateSensorSpec,
     ) -> None:
         """Initialize a controller-state sensor."""

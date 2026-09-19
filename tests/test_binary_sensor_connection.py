@@ -21,6 +21,7 @@ def _attrs(
 ) -> dict[str, Any]:
     """Evaluate ``extra_state_attributes`` against a stub coordinator."""
     coordinator = SimpleNamespace(
+        entity_side=None,
         last_connected=None,
         last_disconnected=None,
         connection_source=None,

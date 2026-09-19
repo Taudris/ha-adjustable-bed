@@ -46,20 +46,19 @@ from .const import (
     bed_type_has_position_feedback,
     resolve_explicit_bed_type,
 )
-from .coordinator import AdjustableBedCoordinator
-from .paired_coordinator import PairedBedCoordinator, SingleAddressPairedCoordinator
+from .paired_coordinator import BedChild, PairedBedCoordinator, SingleAddressPairedCoordinator
 from .pairing import is_paired, pair_member_addresses
 
 if TYPE_CHECKING:
-    from .beds.base import BedController
+    from .beds.base import BedController, SideBoundController
 
 _LOGGER = logging.getLogger(__name__)
 
 # A service target: a single bed's coordinator, or a paired bed's parent.
-BedTarget = AdjustableBedCoordinator | PairedBedCoordinator
+BedTarget = BedChild | PairedBedCoordinator
 # (target, physical side) pairs connected purely to validate a call, so a failed
 # pre-flight can hand them back their idle timer.
-PreflightedSides = list[tuple[BedTarget, AdjustableBedCoordinator]]
+PreflightedSides = list[tuple[BedTarget, BedChild]]
 
 
 # Service names
@@ -297,7 +296,7 @@ def _missing_device_error(device_id: str) -> ServiceValidationError:
 
 def _get_support_bundle_target_from_device(
     hass: HomeAssistant, device_id: str
-) -> tuple[str, AdjustableBedCoordinator | None, ConfigEntry] | None:
+) -> tuple[str, BedChild | None, ConfigEntry] | None:
     """Resolve support-bundle target details from a device registry ID."""
     device_registry = dr.async_get(hass)
     device = device_registry.async_get(device_id)
@@ -331,7 +330,7 @@ def _get_support_bundle_target_from_device(
         if not isinstance(address, str):
             continue
 
-        coordinator: AdjustableBedCoordinator | None = None
+        coordinator: BedChild | None = None
         stored = hass.data.get(DOMAIN, {}).get(entry_id)
         if isinstance(stored, PairedBedCoordinator):
             # Reuse the matching live child coordinator so the bundle pauses
@@ -342,15 +341,15 @@ def _get_support_bundle_target_from_device(
                     coordinator = child
                     break
         else:
-            coordinator = cast("AdjustableBedCoordinator | None", stored)
+            coordinator = cast("BedChild | None", stored)
         return address, coordinator, entry
 
     return None
 
 
 async def _get_controller_for_service(
-    coordinator: AdjustableBedCoordinator,
-) -> BedController:
+    coordinator: BedChild,
+) -> BedController | SideBoundController:
     """Return an active controller for service validation/execution.
 
     Service calls may arrive while the coordinator is idle-disconnected and
@@ -376,9 +375,9 @@ async def _get_controller_for_service(
 
 async def _validation_controller(
     coordinator: BedTarget,
-    target: AdjustableBedCoordinator,
+    target: BedChild,
     preflighted: PreflightedSides,
-) -> BedController:
+) -> BedController | SideBoundController:
     """Return a controller for capability VALIDATION without opening a BLE link
     when avoidable.
 
@@ -400,7 +399,7 @@ async def _validation_controller(
     return controller
 
 
-def _command_targets(coordinator: BedTarget, side: str) -> list[AdjustableBedCoordinator]:
+def _command_targets(coordinator: BedTarget, side: str) -> list[BedChild]:
     """Return the per-side coordinators a sided command must validate.
 
     For a paired bed this is the child coordinator(s) for ``side``; the
@@ -478,7 +477,7 @@ async def _release_preflighted(preflighted: PreflightedSides) -> None:
 
 @contextlib.asynccontextmanager
 async def _release_idle_on_validation_failure(
-    coordinator: AdjustableBedCoordinator,
+    coordinator: BedChild,
 ) -> AsyncIterator[None]:
     """Release a bed reconnected for a per-motor service if validation fails.
 
@@ -494,7 +493,7 @@ async def _release_idle_on_validation_failure(
         raise
 
 
-def _plan_key(target: AdjustableBedCoordinator) -> int:
+def _plan_key(target: BedChild) -> int:
     """Stable per-side key for a validated plan (a proxy shares its child's identity)."""
     return getattr(target, "operation_identity", id(target))
 
@@ -660,7 +659,7 @@ async def handle_stop_all(call: ServiceCall) -> None:
 
 async def _set_position_plan(
     parent: BedTarget,
-    coordinator: AdjustableBedCoordinator,
+    coordinator: BedChild,
     preflighted: PreflightedSides,
     motor: str,
     position: float,
@@ -926,7 +925,7 @@ async def _execute_position_requests(
         await _release_preflighted(preflighted)
         raise
 
-    async def seek(target: AdjustableBedCoordinator, motor: str, position: float) -> None:
+    async def seek(target: BedChild, motor: str, position: float) -> None:
         config = plans[(_plan_key(target), motor)]
         await target.async_seek_position(
             position_key=cast(str, config["position_key"]),
@@ -936,7 +935,7 @@ async def _execute_position_requests(
             move_stop_fn=config["move_stop_fn"],  # type: ignore[arg-type]
         )
 
-    async def seek_all(target: AdjustableBedCoordinator) -> None:
+    async def seek_all(target: BedChild) -> None:
         operations: list[Callable[[], Coroutine[Any, Any, None]]] = []
         for motor, position in requests:
 
@@ -979,7 +978,7 @@ async def _execute_position_requests(
 
 async def _timed_move_plan(
     parent: BedTarget,
-    coordinator: AdjustableBedCoordinator,
+    coordinator: BedChild,
     preflighted: PreflightedSides,
     motor: str,
     direction: str,
@@ -1095,7 +1094,7 @@ async def handle_timed_move(call: ServiceCall) -> None:
         await _release_preflighted(preflighted)
         raise
 
-    async def move(target: AdjustableBedCoordinator) -> None:
+    async def move(target: BedChild) -> None:
         command, pulse_count, pulse_delay_ms, resource = plans[_plan_key(target)]
         await target.async_execute_controller_command(
             command,
@@ -1128,7 +1127,7 @@ async def _preflight_capability(
     targets: list[tuple[BedTarget, str]],
     capability: str,
     label: str,
-    validate: Callable[[BedController], None] | None = None,
+    validate: Callable[[BedController | SideBoundController], None] | None = None,
 ) -> PreflightedSides:
     """Validate a capability on every physical target before any write."""
     preflighted: PreflightedSides = []
@@ -1198,7 +1197,7 @@ async def handle_linak_move_simultaneously(call: ServiceCall) -> None:
         await _release_preflighted(preflighted)
         raise
 
-    async def move(controller: BedController) -> None:
+    async def move(controller: BedController | SideBoundController) -> None:
         await controller.move_simultaneously(
             first_motor,
             first_up,
@@ -1239,7 +1238,7 @@ async def handle_linak_rename(call: ServiceCall) -> None:
         "Linak device rename",
     )
 
-    async def rename(controller: BedController) -> None:
+    async def rename(controller: BedController | SideBoundController) -> None:
         await controller.rename_device(name)
 
     try:
@@ -1283,7 +1282,7 @@ async def handle_linak_set_alarm(call: ServiceCall) -> None:
         "Linak alarm programming",
     )
 
-    async def program(controller: BedController) -> None:
+    async def program(controller: BedController | SideBoundController) -> None:
         await controller.program_alarm(
             call.data[ATTR_SECONDS],
             steps,
@@ -1330,7 +1329,7 @@ async def handle_solace_audio(call: ServiceCall) -> None:
         "Solace music/audio control",
     )
 
-    async def control(controller: BedController) -> None:
+    async def control(controller: BedController | SideBoundController) -> None:
         if action == "query":
             await controller.solace_query_audio_volume()
         elif action == "set_volume":
@@ -1375,7 +1374,7 @@ async def handle_solace_set_alarm(call: ServiceCall) -> None:
         "Solace alarm programming",
     )
 
-    async def program(controller: BedController) -> None:
+    async def program(controller: BedController | SideBoundController) -> None:
         await controller.program_solace_alarm(
             enabled=call.data[ATTR_ENABLED],
             hour=alarm_time.hour,
@@ -1469,7 +1468,7 @@ async def _handle_leggett_timer(call: ServiceCall, *, alarm: bool) -> None:
                             f"Device '{target.name}' requires a sleep duration from {options} minutes"
                         )
 
-        async def timer(controller: BedController) -> None:
+        async def timer(controller: BedController | SideBoundController) -> None:
             if start:
                 assert minutes is not None
                 if alarm:
@@ -1521,7 +1520,7 @@ async def handle_leggett_hold_control(call: ServiceCall) -> None:
                         f"Device '{target.name}' does not support held control '{control}'"
                     )
 
-        async def hold(controller: BedController) -> None:
+        async def hold(controller: BedController | SideBoundController) -> None:
             await controller.hold_control(control, duration_ms)
 
         for coordinator, side in targets:
@@ -1557,7 +1556,7 @@ async def handle_logicdata_set_alarm(call: ServiceCall) -> None:
         raise _missing_device_error(missing[0])
     preflighted = await _preflight_logicdata(targets, "supports_clock_alarm", "Logicdata clock alarms")
 
-    async def program(controller: BedController) -> None:
+    async def program(controller: BedController | SideBoundController) -> None:
         await controller.configure_clock_alarm(
             enabled=call.data[ATTR_ENABLED],
             weekdays=weekdays,
@@ -1591,7 +1590,7 @@ async def handle_logicdata_rename(call: ServiceCall) -> None:
         targets, "supports_device_rename", "Logicdata device rename"
     )
 
-    async def rename(controller: BedController) -> None:
+    async def rename(controller: BedController | SideBoundController) -> None:
         await controller.rename_device(call.data[ATTR_NAME])
 
     try:
@@ -1632,7 +1631,7 @@ async def handle_logicdata_hold_preset(call: ServiceCall) -> None:
         targets, "supports_preset_hold", "Logicdata held preset recall"
     )
 
-    async def hold(controller: BedController) -> None:
+    async def hold(controller: BedController | SideBoundController) -> None:
         await controller.hold_preset(call.data[ATTR_PRESET], duration_ms)
 
     try:
@@ -1669,7 +1668,7 @@ async def handle_jiecang_set_alarm(call: ServiceCall) -> None:
         raise _missing_device_error(missing[0])
     preflighted = await _preflight_jiecang(targets, "supports_clock_alarm", "Jiecang clock alarms")
 
-    async def program(controller: BedController) -> None:
+    async def program(controller: BedController | SideBoundController) -> None:
         await controller.configure_clock_alarm(
             enabled=call.data[ATTR_ENABLED],
             weekdays=weekdays,
@@ -1707,7 +1706,7 @@ async def handle_jiecang_wake(call: ServiceCall) -> None:
         targets, "supports_wake_routine", "Jiecang wake routines"
     )
 
-    async def wake(controller: BedController) -> None:
+    async def wake(controller: BedController | SideBoundController) -> None:
         await controller.execute_wake_routine(
             preset=call.data[ATTR_PRESET],
             head_level=call.data[ATTR_HEAD_LEVEL],
@@ -1735,7 +1734,7 @@ async def handle_jiecang_stop_wake(call: ServiceCall) -> None:
         targets, "supports_wake_routine", "Jiecang wake routines"
     )
 
-    async def stop(controller: BedController) -> None:
+    async def stop(controller: BedController | SideBoundController) -> None:
         await controller.stop_wake_routine()
 
     try:
@@ -1759,7 +1758,7 @@ async def handle_jiecang_rename(call: ServiceCall) -> None:
         targets, "supports_device_rename", "Jiecang device rename"
     )
 
-    async def rename(controller: BedController) -> None:
+    async def rename(controller: BedController | SideBoundController) -> None:
         await controller.rename_device(call.data[ATTR_NAME])
 
     try:
@@ -1790,7 +1789,7 @@ async def handle_generate_support_bundle(call: ServiceCall) -> None:
     include_logs = call.data.get(ATTR_INCLUDE_LOGS, True)
 
     address: str | None = None
-    coordinator: AdjustableBedCoordinator | None = None
+    coordinator: BedChild | None = None
     entry: ConfigEntry | None = None
     selected_device_id: str | None = None
 

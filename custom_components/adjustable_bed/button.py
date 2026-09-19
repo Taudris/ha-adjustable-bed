@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Coroutine, Iterable
+from collections.abc import Callable, Coroutine, Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -14,17 +14,17 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .beds.base import ProductButtonSpec
+from .beds.base import ProductButtonSpec, SideBoundController
 from .const import (
     DOMAIN,
     SIDE_BOTH,
 )
-from .coordinator import AdjustableBedCoordinator
 from .entity import AdjustableBedEntity
+from .entity_runtime import EntityRuntime
 from .paired_coordinator import (
     PairedBedCoordinator,
-    PairedSideProxy,
     SingleAddressPairedCoordinator,
+    entity_runtimes,
 )
 
 if TYPE_CHECKING:
@@ -687,14 +687,11 @@ async def async_setup_entry(
         entities: list[ButtonEntity] = []
         children = list(coordinator.children.values())
         _async_migrate_massage_intensity_button_unique_ids(hass, coordinator, key_suffix="_both")
-        for side, child in coordinator.children.items():
+        for runtime in entity_runtimes(coordinator):
             entities.extend(
                 _button_entities_for(
                     hass,
-                    cast(
-                        "AdjustableBedCoordinator",
-                        PairedSideProxy(coordinator, child, side),
-                    ),
+                    runtime,
                 )
             )
         entities.append(PairedBedStopButton(coordinator))
@@ -705,11 +702,12 @@ async def async_setup_entry(
         async_add_entities(entities)
         return
 
-    async_add_entities(_button_entities_for(hass, coordinator))
+    async_add_entities([entity for runtime in entity_runtimes(coordinator)
+                        for entity in _button_entities_for(hass, runtime)])
 
 
 def _button_entities_for(
-    hass: HomeAssistant, coordinator: AdjustableBedCoordinator
+    hass: HomeAssistant, coordinator: EntityRuntime
 ) -> list[ButtonEntity]:
     """Build button entities for a single (child or standalone) coordinator."""
     # capability_controller: an offline paired side still gets its buttons built
@@ -757,7 +755,7 @@ def _button_entities_for(
 
 def _combined_button_entities_for(
     coordinator: PairedBedCoordinator,
-    children: list[AdjustableBedCoordinator],
+    children: Sequence[EntityRuntime],
 ) -> list[ButtonEntity]:
     """Build the parent device's combined 'both sides' movement/preset buttons.
 
@@ -804,8 +802,8 @@ def _combined_button_entities_for(
 
 
 def _massage_entities_enabled(
-    coordinator: AdjustableBedCoordinator,
-    controller: BedController | None,
+    coordinator: EntityRuntime,
+    controller: BedController | SideBoundController | None,
 ) -> bool:
     """Return the effective configured or protocol-declared massage capability."""
     return coordinator.has_massage or bool(controller and controller.auto_enable_massage)
@@ -813,7 +811,7 @@ def _massage_entities_enabled(
 
 def _combined_motor_buttons_for(
     coordinator: PairedBedCoordinator,
-    eligible: list[AdjustableBedCoordinator],
+    eligible: Sequence[EntityRuntime],
 ) -> list[ButtonEntity]:
     """Per-motor 'both sides' up/down buttons for a cover-based paired bed — only
     the motors EVERY eligible side exposes (read from each side's capability
@@ -854,7 +852,7 @@ def _combined_motor_buttons_for(
 
 def _async_migrate_massage_intensity_button_unique_ids(
     hass: HomeAssistant,
-    coordinator: AdjustableBedCoordinator | PairedBedCoordinator,
+    coordinator: EntityRuntime | PairedBedCoordinator,
     *,
     key_suffix: str = "",
 ) -> None:
@@ -880,7 +878,7 @@ def _async_migrate_massage_intensity_button_unique_ids(
 
 def _should_add_button(
     description: AdjustableBedButtonEntityDescription,
-    controller: BedController | None,
+    controller: BedController | SideBoundController | None,
     has_massage: bool,
 ) -> bool:
     """Return whether the button should be exposed for the current controller."""
@@ -927,7 +925,7 @@ def _should_add_button(
 
 def _button_translation_key(
     description: AdjustableBedButtonEntityDescription,
-    controllers: Iterable[BedController | None],
+    controllers: Iterable[BedController | SideBoundController | None],
 ) -> str:
     """Return the action label shared by every participating controller."""
     resolved_controllers = tuple(controllers)
@@ -945,8 +943,8 @@ def _button_translation_key(
 
 def _async_remove_stale_button_entities(
     hass: HomeAssistant,
-    coordinator: AdjustableBedCoordinator,
-    controller: BedController,
+    coordinator: EntityRuntime,
+    controller: BedController | SideBoundController,
     has_massage: bool,
 ) -> None:
     """Remove button entities that are no longer supported for this controller."""
@@ -967,7 +965,7 @@ def _async_remove_stale_button_entities(
 def _async_remove_stale_combined_button_entities(
     hass: HomeAssistant,
     coordinator: PairedBedCoordinator,
-    children: list[AdjustableBedCoordinator],
+    children: Sequence[EntityRuntime],
     entities: list[ButtonEntity],
 ) -> None:
     """Remove pair-level controls no longer supported by both known sides."""
@@ -990,7 +988,7 @@ def _async_remove_stale_combined_button_entities(
 
 
 def _discovered_memory_slot_name(
-    coordinator: AdjustableBedCoordinator,
+    coordinator: EntityRuntime,
     description: AdjustableBedButtonEntityDescription,
 ) -> str | None:
     """Return the bed-reported name for a memory button, if there is one."""
@@ -1012,7 +1010,7 @@ def _discovered_memory_slot_name(
 class AdjustableBedProductButton(AdjustableBedEntity, ButtonEntity):
     """An extra action from the exact selected product's command catalog."""
 
-    def __init__(self, coordinator: AdjustableBedCoordinator, spec: ProductButtonSpec) -> None:
+    def __init__(self, coordinator: EntityRuntime, spec: ProductButtonSpec) -> None:
         super().__init__(coordinator)
         self._spec = spec
         self._attr_unique_id = coordinator.entity_unique_id(f"product_action_{spec.key}")
@@ -1035,7 +1033,7 @@ class AdjustableBedButton(AdjustableBedEntity, ButtonEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: AdjustableBedButtonEntityDescription,
     ) -> None:
         """Initialize the button."""
@@ -1118,7 +1116,7 @@ class ControllerActionButton(AdjustableBedEntity, ButtonEntity):
     _attr_translation_key = "remote_action"
 
     def __init__(
-        self, coordinator: AdjustableBedCoordinator, spec: ControllerButtonSpec
+        self, coordinator: EntityRuntime, spec: ControllerButtonSpec
     ) -> None:
         super().__init__(coordinator)
         self._spec = spec

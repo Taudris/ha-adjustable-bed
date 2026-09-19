@@ -5,10 +5,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .coordinator import AdjustableBedCoordinator
+    from .paired_coordinator import BedChild
 
 
-def get_gatt_summary(coordinator: AdjustableBedCoordinator) -> dict[str, Any]:
+def get_gatt_summary(coordinator: BedChild) -> dict[str, Any]:
     """Get GATT service/characteristic summary for diagnostics."""
     client = coordinator.client
     if not client or not client.services:

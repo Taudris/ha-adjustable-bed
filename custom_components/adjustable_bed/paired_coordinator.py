@@ -27,6 +27,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 
+from .beds.base import BedController, SideBoundController
 from .command_scheduler import (
     CommandHandle,
     CommandKind,
@@ -51,13 +52,18 @@ from .const import (
     SIDE_RIGHT,
     requires_sequential_pairing,
 )
+from .entity_runtime import ControllerCommand, EntityRuntime, EntityRuntimeView
 
 if TYPE_CHECKING:
+    from bleak import BleakClient
+
     from .coordinator import AdjustableBedCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-CommandFn = Callable[[Any], Coroutine[Any, Any, None]]
+CommandFn = ControllerCommand
+
+type BedChild = AdjustableBedCoordinator | SingleAddressSideCoordinator
 
 
 def _merge_stop_errors(
@@ -94,7 +100,7 @@ class PairedBedCoordinator:
         self,
         hass: HomeAssistant,
         entry: ConfigEntry,
-        children: Mapping[str, AdjustableBedCoordinator],
+        children: Mapping[str, BedChild],
         *,
         connection_mode: str | None = None,
     ) -> None:
@@ -105,7 +111,7 @@ class PairedBedCoordinator:
         # Ordered {side: child}, left first. A side may be absent only in
         # degraded/test setups; normally both are present (a disconnected child
         # is still present, just not is_connected).
-        self._children: dict[str, AdjustableBedCoordinator] = {
+        self._children: dict[str, BedChild] = {
             side: children[side] for side in PAIR_SIDES if side in children
         }
         if not self._children:
@@ -145,7 +151,7 @@ class PairedBedCoordinator:
             SIDE_LEFT: {},
             SIDE_RIGHT: {},
         }
-        self._active_children: set[AdjustableBedCoordinator] = set()
+        self._active_children: set[BedChild] = set()
         self._active_group_resources: frozenset[str] = frozenset()
         self._connection_state_callbacks: set[Callable[[bool], None]] = set()
         self._child_unsubs: list[Callable[[], None]] = []
@@ -170,10 +176,10 @@ class PairedBedCoordinator:
         return tuple(self._children)
 
     @property
-    def children(self) -> dict[str, AdjustableBedCoordinator]:
+    def children(self) -> dict[str, BedChild]:
         return dict(self._children)
 
-    def child_for_side(self, side: str) -> AdjustableBedCoordinator | None:
+    def child_for_side(self, side: str) -> BedChild | None:
         return self._children.get(side)
 
     @contextlib.asynccontextmanager
@@ -232,7 +238,7 @@ class PairedBedCoordinator:
         if side in (SIDE_LEFT, SIDE_RIGHT) and side not in self._children:
             raise ValueError(f"Paired bed has no {side} side")
 
-    def _targets_for(self, side: str) -> list[tuple[str, AdjustableBedCoordinator]]:
+    def _targets_for(self, side: str) -> list[tuple[str, BedChild]]:
         self._validate_side(side)
         if side == SIDE_BOTH:
             return [(s, self._children[s]) for s in PAIR_SIDES if s in self._children]
@@ -288,7 +294,7 @@ class PairedBedCoordinator:
         if resource is not None and resources is not None:
             raise ValueError("Pass resource or resources, not both")
 
-        async def op(child: AdjustableBedCoordinator) -> None:
+        async def op(child: BedChild) -> None:
             if resource is None and resources is None:
                 await child.async_execute_controller_command(
                     command_fn,
@@ -325,7 +331,7 @@ class PairedBedCoordinator:
     ) -> None:
         """Seek a target position on the targeted side(s)."""
 
-        async def op(child: AdjustableBedCoordinator) -> None:
+        async def op(child: BedChild) -> None:
             await child.async_seek_position(
                 position_key, target_angle, move_up_fn, move_down_fn, move_stop_fn
             )
@@ -336,7 +342,7 @@ class PairedBedCoordinator:
         self,
         action: str,
         operation: Callable[
-            [AdjustableBedCoordinator], Coroutine[Any, Any, None]
+            [BedChild], Coroutine[Any, Any, None]
         ],
         *,
         side: str = SIDE_BOTH,
@@ -360,7 +366,7 @@ class PairedBedCoordinator:
         self,
         action: str,
         side: str,
-        op: Callable[[AdjustableBedCoordinator], Coroutine[Any, Any, None]],
+        op: Callable[[BedChild], Coroutine[Any, Any, None]],
         *,
         cancel_running: bool = True,
         resource: str | None = None,
@@ -488,7 +494,7 @@ class PairedBedCoordinator:
 
     @contextlib.asynccontextmanager
     async def _locked_target_sides(
-        self, targets: Collection[tuple[str, AdjustableBedCoordinator]]
+        self, targets: Collection[tuple[str, BedChild]]
     ) -> AsyncIterator[None]:
         """Lock selected physical side lanes in stable order."""
         target_by_side = dict(targets)
@@ -502,8 +508,8 @@ class PairedBedCoordinator:
         self,
         action: str,
         side: str,
-        child: AdjustableBedCoordinator,
-        op: Callable[[AdjustableBedCoordinator], Coroutine[Any, Any, None]],
+        child: BedChild,
+        op: Callable[[BedChild], Coroutine[Any, Any, None]],
         *,
         cancel_running: bool,
         resources: frozenset[str],
@@ -573,8 +579,8 @@ class PairedBedCoordinator:
     async def _run_both_concurrent(
         self,
         action: str,
-        targets: list[tuple[str, AdjustableBedCoordinator]],
-        op: Callable[[AdjustableBedCoordinator], Coroutine[Any, Any, None]],
+        targets: list[tuple[str, BedChild]],
+        op: Callable[[BedChild], Coroutine[Any, Any, None]],
         *,
         cancel_running: bool,
         resources: frozenset[str],
@@ -594,7 +600,7 @@ class PairedBedCoordinator:
 
         group_id = uuid4().hex
         child_by_side = dict(targets)
-        prepared: dict[str, tuple[AdjustableBedCoordinator, CommandHandle]] = {}
+        prepared: dict[str, tuple[BedChild, CommandHandle]] = {}
         committed = False
         result_tasks: dict[str, asyncio.Task[None]] = {}
 
@@ -768,8 +774,8 @@ class PairedBedCoordinator:
     async def _run_both_concurrent_legacy(
         self,
         action: str,
-        targets: list[tuple[str, AdjustableBedCoordinator]],
-        op: Callable[[AdjustableBedCoordinator], Coroutine[Any, Any, None]],
+        targets: list[tuple[str, BedChild]],
+        op: Callable[[BedChild], Coroutine[Any, Any, None]],
     ) -> None:
         """Run the b3 concurrent contract for coordinator test doubles."""
         tasks: dict[str, asyncio.Task[None]] = {
@@ -809,8 +815,8 @@ class PairedBedCoordinator:
     async def _run_both_sequential(
         self,
         action: str,
-        targets: list[tuple[str, AdjustableBedCoordinator]],
-        op: Callable[[AdjustableBedCoordinator], Coroutine[Any, Any, None]],
+        targets: list[tuple[str, BedChild]],
+        op: Callable[[BedChild], Coroutine[Any, Any, None]],
         entry_cancel: Mapping[str, tuple[int, ...]],
         resources: frozenset[str],
     ) -> None:
@@ -915,7 +921,7 @@ class PairedBedCoordinator:
         if errors:
             raise PairedSideError(action, errors)
 
-    async def _release_other_sides(self, keep: AdjustableBedCoordinator) -> bool:
+    async def _release_other_sides(self, keep: BedChild) -> bool:
         """Disconnect every side except ``keep`` (the one-link guard before a
         sequential connect). Returns False if any disconnect failed, so the caller
         can abort rather than risk opening a second link."""
@@ -927,7 +933,7 @@ class PairedBedCoordinator:
         return ok
 
     async def _safe_disconnect(
-        self, side: str, child: AdjustableBedCoordinator
+        self, side: str, child: BedChild
     ) -> bool:
         """Disconnect one side, swallowing failures. Returns True on success — a
         disconnect error must not mask the command outcome, but callers that rely
@@ -958,7 +964,7 @@ class PairedBedCoordinator:
             raise PairedSideError("stop", errors)
 
     async def _stop_children(
-        self, targets: list[tuple[str, AdjustableBedCoordinator]]
+        self, targets: list[tuple[str, BedChild]]
     ) -> dict[str, BaseException]:
         """Send STOP to every target, swallowing individual failures.
 
@@ -1091,7 +1097,7 @@ class PairedBedCoordinator:
         return unregister
 
 
-class SingleAddressSideCoordinator:
+class SingleAddressSideCoordinator(EntityRuntimeView):
     """Logical left/right coordinator view over one physical BLE coordinator."""
 
     def __init__(
@@ -1100,34 +1106,99 @@ class SingleAddressSideCoordinator:
         side: str,
         hydration_owner: SingleAddressPairedCoordinator,
     ) -> None:
-        object.__setattr__(self, "_single_inner", inner)
-        object.__setattr__(self, "_single_side", side)
-        object.__setattr__(self, "_single_hydration_owner", hydration_owner)
-        object.__setattr__(self, "_single_position_data", {})
-        object.__setattr__(self, "_single_position_callbacks", set())
-        # CB24 reports one shared set of axes, so reconnect hydration can relay
-        # it to both views. Other single-address protocols use the same axis
-        # keys per side, where an unbound response would overwrite the other
-        # side's state.
+        self._single_inner = inner
+        self._single_side = side
+        self._single_hydration_owner = hydration_owner
+        self._single_position_data: dict[str, float] = {}
+        self._single_position_callbacks: set[Callable[[dict[str, float]], None]] = set()
+        self._single_unregister_position_callback: Callable[[], None] | None = None
+        # Only CB24 reports shared axes that can be relayed to both logical sides.
         if inner.bed_type == BED_TYPE_OKIN_CB24:
-            object.__setattr__(
-                self,
-                "_single_unregister_position_callback",
-                inner.register_position_callback(
-                    lambda _positions: self._sync_position_state()
-                ),
+            self._single_unregister_position_callback = inner.register_position_callback(
+                lambda _positions: self._sync_position_state()
             )
 
-    def __getattr__(self, name: str) -> Any:
-        if name.startswith("_single_"):
-            raise AttributeError(name)
-        return getattr(self._single_inner, name)
+    @property
+    def _entity_source(self) -> EntityRuntime:
+        return self._single_inner
 
-    def __setattr__(self, name: str, value: Any) -> None:
-        if name.startswith("_single_"):
-            object.__setattr__(self, name, value)
-        else:
-            setattr(self._single_inner, name, value)
+    def async_command_operation_guard(self) -> contextlib.AbstractAsyncContextManager[None]:
+        return self._single_inner.async_command_operation_guard()
+
+    def cache_capability_controller(self) -> None:
+        return self._single_inner.cache_capability_controller()
+
+    def consume_internal_entry_update(self, entry: ConfigEntry) -> bool:
+        return self._single_inner.consume_internal_entry_update(entry)
+
+    async def async_connect(self) -> bool:
+        return await self._single_inner.async_connect()
+
+    async def async_shutdown(self) -> None:
+        return await self._single_inner.async_shutdown()
+
+    async def async_wait_prepared_command(self, handle: CommandHandle) -> None:
+        return await self._single_inner.async_wait_prepared_command(handle)
+
+    def commit_prepared_command(self, handle: CommandHandle) -> None:
+        return self._single_inner.commit_prepared_command(handle)
+
+    async def async_wait_prepared_command_result(self, handle: CommandHandle) -> None:
+        return await self._single_inner.async_wait_prepared_command_result(handle)
+
+    async def async_abort_prepared_command(self, handle: CommandHandle) -> None:
+        return await self._single_inner.async_abort_prepared_command(handle)
+
+    @property
+    def command_timing(self) -> dict[str, object]:
+        return self._single_inner.command_timing
+
+    def get_max_angle(self, motor: str) -> float:
+        return self._single_inner.get_max_angle(motor)
+
+    @property
+    def observed_ble_device_name(self) -> str | None:
+        return self._single_inner.observed_ble_device_name
+
+    @property
+    def client(self) -> BleakClient | None:
+        return self._single_inner.client
+
+    @property
+    def pairing_supported(self) -> bool | None:
+        return self._single_inner.pairing_supported
+
+    @property
+    def connection_history(self) -> dict[str, object]:
+        return self._single_inner.connection_history
+
+    @property
+    def pairing_diagnostics(self) -> dict[str, object]:
+        return self._single_inner.pairing_diagnostics
+
+    @property
+    def adapter_details(self) -> dict[str, object]:
+        return self._single_inner.adapter_details
+
+    @property
+    def command_trace(self) -> list[dict[str, object]]:
+        return self._single_inner.command_trace
+
+    @property
+    def connection_attempt_details(self) -> list[dict[str, object]]:
+        return self._single_inner.connection_attempt_details
+
+    def pause_disconnect_timer(self) -> None:
+        return self._single_inner.pause_disconnect_timer()
+
+    def resume_disconnect_timer(self) -> None:
+        return self._single_inner.resume_disconnect_timer()
+
+    async def async_start_notify_for_diagnostics(self) -> None:
+        return await self._single_inner.async_start_notify_for_diagnostics()
+
+    def set_raw_notify_callback(self, callback: Callable[[str, bytes], None] | None) -> None:
+        return self._single_inner.set_raw_notify_callback(callback)
 
     def __hash__(self) -> int:
         return hash(id(self._single_inner))
@@ -1169,10 +1240,10 @@ class SingleAddressSideCoordinator:
 
     def _unregister_inner_position_callback(self) -> None:
         """Release the shared-position relay registered by CB24 views."""
-        unregister = getattr(self, "_single_unregister_position_callback", None)
+        unregister = self._single_unregister_position_callback
         if unregister is not None:
             unregister()
-            object.__setattr__(self, "_single_unregister_position_callback", None)
+            self._single_unregister_position_callback = None
 
     def register_position_callback(
         self, callback_fn: Callable[[dict[str, float]], None]
@@ -1187,12 +1258,12 @@ class SingleAddressSideCoordinator:
         return unregister
 
     @property
-    def controller(self) -> Any | None:
+    def controller(self) -> BedController | SideBoundController | None:
         controller = self._single_inner.controller
         return controller.bind_side(self._single_side) if controller is not None else None
 
     @property
-    def capability_controller(self) -> Any | None:
+    def capability_controller(self) -> BedController | SideBoundController | None:
         controller = self._single_inner.capability_controller
         return controller.bind_side(self._single_side) if controller is not None else None
 
@@ -1278,13 +1349,17 @@ class SingleAddressSideCoordinator:
             **kwargs,
         )
 
-    async def async_execute_controller_query(
-        self, query_fn: Callable[[Any], Coroutine[Any, Any, Any]], **kwargs: Any
-    ) -> Any:
+    async def async_execute_controller_query[T](
+        self, query_fn: Callable[[BedController], Coroutine[object, object, T]],
+        cancel_running: bool = False, skip_disconnect: bool = False,
+        preemptible: bool = True, run_if: Callable[[], bool] | None = None,
+    ) -> T:
         async def bound(controller: Any) -> Any:
             return await query_fn(controller.bind_side(self._single_side))
 
-        result = await self._single_inner.async_execute_controller_query(bound, **kwargs)
+        result = await self._single_inner.async_execute_controller_query(
+            bound, cancel_running, skip_disconnect, preemptible, run_if
+        )
         self._sync_position_state()
         return result
 
@@ -1396,7 +1471,7 @@ class SingleAddressPairedCoordinator(PairedBedCoordinator):
         super().__init__(
             hass,
             entry,
-            children,  # type: ignore[arg-type]
+            children,
             connection_mode=PAIR_CONNECTION_MODE_CONCURRENT,
         )
 
@@ -1411,13 +1486,13 @@ class SingleAddressPairedCoordinator(PairedBedCoordinator):
     def entity_unique_id(self, key: str) -> str:
         return f"{self._single_inner.address}_{key}"
 
-    def _targets_for(self, side: str) -> list[tuple[str, AdjustableBedCoordinator]]:
+    def _targets_for(self, side: str) -> list[tuple[str, BedChild]]:
         self._validate_side(side)
         if side == SIDE_BOTH and self._single_native_both:
             return [
                 (SIDE_LEFT, self._single_both),
                 (SIDE_RIGHT, self._single_both),
-            ]  # type: ignore[list-item]
+            ]
         return super()._targets_for(side)
 
     def _set_native_both_position_state(
@@ -1431,8 +1506,8 @@ class SingleAddressPairedCoordinator(PairedBedCoordinator):
     async def _run_both_concurrent(
         self,
         action: str,
-        targets: list[tuple[str, AdjustableBedCoordinator]],
-        op: Callable[[AdjustableBedCoordinator], Coroutine[Any, Any, None]],
+        targets: list[tuple[str, BedChild]],
+        op: Callable[[BedChild], Coroutine[Any, Any, None]],
         *,
         cancel_running: bool,
         resources: frozenset[str],
@@ -1484,7 +1559,7 @@ class SingleAddressPairedCoordinator(PairedBedCoordinator):
             raise
 
     async def _stop_children(
-        self, targets: list[tuple[str, AdjustableBedCoordinator]]
+        self, targets: list[tuple[str, BedChild]]
     ) -> dict[str, BaseException]:
         if (
             self._single_native_both
@@ -1687,7 +1762,7 @@ class SingleAddressPairedCoordinator(PairedBedCoordinator):
         )
 
 
-class PairedSideProxy:
+class PairedSideProxy(EntityRuntimeView):
     """A child coordinator as seen by its per-side entities, with writes routed
     through the parent so they take the pair command lock.
 
@@ -1703,7 +1778,7 @@ class PairedSideProxy:
     def __init__(
         self,
         parent: PairedBedCoordinator,
-        child: AdjustableBedCoordinator,
+        child: BedChild,
         side: str,
     ) -> None:
         """Wrap ``child`` (on ``side``) with writes routed through ``parent``."""
@@ -1711,35 +1786,42 @@ class PairedSideProxy:
         self._pair_child = child
         self._pair_side = side
 
-    def __getattr__(self, name: str) -> Any:
-        # Everything not overridden below delegates to the wrapped child. Guard
-        # the proxy's own attrs so a miss before __init__ can't infinitely recurse.
-        if name.startswith("_pair_"):
-            raise AttributeError(name)
-        return getattr(self._pair_child, name)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        # The proxy's own wiring stays local; everything else delegates to the
-        # child so existing entity and coordinator state surfaces stay compatible.
-        if name.startswith("_pair_"):
-            object.__setattr__(self, name, value)
-        else:
-            setattr(self._pair_child, name, value)
+    @property
+    def _entity_source(self) -> EntityRuntime:
+        return self._pair_child
 
     async def async_execute_controller_command(
-        self, command_fn: CommandFn, **kwargs: Any
+        self, command_fn: ControllerCommand, *, cancel_running: bool = True,
+        skip_disconnect: bool = False, resource: str | None = None,
+        resources: Collection[str] | None = None,
     ) -> None:
-        """Route a side command through the parent (takes the pair lock)."""
+        """Route entity commands through the parent safety contract."""
         await self._pair_parent.async_execute_controller_command(
-            command_fn, side=self._pair_side, **kwargs
+            command_fn, side=self._pair_side, cancel_running=cancel_running,
+            skip_disconnect=skip_disconnect, resource=resource, resources=resources,
         )
 
-    async def async_seek_position(self, *args: Any, **kwargs: Any) -> None:
-        """Route a side seek through the parent (takes the pair lock)."""
+    async def async_seek_position(
+        self, position_key: str, target_angle: float,
+        move_up_fn: ControllerCommand, move_down_fn: ControllerCommand,
+        move_stop_fn: ControllerCommand,
+    ) -> None:
         await self._pair_parent.async_seek_position(
-            *args, side=self._pair_side, **kwargs
+            position_key, target_angle, move_up_fn, move_down_fn, move_stop_fn,
+            side=self._pair_side,
         )
 
-    async def async_stop_command(self, **kwargs: Any) -> None:
-        """Stop just this side via the parent's resilient stop contract."""
+    async def async_stop_command(self) -> None:
         await self._pair_parent.async_stop_command(side=self._pair_side)
+
+
+def entity_runtimes(
+    coordinator: AdjustableBedCoordinator | PairedBedCoordinator,
+) -> tuple[EntityRuntime, ...]:
+    """Build entity views with the same identity and routing on every platform."""
+    if isinstance(coordinator, PairedBedCoordinator):
+        return tuple(
+            PairedSideProxy(coordinator, child, side)
+            for side, child in coordinator.children.items()
+        )
+    return (coordinator,)
