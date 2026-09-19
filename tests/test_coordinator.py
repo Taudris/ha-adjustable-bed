@@ -254,6 +254,47 @@ class TestCoordinatorConnection:
         assert result is False
         assert coordinator.controller is None
 
+    @pytest.mark.parametrize(
+        "bed_type,path_count,success_at,expected_attempts",
+        [
+            (BED_TYPE_LINAK, 2, 4, 4),
+            (BED_TYPE_LINAK, 2, None, 5),
+            (BED_TYPE_LINAK, 1, 4, 3),
+            (BED_TYPE_KEESON, 2, 4, 3),
+        ],
+    )
+    async def test_linak_retries_reach_alternative_paths_with_bounded_backoff(
+        self, hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client,
+        bed_type, path_count, success_at, expected_attempts,
+    ):
+        """HA's strong failed paths must not exhaust the budget before fallback."""
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        coordinator._bed_type = bed_type
+        coordinator._retry_base_delay = 2
+        attempts = 0
+
+        async def connect(*_args, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts != success_at:
+                raise BleakError("ESP_GATT_ERROR while connecting")
+            return mock_bleak_client
+
+        with (
+            patch("custom_components.adjustable_bed.coordinator.async_connection_paths", return_value=tuple(
+                ConnectionPath(source=f"proxy-{i}") for i in range(path_count)
+            )),
+            patch("custom_components.adjustable_bed.coordinator.establish_connection", side_effect=connect),
+            patch("custom_components.adjustable_bed.coordinator.random.uniform", return_value=1),
+            patch("custom_components.adjustable_bed.coordinator.asyncio.sleep", new=AsyncMock()) as sleep,
+        ):
+            result = await coordinator.async_connect()
+
+        assert result is (success_at is not None and success_at <= expected_attempts)
+        assert attempts == expected_attempts
+        retry_delays = [call.args[0] for call in sleep.await_args_list if call.args[0] >= 2]
+        assert retry_delays == [2, *([4] * (expected_attempts - 2))]
+
     async def test_connect_bleak_error(
         self,
         hass: HomeAssistant,

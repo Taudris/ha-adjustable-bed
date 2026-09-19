@@ -49,6 +49,7 @@ from .bluetooth_diagnostics import connection_reachability
 from .bluetooth_transport import (
     ConnectionPath,
     TransportClass,
+    async_connection_paths,
     async_path_for_source,
     client_source,
 )
@@ -2467,10 +2468,20 @@ class AdjustableBedCoordinator:
         # Retries, warnings, and failures keep their levels regardless (see below).
         connect_log = _LOGGER.info if self._last_connected is None else _LOGGER.debug
 
+        attempt_limit = self._max_retries
+        linak_multipath = self._bed_type == BED_TYPE_LINAK and sum(
+            path.can_connect for path in async_connection_paths(self.hass, self._address)
+        ) > 1
+        if linak_multipath:
+            # HA may spend several attempts penalizing a strong but unusable
+            # proxy before selecting a weaker working one. Keep that fallback
+            # inside this request instead of requiring another user action.
+            attempt_limit = max(attempt_limit, 5)
+
         connect_log(
             "Initiating BLE connection to %s (max %d attempts)",
             self._address,
-            self._max_retries,
+            attempt_limit,
         )
         overall_start = time.monotonic()
         # Track adapters that ran out of connection slots so we can try
@@ -2479,7 +2490,6 @@ class AdjustableBedCoordinator:
         adapter_result: AdapterSelectionResult | None = None
 
         attempt = 0
-        attempt_limit = self._max_retries
         protocol_correction_pairing_retry_reserved = False
         while attempt < attempt_limit:
             attempt_index = attempt
@@ -2495,7 +2505,10 @@ class AdjustableBedCoordinator:
 
             # On retries, add a delay before attempting to give the Bluetooth stack time to reset
             if attempt_index > 0:
-                base_delay = self._retry_base_delay * (2 ** (attempt_index - 1))
+                retry_exponent = attempt_index - 1
+                if linak_multipath:
+                    retry_exponent = min(retry_exponent, 1)
+                base_delay = self._retry_base_delay * (2 ** retry_exponent)
                 jitter = random.uniform(1 - self._retry_jitter, 1 + self._retry_jitter)
                 pre_retry_delay = base_delay * jitter
                 _LOGGER.info(
@@ -3554,7 +3567,7 @@ class AdjustableBedCoordinator:
             "  4. Move adapter closer to bed\n"
             "  5. If using ESPHome proxy, verify it's online",
             self._address,
-            self._max_retries,
+            attempt,
             total_elapsed,
         )
         self._schedule_pending_capability_reload()

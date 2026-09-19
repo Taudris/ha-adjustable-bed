@@ -81,6 +81,11 @@ Memory recall and flat presets have a 30-second elapsed hold limit after
 connection readiness. Slow Bluetooth acknowledgements cannot extend that hold;
 STOP cleanup still runs when the limit expires or a command is cancelled.
 
+When HA sees multiple available connection paths, Linak allows up to five
+connection attempts so HA can fall back from a stronger but failing proxy to a
+working alternative. Retry backoff stops growing after the second retry. A
+genuinely unreachable bed still reports failure after this bounded retry budget.
+
 ## Implemented features
 
 | Feature | Bed Control | Performance Series |
