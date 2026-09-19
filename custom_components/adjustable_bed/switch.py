@@ -6,7 +6,7 @@ import asyncio
 import logging
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.switch import SwitchEntity, SwitchEntityDescription
 from homeassistant.config_entries import ConfigEntry
@@ -15,9 +15,9 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import BED_TYPE_SLEEP_NUMBER_MCR, DOMAIN
-from .coordinator import AdjustableBedCoordinator
 from .entity import AdjustableBedEntity
-from .paired_coordinator import PairedBedCoordinator, PairedSideProxy
+from .entity_runtime import EntityRuntime
+from .paired_coordinator import entity_runtimes
 
 if TYPE_CHECKING:
     from .beds.base import BedController
@@ -92,25 +92,15 @@ async def async_setup_entry(
 ) -> None:
     """Set up Adjustable Bed switch entities."""
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    if isinstance(coordinator, PairedBedCoordinator):
-        entities: list[AdjustableBedSwitch] = []
-        for side, child in coordinator.children.items():
-            entities.extend(
-                _switch_entities_for(
-                    hass,
-                    cast(
-                        "AdjustableBedCoordinator",
-                        PairedSideProxy(coordinator, child, side),
-                    ),
-                )
-            )
-        async_add_entities(entities)
-        return
-    async_add_entities(_switch_entities_for(hass, coordinator))
+    async_add_entities([
+        entity
+        for runtime in entity_runtimes(coordinator)
+        for entity in _switch_entities_for(hass, runtime)
+    ])
 
 
 def _switch_entities_for(
-    hass: HomeAssistant, coordinator: AdjustableBedCoordinator
+    hass: HomeAssistant, coordinator: EntityRuntime
 ) -> list[AdjustableBedSwitch]:
     """Build switch entities for a single (child or standalone) coordinator."""
     # capability_controller: an offline paired side (e.g. Linak under-bed lights)
@@ -174,7 +164,7 @@ class AdjustableBedSwitch(AdjustableBedEntity, SwitchEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: AdjustableBedSwitchEntityDescription,
     ) -> None:
         """Initialize the switch."""

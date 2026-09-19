@@ -16,6 +16,7 @@ async def _noop(_controller) -> None:
 async def test_cover_commands_use_physical_position_axis_resource() -> None:
     """Logical Keeson motor names must share their seek scheduler resource."""
     coordinator = SimpleNamespace(
+        entity_side=None,
         device_info={},
         entity_translation_key=lambda key: key,
         entity_unique_id=lambda key: key,

@@ -1647,3 +1647,86 @@ class TestLinakPositionData:
         assert state["linak_back_end_position_up"] is False
         assert state["linak_back_end_position_down"] is True
         assert state["linak_back_position_lost"] is False
+
+
+@pytest.mark.parametrize(
+    "replacement_target,stop_during_cleanup", [(55.0, False), (20.0, False), (55.0, True)]
+)
+async def test_current_seek_replacement_releases_old_motion_before_new_target(
+    hass: HomeAssistant,
+    mock_config_entry,
+    mock_coordinator_connected,
+    mock_bleak_client: MagicMock,
+    replacement_target: float,
+    stop_during_cleanup: bool,
+) -> None:
+    """Check current software ordering; this does not simulate actuator inertia (#518)."""
+    coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+    await coordinator.async_connect()
+    _mark_session_ready(coordinator)
+    coordinator._handle_position_update("back", 40.0)
+    first_motion = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    commands: list[bytes] = []
+    tasks: list[asyncio.Task[None]] = []
+
+    async def write(_uuid: str, command: bytes, *, response: bool) -> None:
+        commands.append(command)
+        if command == LinakCommands.MOVE_STOP and not cleanup_started.is_set():
+            cleanup_started.set()
+            await release_cleanup.wait()
+        elif command in (LinakCommands.MOVE_BACK_UP, LinakCommands.MOVE_BACK_DOWN):
+            if not first_motion.is_set():
+                coordinator._handle_position_update("back", 39.0)
+                first_motion.set()
+            else:
+                coordinator._handle_position_update("back", replacement_target)
+
+    async def seek(target: float) -> None:
+        await coordinator.async_seek_position(
+            "back",
+            target,
+            lambda controller: controller.move_back_up(),
+            lambda controller: controller.move_back_down(),
+            lambda controller: controller.move_back_stop(),
+        )
+
+    mock_bleak_client.write_gatt_char.side_effect = write
+    try:
+        tasks.append(asyncio.create_task(seek(5.0)))
+        await asyncio.wait_for(first_motion.wait(), 1)
+        tasks.append(asyncio.create_task(seek(replacement_target)))
+        await asyncio.wait_for(cleanup_started.wait(), 1)
+        # Replacement must wait for the old movement's cleanup, even if the
+        # transport stalls there. Neither same-direction nor reversal skips it.
+        assert commands == [LinakCommands.MOVE_BACK_DOWN, LinakCommands.MOVE_STOP]
+        if stop_during_cleanup:
+            tasks.append(asyncio.create_task(coordinator.async_stop_command()))
+            await asyncio.sleep(0)  # Let STOP invalidate the queued replacement.
+        release_cleanup.set()
+        await asyncio.wait_for(asyncio.gather(*tasks), 1)
+        if stop_during_cleanup:
+            assert LinakCommands.MOVE_BACK_UP not in commands
+            assert commands.count(LinakCommands.MOVE_BACK_DOWN) == 1
+            assert commands[-1] == LinakCommands.MOVE_STOP
+        else:
+            expected = (
+                LinakCommands.MOVE_BACK_UP
+                if replacement_target > 39.0
+                else LinakCommands.MOVE_BACK_DOWN
+            )
+            assert commands == [
+                LinakCommands.MOVE_BACK_DOWN,
+                LinakCommands.MOVE_STOP,
+                expected,
+                LinakCommands.MOVE_STOP,
+            ]
+            assert coordinator._seek_outcomes["back"]["outcome"] == "reached_target"
+    finally:
+        release_cleanup.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await coordinator.async_shutdown()

@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from homeassistant.helpers.entity import Entity
 
 if TYPE_CHECKING:
-    from .coordinator import AdjustableBedCoordinator
+    from .entity_runtime import EntityRuntime
 
 
 class AdjustableBedEntity(Entity):
@@ -15,11 +15,11 @@ class AdjustableBedEntity(Entity):
 
     _attr_has_entity_name = True
 
-    def __init__(self, coordinator: AdjustableBedCoordinator) -> None:
+    def __init__(self, coordinator: EntityRuntime) -> None:
         """Initialize the entity."""
         self._coordinator = coordinator
         self._attr_device_info = coordinator.device_info
-        side = getattr(coordinator, "entity_side", None)
+        side = coordinator.entity_side
         if side is not None:
             self._attr_extra_state_attributes = {"bed_side": side}
 

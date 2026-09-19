@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.cover import (
     CoverDeviceClass,
@@ -22,13 +22,13 @@ from .const import (
     BEDS_WITH_PERCENTAGE_POSITIONS,
     DOMAIN,
 )
-from .coordinator import AdjustableBedCoordinator
 from .entity import AdjustableBedEntity
+from .entity_runtime import EntityRuntime
 from .logicdata_app_protocol import LAYOUTS, layout_axes
-from .paired_coordinator import PairedBedCoordinator, PairedSideProxy
+from .paired_coordinator import entity_runtimes
 
 if TYPE_CHECKING:
-    from .beds.base import BedController, MotorControlSpec
+    from .beds.base import BedController, MotorControlSpec, SideBoundController
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -189,31 +189,15 @@ async def async_setup_entry(
 ) -> None:
     """Set up Adjustable Bed cover entities."""
     coordinator = hass.data[DOMAIN][entry.entry_id]
-
-    # Paired beds expose per-side motors: build the same covers against each
-    # child coordinator (each attaches to its own side sub-device). There is no
-    # combined cover (synthesized position is a non-goal); combined motion is
-    # exposed as "both" buttons instead.
-    if isinstance(coordinator, PairedBedCoordinator):
-        entities: list[AdjustableBedCover] = []
-        for side, child in coordinator.children.items():
-            entities.extend(
-                _cover_entities_for(
-                    hass,
-                    cast(
-                        "AdjustableBedCoordinator",
-                        PairedSideProxy(coordinator, child, side),
-                    ),
-                )
-            )
-        async_add_entities(entities)
-        return
-
-    async_add_entities(_cover_entities_for(hass, coordinator))
+    async_add_entities([
+        entity
+        for runtime in entity_runtimes(coordinator)
+        for entity in _cover_entities_for(hass, runtime)
+    ])
 
 
 def _cover_entities_for(
-    hass: HomeAssistant, coordinator: AdjustableBedCoordinator
+    hass: HomeAssistant, coordinator: EntityRuntime
 ) -> list[AdjustableBedCover]:
     """Build the motor cover entities for a single (child or standalone) coordinator."""
     # capability_controller, not controller: a paired side that is offline at
@@ -280,8 +264,8 @@ def _build_cover_description(
 
 def _async_remove_stale_cover_entities(
     hass: HomeAssistant,
-    coordinator: AdjustableBedCoordinator,
-    controller: BedController,
+    coordinator: EntityRuntime,
+    controller: BedController | SideBoundController,
 ) -> None:
     """Remove stale cover entities that should no longer be exposed."""
     registry = er.async_get(hass)
@@ -316,7 +300,7 @@ class AdjustableBedCover(AdjustableBedEntity, CoverEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: AdjustableBedCoverEntityDescription,
     ) -> None:
         """Initialize the cover."""

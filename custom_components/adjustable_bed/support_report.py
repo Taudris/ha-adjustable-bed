@@ -43,7 +43,7 @@ from .kaidi_protocol import extract_kaidi_advertisement, kaidi_advertisement_to_
 from .redaction import redact_data, redact_pins_only
 
 if TYPE_CHECKING:
-    from .coordinator import AdjustableBedCoordinator
+    from .paired_coordinator import BedChild
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -72,7 +72,7 @@ _RELEVANT_LOG_NAMES = (DOMAIN, "bluetooth", "bleak", "habluetooth")
 async def generate_support_report(
     hass: HomeAssistant,
     entry: ConfigEntry,
-    coordinator: AdjustableBedCoordinator,
+    coordinator: BedChild,
     *,
     include_logs: bool = True,
 ) -> dict[str, Any]:
@@ -142,7 +142,7 @@ def _get_integration_info(entry: ConfigEntry) -> dict[str, Any]:
     }
 
 
-def _get_connection_info(coordinator: AdjustableBedCoordinator) -> dict[str, Any]:
+def _get_connection_info(coordinator: BedChild) -> dict[str, Any]:
     """Get connection state information."""
     is_connected = coordinator.is_connected
     client = coordinator.client
@@ -169,7 +169,7 @@ def _get_connection_info(coordinator: AdjustableBedCoordinator) -> dict[str, Any
 
 def _get_pairing_info(
     entry: ConfigEntry | None,
-    coordinator: AdjustableBedCoordinator | None = None,
+    coordinator: BedChild | None = None,
     *,
     diagnostic_backend: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -205,7 +205,7 @@ def _get_pairing_info(
     return info
 
 
-def _get_controller_info(coordinator: AdjustableBedCoordinator) -> dict[str, Any]:
+def _get_controller_info(coordinator: BedChild) -> dict[str, Any]:
     """Get controller information."""
     info: dict[str, Any] = {"initialized": coordinator.controller is not None}
 
@@ -242,7 +242,7 @@ def _get_controller_info(coordinator: AdjustableBedCoordinator) -> dict[str, Any
 
 
 async def _get_bluetooth_info(
-    hass: HomeAssistant, coordinator: AdjustableBedCoordinator
+    hass: HomeAssistant, coordinator: BedChild
 ) -> dict[str, Any]:
     """Get Bluetooth adapter and advertisement information."""
     info: dict[str, Any] = {}

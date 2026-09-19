@@ -54,7 +54,7 @@ from .kaidi_protocol import extract_kaidi_advertisement, kaidi_advertisement_to_
 
 if TYPE_CHECKING:
     from .beds.base import BedController
-    from .coordinator import AdjustableBedCoordinator
+    from .paired_coordinator import BedChild
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -188,7 +188,7 @@ class BLEDiagnosticRunner:
         hass: HomeAssistant,
         address: str,
         capture_duration: int = DEFAULT_CAPTURE_DURATION,
-        coordinator: AdjustableBedCoordinator | None = None,
+        coordinator: BedChild | None = None,
     ) -> None:
         """Initialize the diagnostic runner."""
         if capture_duration < 0:

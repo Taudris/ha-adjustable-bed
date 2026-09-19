@@ -23,7 +23,6 @@ from custom_components.adjustable_bed import (
     _async_release_absorbed_singles,
     _async_update_listener,
     _build_paired_children,
-    _device_for_entry_and_identifier,
     _make_child_persist_cb,
     _maybe_create_pairing_issue_for,
     _shared_child_fields,
@@ -85,6 +84,7 @@ from custom_components.adjustable_bed.paired_coordinator import (
     PairedBedCoordinator,
     SingleAddressPairedCoordinator,
 )
+from custom_components.adjustable_bed.paired_registry import _device_for_entry_and_identifier
 from custom_components.adjustable_bed.pairing import (
     effective_child_data,
     get_child,
@@ -672,7 +672,7 @@ class TestPairedSetup:
         with (
             patch.object(hass.config_entries, "async_add", side_effect=fail_second),
             patch(
-                "custom_components.adjustable_bed._async_transfer_device_registry_entry"
+                "custom_components.adjustable_bed.paired_registry._async_transfer_device_registry_entry"
             ) as transfer_device,
             pytest.raises(RuntimeError, match="injected second-side failure"),
         ):

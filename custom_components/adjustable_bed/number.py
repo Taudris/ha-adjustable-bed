@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -32,12 +32,12 @@ from .const import (
     SIDE_BOTH,
     bed_type_has_position_feedback,
 )
-from .coordinator import AdjustableBedCoordinator
 from .entity import AdjustableBedEntity
+from .entity_runtime import EntityRuntime
 from .paired_coordinator import (
     PairedBedCoordinator,
-    PairedSideProxy,
     SingleAddressPairedCoordinator,
+    entity_runtimes,
 )
 
 if TYPE_CHECKING:
@@ -287,14 +287,11 @@ async def async_setup_entry(
     if isinstance(coordinator, PairedBedCoordinator):
         paired_entities: list[NumberEntity] = []
         children = list(coordinator.children.values())
-        for side, child in coordinator.children.items():
+        for runtime in entity_runtimes(coordinator):
             paired_entities.extend(
                 _number_entities_for(
                     hass,
-                    cast(
-                        "AdjustableBedCoordinator",
-                        PairedSideProxy(coordinator, child, side),
-                    ),
+                    runtime,
                 )
             )
         # Combined sliders on the parent device drive both sides to one target.
@@ -304,11 +301,12 @@ async def async_setup_entry(
         if paired_entities:
             async_add_entities(paired_entities)
         return
-    async_add_entities(_number_entities_for(hass, coordinator))
+    async_add_entities([entity for runtime in entity_runtimes(coordinator)
+                        for entity in _number_entities_for(hass, runtime)])
 
 
 def _number_entities_for(
-    hass: HomeAssistant, coordinator: AdjustableBedCoordinator
+    hass: HomeAssistant, coordinator: EntityRuntime
 ) -> list[NumberEntity]:
     """Build number entities for a single (child or standalone) coordinator."""
     entry = coordinator.entry  # ChildEntryView for a paired child; real entry otherwise
@@ -497,7 +495,7 @@ def _number_entities_for(
 
 
 def _position_number_specs(
-    coordinator: AdjustableBedCoordinator,
+    coordinator: EntityRuntime,
 ) -> tuple[PositionNumberSpec, ...]:
     """Return the position sliders one bed (or paired side) can seek, else ().
 
@@ -519,7 +517,7 @@ def _position_number_specs(
 
 def _combined_position_entities_for(
     coordinator: PairedBedCoordinator,
-    children: list[AdjustableBedCoordinator],
+    children: Sequence[EntityRuntime],
 ) -> list[NumberEntity]:
     """Build the parent device's 'both sides' position sliders.
 
@@ -558,7 +556,7 @@ def _combined_position_entities_for(
 def _async_remove_stale_combined_number_entities(
     hass: HomeAssistant,
     coordinator: PairedBedCoordinator,
-    children: list[AdjustableBedCoordinator],
+    children: Sequence[EntityRuntime],
     entities: list[NumberEntity],
 ) -> None:
     """Remove pair-level sliders no longer supported by both known sides."""
@@ -595,7 +593,7 @@ def _async_remove_stale_combined_number_entities(
 
 def _async_remove_stale_sleep_number_entity(
     hass: HomeAssistant,
-    coordinator: AdjustableBedCoordinator,
+    coordinator: EntityRuntime,
 ) -> None:
     """Remove the legacy single-side Sleep Number entity when side controls exist."""
     registry = er.async_get(hass)
@@ -610,7 +608,7 @@ def _async_remove_stale_sleep_number_entity(
 
 def _async_remove_stale_light_level_entity(
     hass: HomeAssistant,
-    coordinator: AdjustableBedCoordinator,
+    coordinator: EntityRuntime,
 ) -> None:
     """Remove brightness when the current profile no longer exposes it."""
     registry = er.async_get(hass)
@@ -625,7 +623,7 @@ def _async_remove_stale_light_level_entity(
 
 def _async_remove_stale_massage_entities(
     hass: HomeAssistant,
-    coordinator: AdjustableBedCoordinator,
+    coordinator: EntityRuntime,
     active_zones: set[str],
 ) -> None:
     """Remove intensity numbers no longer supported by the selected controller."""
@@ -642,7 +640,7 @@ def _async_remove_stale_massage_entities(
 
 def _async_remove_stale_position_entities(
     hass: HomeAssistant,
-    coordinator: AdjustableBedCoordinator,
+    coordinator: EntityRuntime,
     *,
     stale_keys: frozenset[str] | None = None,
 ) -> None:
@@ -670,7 +668,7 @@ class AdjustableBedPositionNumber(AdjustableBedEntity, NumberEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: AdjustableBedNumberEntityDescription,
     ) -> None:
         """Initialize the number entity."""
@@ -826,7 +824,7 @@ class AdjustableBedMassageNumber(AdjustableBedEntity, NumberEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: AdjustableBedMassageNumberEntityDescription,
     ) -> None:
         """Initialize the massage number entity."""
@@ -884,7 +882,7 @@ class AdjustableBedLightLevelNumber(AdjustableBedEntity, NumberEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: NumberEntityDescription,
     ) -> None:
         """Initialize the light level number entity."""
@@ -917,7 +915,7 @@ class AdjustableBedLightLevelNumber(AdjustableBedEntity, NumberEntity):
     def native_value(self) -> float | None:
         """Return the current light level when the controller tracks it."""
         level = self._coordinator.controller_state.get("light_level")
-        if level is None:
+        if not isinstance(level, (str, int, float)):
             return None
         return float(level)
 
@@ -944,7 +942,7 @@ class AdjustableBedSleepNumberSettingNumber(AdjustableBedEntity, NumberEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: NumberEntityDescription,
     ) -> None:
         """Initialize the Sleep Number setting entity."""
@@ -977,7 +975,7 @@ class AdjustableBedSleepNumberSettingNumber(AdjustableBedEntity, NumberEntity):
     def native_value(self) -> float | None:
         """Return the current Sleep Number setting."""
         value = self._coordinator.controller_state.get("sleep_number")
-        if value is None:
+        if not isinstance(value, (str, int, float)):
             return None
         return float(value)
 
@@ -1013,7 +1011,7 @@ class AdjustableBedSideStateNumber(AdjustableBedEntity, NumberEntity):
 
     def __init__(
         self,
-        coordinator: AdjustableBedCoordinator,
+        coordinator: EntityRuntime,
         description: AdjustableBedSideStateNumberEntityDescription,
     ) -> None:
         """Initialize the side-specific number entity."""
@@ -1046,7 +1044,7 @@ class AdjustableBedSideStateNumber(AdjustableBedEntity, NumberEntity):
     def native_value(self) -> float | None:
         """Return the current side-specific value."""
         value = self._coordinator.controller_state.get(self.entity_description.state_key)
-        if value is None:
+        if not isinstance(value, (str, int, float)):
             return None
         return float(value)
 

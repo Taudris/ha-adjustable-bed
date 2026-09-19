@@ -253,7 +253,7 @@ class ChildEntryView:
     A paired bed is one config entry but two child coordinators. Each child reads
     its per-side config from ``.data`` (this view) and persists runtime changes
     through ``persist_data`` — which updates this view in place and routes to the
-    parent's child descriptor. Everything else proxies to the real parent entry,
+    parent's child descriptor. Explicit lifecycle methods forward to the parent,
     so background tasks, ``entry_id`` and the entry lifecycle stay attached to the
     single real entry. Single beds never use this — they get the real entry.
     """
@@ -304,16 +304,38 @@ class ChildEntryView:
             persisted_data = {key: self._child_data[key] for key in keys if key in self._child_data}
         self._persist_cb(persisted_data)
 
-    def __getattr__(self, name: str) -> Any:
-        # Anything not overridden above (entry_id, title, unique_id, version,
-        # async_create_background_task, async_on_unload, ...) comes from the parent.
-        return getattr(self._parent, name)
+    @property
+    def entry_id(self) -> str:
+        return self._parent.entry_id
+
+    @property
+    def title(self) -> str:
+        return self._parent.title
+
+    @property
+    def unique_id(self) -> str | None:
+        return self._parent.unique_id
+
+    @property
+    def version(self) -> int:
+        return self._parent.version
+
+    def async_create_background_task[R](
+        self, hass: HomeAssistant, target: Coroutine[object, object, R],
+        name: str, eager_start: bool = True,
+    ) -> asyncio.Task[R]:
+        return self._parent.async_create_background_task(hass, target, name, eager_start)
+
+    def async_on_unload(
+        self, func: Callable[[], Coroutine[object, object, None] | None],
+    ) -> None:
+        self._parent.async_on_unload(func)
 
 
 class AdjustableBedCoordinator:
     """Coordinator for managing bed connection and state."""
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry | ChildEntryView) -> None:
         """Initialize the coordinator."""
         self.hass = hass
         self.entry = entry
@@ -775,6 +797,11 @@ class AdjustableBedCoordinator:
             self._async_persist_config(entry_data)
 
         return bed_type_changed or entry_data_changed
+
+    @property
+    def entity_side(self) -> str | None:
+        """Standalone and separate-address children keep unsuffixed identities."""
+        return None
 
     @property
     def address(self) -> str:
