@@ -105,7 +105,7 @@ class TestVerificationOutcomes:
             path=_PROXY, operation="setup_pairing",
         )
         assert not evidence.proves_bond
-        assert evidence.status is BondVerificationStatus.INCONCLUSIVE
+        assert evidence.status is BondVerificationStatus.AUTH_FAILED
 
     async def test_sleep_number_encryption_error_is_a_failed_bond(self) -> None:
         evidence = await async_verify_authenticated_access(

@@ -21,8 +21,9 @@ addresses. The reply supplies the peer and client addresses; neither is derived
 from the Bluetooth MAC. Requests use RIGHT=0 / LEFT=1. Matching checks the response
 bit, negotiated addresses, node class and opcode; SE chunk transfers also check
 the selector. Notification setup preserves the artifact's 128 ms service-discovery delay. Ordinary response timeout is 900 ms, long-transfer chunk timeout is
-1800 ms, with three timeout retries. Writes use advertised GATT properties and
-split at ATT MTU minus three. Invalid CRC, truncated responses, overlong SE values,
+1800 ms, with three timeout retries. Writes split at ATT MTU minus three and retain the existing response-first
+ESPHome compatibility path. If a local adapter rejects that write mode, the
+chunk falls back to an advertised write-without-response operation. Invalid CRC, truncated responses, overlong SE values,
 unknown commands, invalid parameters and unsupported feature requests are rejected.
 
 Foundation capabilities come from its node and system status. Foundation

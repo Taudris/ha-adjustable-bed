@@ -412,3 +412,45 @@ async def test_grouped_queries_fall_back_only_for_unknown_command(
         with pytest.raises(ValueError, match="generic"):
             await controller._read_bed_presence_states()
         controller._send_bamkey_command.assert_not_awaited()
+
+
+@pytest.mark.parametrize("thermal", ["cool", "heat_cool"])
+async def test_optional_state_payload_failure_does_not_abort_hydration(thermal: str) -> None:
+    controller, _client = controller_with_client()
+    controller._ensure_notifications_started = AsyncMock()
+    controller.async_execute_sleep_number_command = AsyncMock(return_value={
+        "chamber_type": "dual", "rapid_sleep_setting_enable_flag": "yes",
+        "thermal_control_enabled_flag": thermal,
+    })
+    controller.read_sleep_number_setting_for_side = AsyncMock(side_effect=ValueError("payload"))
+    controller.read_footwarming_state_for_side = AsyncMock(side_effect=ValueError("payload"))
+    controller.read_frosty_state_for_side = AsyncMock(side_effect=ValueError("payload"))
+    controller.read_heidi_state_for_side = AsyncMock(side_effect=ValueError("payload"))
+    await controller.query_config()
+    assert controller.read_footwarming_state_for_side.await_count == 2
+    thermal_read = (controller.read_frosty_state_for_side if thermal == "cool"
+                    else controller.read_heidi_state_for_side)
+    assert thermal_read.await_count == 2
+
+
+@pytest.mark.parametrize("error", [BleakError("link"), ConnectionError("link"), TimeoutError()])
+async def test_optional_state_transport_failure_still_retries_connection(error: Exception) -> None:
+    controller, _client = controller_with_client()
+    controller._ensure_notifications_started = AsyncMock()
+    controller.async_execute_sleep_number_command = AsyncMock(return_value={
+        "chamber_type": "single", "rapid_sleep_setting_enable_flag": "yes",
+        "thermal_control_enabled_flag": "none",
+    })
+    controller.read_sleep_number_setting_for_side = AsyncMock()
+    controller.read_footwarming_state_for_side = AsyncMock(side_effect=error)
+    with pytest.raises(type(error)):
+        await controller.query_config()
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_favorite_recall_and_save_capabilities_agree(enabled: bool) -> None:
+    controller, _client = controller_with_client()
+    controller._system_config = {"favorite_preset": "yes" if enabled else "no"}
+    assert controller.supports_memory_presets is enabled
+    assert controller.supports_memory_programming is enabled
+    assert controller.memory_slot_count == int(enabled)

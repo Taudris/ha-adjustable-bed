@@ -216,9 +216,17 @@ set_position:
               value: feet
             - label: Lumbar
               value: lumbar
+            - label: Left back (Sleep Number MCR)
+              value: left_back
+            - label: Right back (Sleep Number MCR)
+              value: right_back
+            - label: Left legs (Sleep Number MCR)
+              value: left_legs
+            - label: Right legs (Sleep Number MCR)
+              value: right_legs
     position:
       name: Position
-      description: Target position (0-68° for back/head, 0-45° for legs/feet, 0-100% for Keeson/Ergomotion/BOX25 Star).
+      description: Target position (0-68° for back/head, 0-45° for legs/feet, 0-100% for Keeson/Ergomotion/BOX25 Star/Sleep Number MCR).
       required: true
       selector:
         number:
@@ -252,7 +260,7 @@ set_positions:
           integration: adjustable_bed
     positions:
       name: Positions
-      description: One target per motor.
+      description: One target per motor. Sleep Number MCR uses left_back, right_back, left_legs, or right_legs with 0-100% targets.
       required: true
       example:
         - motor: back

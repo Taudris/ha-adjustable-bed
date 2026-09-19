@@ -27,7 +27,8 @@ pair a connection whose bond is still usable.
 
 Auth must return a 16-byte session UUID. A short value such as `0000` is invalid;
 the all-zero and UUID-one values are explicit failure responses. A failed or
-malformed Auth read prevents notification startup and commands. Successful
+malformed Auth value keeps pairing verification incomplete and prevents
+notification startup and commands. Successful
 notification subscription alone does not prove authentication.
 
 An ATT error 15 (`Insufficient encryption`) is an authentication failure, just

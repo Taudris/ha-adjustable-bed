@@ -13,15 +13,19 @@ if TYPE_CHECKING:
     from bleak import BleakClient
 
 
+class InvalidSleepNumberSession(BleakError):
+    """The Auth characteristic returned explicit evidence of an unusable session."""
+
+
 def validate_sleep_number_session(value: bytes) -> bytes:
     """Reject malformed UUIDs and the two protocol failure sentinels."""
     if len(value) != 16:
-        raise BleakError("Sleep Number Auth must contain a 16-byte session UUID")
+        raise InvalidSleepNumberSession("Sleep Number Auth must contain a 16-byte session UUID")
     identifier = int.from_bytes(value, "big")
     if identifier == 0:
-        raise BleakError("Sleep Number connection limit reached (zero Auth UUID)")
+        raise InvalidSleepNumberSession("Sleep Number connection limit reached (zero Auth UUID)")
     if identifier == 1:
-        raise BleakError("Sleep Number authentication rejected (Auth UUID one)")
+        raise InvalidSleepNumberSession("Sleep Number authentication rejected (Auth UUID one)")
     return value
 
 

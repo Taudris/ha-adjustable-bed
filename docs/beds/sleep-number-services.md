@@ -103,3 +103,10 @@ data:
 Protocol behavior comes from the SleepIQ 5.4.11 APK. Physical validation on each
 bed model remains pending; successful static tests do not establish hardware
 compatibility.
+
+### MCR position services
+
+Use `set_position` or `set_positions` with the motor keys `left_back`,
+`right_back`, `left_legs`, or `right_legs` and percentage targets from 0 to 100.
+Only axes reported by the foundation are accepted. Unsided `back` and `legs`
+are rejected so a request cannot silently move the wrong side.

@@ -17,6 +17,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
+from bleak.exc import BleakError
+
 from ..const import (
     CONF_SLEEP_NUMBER_MCR_CLIENT_ID,
     SLEEP_NUMBER_MCR_RX_CHAR_UUID,
@@ -1455,24 +1457,36 @@ class SleepNumberMcrController(BedController):
     async def _async_write_frame(
         self, frame: bytes, *, cancel_event: asyncio.Event | None = None
     ) -> None:
-        """Use advertised write properties and fragment at the negotiated ATT MTU."""
+        """Preserve proxy-compatible writes and fragment at the negotiated ATT MTU."""
         client = self.client
         if client is None:
             raise ConnectionError("Not connected to bed")
         characteristic = client.services.get_characteristic(SLEEP_NUMBER_MCR_RX_CHAR_UUID)
         properties = characteristic.properties if characteristic is not None else ()
-        response = "write" in properties
-        if not response and "write-without-response" not in properties:
+        if "write" not in properties and "write-without-response" not in properties:
             raise ValueError("MCR characteristic has no writable property")
         mtu = client.mtu_size
         size = max(1, mtu - 3) if isinstance(mtu, int) else 20
         for offset in range(0, len(frame), size):
-            await self._write_gatt_with_retry(
-                SLEEP_NUMBER_MCR_RX_CHAR_UUID,
-                frame[offset : offset + size],
-                cancel_event=cancel_event,
-                response=response,
-            )
+            chunk = frame[offset : offset + size]
+            # ESPHome can drop unacknowledged writes despite the advertised
+            # properties. Local adapters may enforce those properties instead.
+            try:
+                await self._write_gatt_with_retry(
+                    SLEEP_NUMBER_MCR_RX_CHAR_UUID,
+                    chunk,
+                    cancel_event=cancel_event,
+                    response=True,
+                )
+            except (BleakError, TimeoutError, OSError):
+                if "write-without-response" not in properties:
+                    raise
+                await self._write_gatt_with_retry(
+                    SLEEP_NUMBER_MCR_RX_CHAR_UUID,
+                    chunk,
+                    cancel_event=cancel_event,
+                    response=False,
+                )
 
     def _handle_mcr_notification(self, _sender: object, data: bytearray) -> None:
         """Handle an MCR notification frame."""

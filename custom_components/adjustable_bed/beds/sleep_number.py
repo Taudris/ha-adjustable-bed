@@ -972,7 +972,8 @@ class SleepNumberController(BedController):
         self.forward_controller_state_updates({"sleep_number_configuration": self._system_config})
         if self.supports_sleep_number_setting:
             for side in self._feature_sides:
-                await self.read_sleep_number_setting_for_side(side)
+                with contextlib.suppress(ValueError):
+                    await self.read_sleep_number_setting_for_side(side)
         for side in _SLEEP_NUMBER_BED_PRESENCE_QUERY_SIDES:
             if side not in self._feature_sides:
                 self._store_footwarming_present_for_side(side, False)
@@ -985,11 +986,14 @@ class SleepNumberController(BedController):
             self._store_frosty_present_for_side(side, thermal == "cool")
             self._store_heidi_present_for_side(side, thermal == "heat_cool")
             if footwarming:
-                await self.read_footwarming_state_for_side(side)
+                with contextlib.suppress(ValueError):
+                    await self.read_footwarming_state_for_side(side)
             if thermal == "cool":
-                await self.read_frosty_state_for_side(side)
+                with contextlib.suppress(ValueError):
+                    await self.read_frosty_state_for_side(side)
             elif thermal == "heat_cool":
-                await self.read_heidi_state_for_side(side)
+                with contextlib.suppress(ValueError):
+                    await self.read_heidi_state_for_side(side)
 
     async def read_sleep_number_setting(self) -> int:
         """Read the configured side's Sleep Number setting."""
@@ -1458,6 +1462,10 @@ class SleepNumberController(BedController):
     @property
     def memory_slot_count(self) -> int:
         return int(self.supports_memory_programming)
+
+    @property
+    def supports_memory_presets(self) -> bool:
+        return self._system_config.get("favorite_preset", "yes") == "yes"
 
     @property
     def supports_memory_programming(self) -> bool:

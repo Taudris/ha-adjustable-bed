@@ -241,7 +241,7 @@ async def test_write_fragmentation_and_properties(controller):
         "write-without-response"
     ]
     await controller._async_write_frame(b"hello")
-    assert controller._write_gatt_with_retry.await_args.kwargs["response"] is False
+    assert controller._write_gatt_with_retry.await_args.kwargs["response"] is True
 
 
 async def test_long_read_crc_and_chunk_cycle(controller):
@@ -554,3 +554,77 @@ async def test_busy_pump_cleanup_deadline_releases_request_state(controller, mon
     assert controller._async_write_frame.await_count > 1
     assert controller._outstanding_request_key is None
     assert controller._outstanding_node is None
+
+
+async def test_local_write_fallback_preserves_fragments(controller):
+    from bleak.exc import BleakError
+
+    controller.client.services.get_characteristic.return_value.properties = ["write-without-response"]
+    controller._write_gatt_with_retry = AsyncMock(side_effect=[BleakError("not permitted"), None, None])
+    await controller._async_write_frame(bytes(range(29)))
+    calls = controller._write_gatt_with_retry.await_args_list
+    assert [(call.args[1], call.kwargs["response"]) for call in calls] == [
+        (bytes(range(20)), True), (bytes(range(20)), False), (bytes(range(20, 29)), True),
+    ]
+
+
+@pytest.mark.parametrize("service", ["set_position", "set_positions"])
+async def test_position_services_use_explicit_side_percentages(hass, controller, service):
+    from unittest.mock import patch
+
+    from custom_components.adjustable_bed.services import async_register_services
+
+    coordinator = controller._coordinator
+    coordinator.entry.data = {CONF_BED_TYPE: BED_TYPE_SLEEP_NUMBER_MCR}
+    coordinator.disable_angle_sensing = False
+    coordinator.controller = controller
+    coordinator.async_seek_position = AsyncMock()
+
+    async def run_group(operations, **kwargs):
+        for operation in operations:
+            await operation()
+
+    coordinator.async_execute_command_group = AsyncMock(side_effect=run_group)
+    await async_register_services(hass)
+    data = {"device_id": ["test"]}
+    requests = [{"motor": "left_back", "position": 95}, {"motor": "right_legs", "position": 85}]
+    if service == "set_position":
+        data.update(requests[0])
+        requests = requests[:1]
+    else:
+        data["positions"] = requests
+    with patch("custom_components.adjustable_bed.services._resolve_sided_targets",
+               return_value=([(coordinator, "both")], [])), patch(
+        "custom_components.adjustable_bed.services._validation_controller", return_value=controller
+    ):
+        await hass.services.async_call(DOMAIN, service, data, blocking=True)
+    calls = coordinator.async_seek_position.await_args_list
+    assert [(call.kwargs["position_key"], call.kwargs["target_angle"]) for call in calls] == [
+        (request["motor"], request["position"]) for request in requests
+    ]
+    bound = MagicMock()
+    bound.move_back_up = AsyncMock()
+    controller.bind_side = MagicMock(return_value=bound)
+    await calls[0].kwargs["move_up_fn"](controller)
+    controller.bind_side.assert_called_once_with("left")
+    bound.move_back_up.assert_awaited_once()
+
+
+
+@pytest.mark.parametrize("motor,position", [("back", 50), ("left_back", 101)])
+async def test_position_plan_rejects_ambiguous_axis_and_invalid_percentage(controller, motor, position):
+    from unittest.mock import patch
+
+    from homeassistant.exceptions import ServiceValidationError
+
+    from custom_components.adjustable_bed.services import _set_position_plan
+
+    coordinator = controller._coordinator
+    coordinator.entry.data = {CONF_BED_TYPE: BED_TYPE_SLEEP_NUMBER_MCR}
+    coordinator.disable_angle_sensing = False
+    coordinator.async_ensure_connected = AsyncMock()
+    with (
+        patch("custom_components.adjustable_bed.services._validation_controller", return_value=controller),
+        pytest.raises(ServiceValidationError),
+    ):
+        await _set_position_plan(coordinator, coordinator, [], motor, position)
