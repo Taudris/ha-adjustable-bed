@@ -17,6 +17,13 @@ Uses the same 7-byte command frame as Okin Nordic:
 Identical motor/preset/light/massage command bytes as Okin Nordic, but:
 - Init sequence is only the wake command (5A 0B 00 A5), no Mattress Firm handshake
 - Write-without-response required (Nordic uses write-with-response)
+- Presets are a tap (key x2 at 300 ms) released with STOP x3 at 300 ms. The
+  generic Okin preset path (key x100 at 300 ms, one STOP) leaves this bed
+  armed for ~20 s before it moves; the triple STOP is what commits the move.
+- A preset in flight ignores STOP entirely. Any motor key interrupts it, the
+  same as pressing a button on the handset, so stop_all taps a motor key
+  first while a preset may still be moving.
+  (Verified on a Sealy Element, 2026-09)
 - Additional motors: neck (0x0A/0x0B), hips (0x08/0x09), head+foot simultaneous (0x0C/0x0D)
 - Additional presets: TV/PC, Read, Inverse, Work, Incline, Extension
 - Light brightness and color control
@@ -31,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from bleak.exc import BleakError
@@ -91,6 +99,15 @@ class OkinCB35Controller(Okin7ByteController):
         """Initialize the CB35 controller."""
         super().__init__(coordinator, config=OKIN_CB35_CONFIG)
 
+    @property
+    def _preset_started_at(self) -> float | None:
+        """Keep the interrupt window across BLE reconnects on this physical bed."""
+        return self._coordinator.okin_cb35_preset_started_at
+
+    @_preset_started_at.setter
+    def _preset_started_at(self, value: float | None) -> None:
+        self._coordinator.okin_cb35_preset_started_at = value
+
     # ─── Write override: CB35 requires write-without-response ─────────
 
     async def write_command(
@@ -99,6 +116,8 @@ class OkinCB35Controller(Okin7ByteController):
         repeat_count: int = 1,
         repeat_delay_ms: int = 100,
         cancel_event: asyncio.Event | None = None,
+        *,
+        on_write: Callable[[], None] | None = None,
     ) -> None:
         """Write a command using write-without-response."""
         if self.client is None or not self.client.is_connected:
@@ -133,7 +152,110 @@ class OkinCB35Controller(Okin7ByteController):
             repeat_delay_ms=repeat_delay_ms,
             cancel_event=effective_cancel,
             response=self._config.write_with_response,
+            on_write=on_write,
         )
+
+    # ─── Presets and stop ─────────────────────────────────────────────
+    # The CB35 protocol doc records the app's release as STOP sent three times
+    # at 300 ms. On hardware a preset key only arms the bed; the triple STOP is
+    # what commits it. With the generic single STOP the bed sat armed for ~20 s
+    # before moving (Sealy Element, 2026-09). A preset already driving ignores
+    # STOP but is interrupted by any motor key, as on the handset.
+
+    _PRESET_TAP_REPEATS = 2
+    _PRESET_TAP_DELAY_MS = 300
+    _STOP_REPEATS = 3
+    _STOP_DELAY_MS = 300
+    # Longer than any preset's full travel on the tested bed (~30 s).
+    _PRESET_INTERRUPT_WINDOW_S = 45.0
+
+    def _record_preset_write(self) -> None:
+        """Remember a transmitted preset, including partially cancelled taps."""
+        self._preset_started_at = asyncio.get_running_loop().time()
+
+    def _record_motor_write(self) -> None:
+        """A transmitted motor key supersedes the previous preset."""
+        self._preset_started_at = None
+
+    async def _send_stop(self) -> None:
+        """Send STOP x3 with a fresh cancel event so a pending cancel cannot suppress it."""
+        await self.write_command(
+            _cmd(0x0F),
+            repeat_count=self._STOP_REPEATS,
+            repeat_delay_ms=self._STOP_DELAY_MS,
+            cancel_event=asyncio.Event(),
+        )
+
+    async def _preset_with_stop(
+        self, command: bytes, repeat_count: int = 2, repeat_delay_ms: int = 300
+    ) -> None:
+        """Tap the preset key, then release it with STOP x3 to commit the move."""
+        command_failed = False
+        try:
+            if self._coordinator.cancel_command.is_set():
+                return
+            await self.write_command(
+                command,
+                repeat_count=self._PRESET_TAP_REPEATS,
+                repeat_delay_ms=self._PRESET_TAP_DELAY_MS,
+                on_write=self._record_preset_write,
+            )
+        except BaseException:
+            command_failed = True
+            raise
+        finally:
+            try:
+                await self._send_stop()
+            except BleakError, ConnectionError:
+                _LOGGER.debug("Failed to send preset release", exc_info=True)
+                if not command_failed:
+                    raise
+
+    async def _move_with_stop(self, command: bytes) -> None:
+        """Run a motor command and clear any preset it successfully interrupts."""
+        try:
+            pulse_count, pulse_delay = self.motor_pulse_settings()
+            await self.write_command(
+                command,
+                repeat_count=pulse_count,
+                repeat_delay_ms=pulse_delay,
+                on_write=self._record_motor_write,
+            )
+        finally:
+            try:
+                await self._send_stop()
+            except BleakError, ConnectionError:
+                _LOGGER.debug("Failed to send STOP during cleanup", exc_info=True)
+
+    async def stop_all(self) -> None:
+        """Stop all movement.
+
+        A preset that is still driving ignores STOP, so tap a motor key first
+        while one may be in flight. Outside that window send STOP alone so an
+        idle stop does not nudge the bed.
+        """
+        preset_started_at = self._preset_started_at
+        if preset_started_at is None:
+            await self._send_stop()
+            return
+
+        if asyncio.get_running_loop().time() - preset_started_at >= self._PRESET_INTERRUPT_WINDOW_S:
+            self._preset_started_at = None
+            await self._send_stop()
+            return
+
+        interrupt_succeeded = False
+        try:
+            await self.write_command(_cmd(0x00), repeat_count=1, cancel_event=asyncio.Event())
+            interrupt_succeeded = True
+            self._preset_started_at = None
+        finally:
+            try:
+                await self._send_stop()
+            except BleakError, ConnectionError:
+                _LOGGER.debug("Failed to send STOP after preset interrupt", exc_info=True)
+                if interrupt_succeeded:
+                    raise
 
     # ─── Extra capability properties ──────────────────────────────────
 
@@ -265,9 +387,7 @@ class OkinCB35Controller(Okin7ByteController):
 
     # ─── Notification handling ────────────────────────────────────────
 
-    def _on_notification(
-        self, characteristic: BleakGATTCharacteristic, data: bytearray
-    ) -> None:
+    def _on_notification(self, characteristic: BleakGATTCharacteristic, data: bytearray) -> None:
         """Handle BLE notification data from the bed."""
         raw = bytes(data)
         self.forward_raw_notification(characteristic.uuid, raw)
