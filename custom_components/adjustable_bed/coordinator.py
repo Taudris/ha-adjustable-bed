@@ -225,8 +225,8 @@ _INITIAL_POSITION_READ_TOTAL_TIMEOUT = 40.0
 _INITIAL_POSITION_READ_RETRY_DELAY = 3.0
 _INITIAL_POSITION_READ_MAX_ATTEMPTS = 6
 _PASSIVE_POSITION_RECONCILIATION_IDLE_MARGIN = 15.0
-# Share a Linak connection across rapid taps, then give the physical remote back its link.
-_LINAK_COMMAND_BURST_GRACE_SECONDS = 1.0
+# Share a connection across rapid taps, then give the physical remote back its link.
+_COMMAND_BURST_GRACE_SECONDS = 1.0
 # One reconnect gives a stale preserved OKIN profile another chance to reveal
 # the CST/RF ECO BT discriminator without making known receivers pay DIS
 # timeouts forever.
@@ -2230,22 +2230,19 @@ class AdjustableBedCoordinator:
         return self._disconnect_after_command and not self._uses_persistent_connection()
 
     async def _async_release_command_connection(self) -> None:
-        """Allow a short Linak command burst before releasing the physical remote's link."""
-        if self._bed_type == BED_TYPE_LINAK:
-            self._reset_disconnect_timer()
-        else:
-            await self.async_disconnect()
+        """Allow a short command burst before releasing the physical remote's link."""
+        self._reset_disconnect_timer()
 
     def _idle_disconnect_delay(self) -> float:
-        """Keep Linak's remote handoff short when disconnect-after-command is enabled."""
-        if self._bed_type == BED_TYPE_LINAK and self._disconnect_after_operation_enabled():
-            return _LINAK_COMMAND_BURST_GRACE_SECONDS
+        """Keep the remote handoff short when disconnect-after-command is enabled."""
+        if self._disconnect_after_operation_enabled():
+            return _COMMAND_BURST_GRACE_SECONDS
         return self._idle_disconnect_seconds
 
     @contextlib.contextmanager
     def hold_command_connection(self) -> Iterator[None]:
-        """Start Linak's remote handoff only after every side of a linked action settles."""
-        if self._bed_type != BED_TYPE_LINAK or not self._disconnect_after_operation_enabled():
+        """Start the idle timeout only after every side of a linked action settles."""
+        if self._uses_persistent_connection():
             yield
             return
         self._command_connection_holds += 1
@@ -2469,10 +2466,10 @@ class AdjustableBedCoordinator:
         connect_log = _LOGGER.info if self._last_connected is None else _LOGGER.debug
 
         attempt_limit = self._max_retries
-        linak_multipath = self._bed_type == BED_TYPE_LINAK and sum(
+        multipath = sum(
             path.can_connect for path in async_connection_paths(self.hass, self._address)
         ) > 1
-        if linak_multipath:
+        if multipath:
             # HA may spend several attempts penalizing a strong but unusable
             # proxy before selecting a weaker working one. Keep that fallback
             # inside this request instead of requiring another user action.
@@ -2506,7 +2503,7 @@ class AdjustableBedCoordinator:
             # On retries, add a delay before attempting to give the Bluetooth stack time to reset
             if attempt_index > 0:
                 retry_exponent = attempt_index - 1
-                if linak_multipath:
+                if multipath:
                     retry_exponent = min(retry_exponent, 1)
                 base_delay = self._retry_base_delay * (2 ** retry_exponent)
                 jitter = random.uniform(1 - self._retry_jitter, 1 + self._retry_jitter)
@@ -3823,6 +3820,12 @@ class AdjustableBedCoordinator:
                                 )
                                 return
 
+                            if self._disconnect_after_operation_enabled():
+                                # Missing feedback must not reserve the link
+                                # through the full hydration retry window when
+                                # the user asked for prompt remote handoff.
+                                return
+
                             if attempt >= _INITIAL_POSITION_READ_MAX_ATTEMPTS:
                                 break
 
@@ -3947,7 +3950,7 @@ class AdjustableBedCoordinator:
             return None
         if not self._passive_position_reconciliation_enabled:
             return None
-        if self._bed_type == BED_TYPE_LINAK and self._disconnect_after_operation_enabled():
+        if self._disconnect_after_operation_enabled():
             # Polling would take the link back from the physical remote while idle.
             return None
         if requested_interval_s is None or requested_interval_s <= 0:
@@ -4010,7 +4013,11 @@ class AdjustableBedCoordinator:
 
     async def async_reconcile_positions(self) -> None:
         """Perform a low-frequency passive position refresh when the coordinator is idle."""
-        if self._disable_angle_sensing or self._passive_position_reconciliation_interval_s is None:
+        if (
+            self._disable_angle_sensing
+            or self._passive_position_reconciliation_interval_s is None
+            or self._disconnect_after_operation_enabled()
+        ):
             return
 
         if self._connecting or self._command_lock.locked():
@@ -4546,10 +4553,10 @@ class AdjustableBedCoordinator:
                 _LOGGER.info("Stop command sent")
             finally:
                 if self._client is not None and self._client.is_connected:
-                    # Release promptly, retaining Linak's short burst handoff.
+                    # Release promptly after the short burst handoff.
                     if self._disconnect_after_operation_enabled():
                         _LOGGER.debug(
-                            "Disconnecting after stop command (disconnect_after_command=True) for %s",
+                            "Scheduling disconnect after stop command (disconnect_after_command=True) for %s",
                             self._address,
                         )
                         await self._async_release_command_connection()
@@ -4607,7 +4614,7 @@ class AdjustableBedCoordinator:
             and not command_preempted
         ):
             _LOGGER.debug(
-                "Disconnecting after %s (disconnect_after_command=True) for %s",
+                "Scheduling disconnect after %s (disconnect_after_command=True) for %s",
                 operation_name,
                 self._address,
             )
@@ -4651,12 +4658,6 @@ class AdjustableBedCoordinator:
                     await operation_task
                 except asyncio.CancelledError:
                     pass
-                except Exception as err:
-                    _LOGGER.debug(
-                        "Controller %s raised while cancelling: %s",
-                        operation_name,
-                        err,
-                    )
                 if raise_on_cancel:
                     raise asyncio.CancelledError
                 return None
@@ -4774,11 +4775,17 @@ class AdjustableBedCoordinator:
                     read_positions_after_operation
                     and not self._disable_angle_sensing
                     and not cancel_event.is_set()
+                    and not self._command_scheduler.has_pending
                 ):
                     if self._position_mode == POSITION_MODE_ACCURACY or (
                         self._disconnect_after_operation_enabled() and not skip_disconnect
                     ):
-                        await self._async_read_positions()
+                        await self._async_wait_for_controller_operation(
+                            asyncio.create_task(self._async_read_positions()),
+                            cancel_event=cancel_event,
+                            operation_name="final position read",
+                            raise_on_cancel=False,
+                        )
                     else:
                         # Tracked + deduplicated: tie the read to the entry
                         # lifecycle. A raw async_create_task here would leak a
@@ -5140,11 +5147,11 @@ class AdjustableBedCoordinator:
             return
         self._background_read_task = self.entry.async_create_background_task(
             self.hass,
-            self._async_read_positions_background(),
+            self._async_read_positions_background(self._cancel_counter),
             name=f"adjustable_bed_position_read_{self._address}",
         )
 
-    async def _async_read_positions_background(self) -> None:
+    async def _async_read_positions_background(self, entry_cancel_count: int) -> None:
         """Read positions in background with proper lock serialization.
 
         This method acquires the command lock to prevent concurrent GATT operations.
@@ -5152,7 +5159,19 @@ class AdjustableBedCoordinator:
         "operation in progress" errors from overlapping BLE operations.
         """
         async with self._command_lock:
-            await self._async_read_positions()
+            if (
+                self._cancel_counter != entry_cancel_count
+                or self._command_scheduler.has_pending
+                or not self.is_connected
+            ):
+                return
+            self._cancel_command.clear()
+            await self._async_wait_for_controller_operation(
+                asyncio.create_task(self._async_read_positions()),
+                cancel_event=self._cancel_command,
+                operation_name="background position read",
+                raise_on_cancel=False,
+            )
 
     async def _async_poll_positions_during_movement(self, stop_event: asyncio.Event) -> None:
         """Poll positions periodically during movement.
@@ -5285,6 +5304,9 @@ class AdjustableBedCoordinator:
     @callback
     def _schedule_controller_state_refresh_retry(self) -> None:
         """Schedule another readable light-state refresh after a transient failure."""
+        if self._disconnect_after_operation_enabled():
+            # Background retries must not keep renewing the remote handoff.
+            return
         if not self._should_refresh_readable_light_state(force=False):
             return
 
@@ -5378,9 +5400,11 @@ class AdjustableBedCoordinator:
                     _read_light_state,
                     cancel_running=False,
                     skip_disconnect=True,
+                    run_if=lambda: self._should_refresh_readable_light_state(force=False),
                 )
-            self._merge_controller_light_state(state)
-            self._mark_controller_state_refresh_complete()
+            if state is not None:
+                self._merge_controller_light_state(state)
+                self._mark_controller_state_refresh_complete()
         except asyncio.CancelledError:
             should_retry = True
             raise
@@ -5762,7 +5786,7 @@ class AdjustableBedCoordinator:
                         )
                     ):
                         _LOGGER.debug(
-                            "Disconnecting after seek (disconnect_after_command=True) for %s",
+                            "Scheduling disconnect after seek (disconnect_after_command=True) for %s",
                             self._address,
                         )
                         await self._async_release_command_connection()

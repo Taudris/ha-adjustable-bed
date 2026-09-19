@@ -1711,17 +1711,13 @@ class TestServices:
             blocking=True,
         )
 
-        assert (
-            mock_bleak_client.write_gatt_char.await_args_list
-            == [
-                call(
-                    KEESON_KSBT_CHAR_UUID,
-                    bytes.fromhex("040200000001"),
-                    response=True,
-                )
-            ]
-            * 4
-        )
+        writes = mock_bleak_client.write_gatt_char.await_args_list
+        # At 300ms cadence, the elapsed 900ms ceiling allows at most three
+        # writes. The old count-only limit sent a fourth at/after the deadline.
+        assert 1 <= len(writes) <= 3
+        assert writes == [call(
+            KEESON_KSBT_CHAR_UUID, bytes.fromhex("040200000001"), response=True,
+        )] * len(writes)
         coordinator = hass.data[DOMAIN][entry.entry_id]
         assert {tuple(item["resources"]) for item in coordinator.command_trace} == {("motor:back",)}
         timed_move_record = coordinator._command_scheduler.recent_records[-1]
@@ -1784,13 +1780,9 @@ class TestServices:
         )
 
         payloads = [call.args[1] for call in mock_bleak_client.write_gatt_char.call_args_list]
-        assert payloads == [
-            bytes.fromhex("040200000001"),
-            bytes.fromhex("040200000001"),
-            bytes.fromhex("040200000001"),
-            bytes.fromhex("040200000000"),
-            bytes.fromhex("040200000000"),
-        ]
+        assert 1 <= len(payloads[:-2]) <= 2
+        assert payloads[:-2] == [bytes.fromhex("040200000001")] * len(payloads[:-2])
+        assert payloads[-2:] == [bytes.fromhex("040200000000")] * 2
 
     async def test_timed_move_service_accepts_octo_tv_lift(
         self,
@@ -1847,13 +1839,9 @@ class TestServices:
         move_packet = controller._build_packet([0x02, 0x70], [0x02])
         stop_packet = controller._build_packet([0x02, 0x73])
         payloads = [call.args[1] for call in mock_bleak_client.write_gatt_char.call_args_list]
-        assert payloads == [
-            move_packet,
-            move_packet,
-            move_packet,
-            stop_packet,
-            stop_packet,
-        ]
+        assert 1 <= len(payloads[:-2]) <= 2
+        assert payloads[:-2] == [move_packet] * len(payloads[:-2])
+        assert payloads[-2:] == [stop_packet] * 2
 
     async def test_timed_move_service_rejects_bed_height_for_standard_layout(
         self,

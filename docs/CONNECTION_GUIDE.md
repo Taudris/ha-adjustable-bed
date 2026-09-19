@@ -9,7 +9,23 @@ Most adjustable beds use Bluetooth Low Energy (BLE) to communicate with their re
 **Key Points:**
 - **BLE Range**: Typically 10-30 meters, but walls and interference reduce this
 - **Single Connection**: Most beds only accept ONE Bluetooth connection at a time - disconnect manufacturer apps first
-- **Idle Disconnect**: The integration disconnects after 40 seconds of idle time to allow other devices to connect
+- **Remote handoff**: With Disconnect After Command enabled, rapid commands share a connection until one second after the last operation finishes. Otherwise the configured idle timeout applies (default 40 seconds). Controllers requiring persistent connections keep their existing lifecycle.
+
+### Multiple adapters and proxies
+
+Home Assistant ranks the available Bluetooth paths each time it connects. The
+strongest signal is not always the path that can successfully establish a link.
+When more than one usable path is available, the integration allows at least
+five connection attempts and caps the exponential backoff at twice the selected
+connection profile's base delay. This gives HA time to penalize failed paths and
+select an alternative within the same request. Single-path connections retain
+the profile's normal retry budget.
+
+The integration continues to use HA's routing, connection slots, and pairing
+ownership. It does not transfer bonds between proxies, force a particular route,
+or replay a failed motor, toggle, or memory-write command. Retries can recover a
+connection failure, but an unreachable bed or a terminal authentication problem
+still reports an error. See [Bluetooth best practices](https://developers.home-assistant.io/docs/bluetooth/).
 
 ### Does Your Bed Have Bluetooth?
 

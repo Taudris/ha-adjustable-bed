@@ -260,10 +260,12 @@ class TestCoordinatorConnection:
             (BED_TYPE_LINAK, 2, 4, 4),
             (BED_TYPE_LINAK, 2, None, 5),
             (BED_TYPE_LINAK, 1, 4, 3),
-            (BED_TYPE_KEESON, 2, 4, 3),
+            (BED_TYPE_KEESON, 2, 4, 4),
+            (BED_TYPE_KEESON, 2, None, 5),
+            (BED_TYPE_KEESON, 1, 4, 3),
         ],
     )
-    async def test_linak_retries_reach_alternative_paths_with_bounded_backoff(
+    async def test_retries_reach_alternative_paths_with_bounded_backoff(
         self, hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client,
         bed_type, path_count, success_at, expected_attempts,
     ):
@@ -909,6 +911,28 @@ class TestCoordinatorConnection:
         controller.prepare_for_position_read.assert_awaited_once_with()
         mock_read_positions.assert_awaited_once_with()
 
+    async def test_quick_handoff_does_not_hold_link_for_missing_position_retries(
+        self, hass, mock_config_entry,
+    ):
+        """Unavailable feedback must not turn quick handoff into a 40-second retry hold."""
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        coordinator._disconnect_after_command = True
+        coordinator._disable_angle_sensing = False
+        coordinator._client = MagicMock(is_connected=True)
+        controller = make_controller_mock(
+            position_number_specs=(SimpleNamespace(position_key="back"),),
+        )
+        controller.prepare_for_position_read = AsyncMock()
+        controller.read_positions = AsyncMock()
+        coordinator._controller = controller
+
+        with patch("custom_components.adjustable_bed.coordinator._INITIAL_POSITION_READ_RETRY_DELAY", 0):
+            await coordinator.async_read_initial_positions()
+
+        controller.read_positions.assert_awaited_once()
+        assert coordinator._disconnect_timer is not None
+        assert coordinator._disconnect_timer.when() - hass.loop.time() == pytest.approx(1, abs=.1)
+
     async def test_initial_position_read_retries_missing_axes(
         self,
         hass: HomeAssistant,
@@ -1346,15 +1370,17 @@ class TestCoordinatorConnection:
         assert coordinator._resolve_passive_position_reconciliation_interval(120.0) == 195.0
 
     @pytest.mark.parametrize("disconnect_after_command", [True, False])
-    async def test_linak_remote_handoff_controls_passive_polling(
+    @pytest.mark.parametrize("bed_type", [BED_TYPE_LINAK, BED_TYPE_KEESON, BED_TYPE_OCTO])
+    async def test_remote_handoff_controls_passive_polling(
         self,
         hass: HomeAssistant,
         mock_config_entry,
         disconnect_after_command: bool,
+        bed_type: str,
     ) -> None:
         """Quick handoff must not periodically reclaim the remote's BLE link."""
         coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
-        coordinator._bed_type = BED_TYPE_LINAK
+        coordinator._bed_type = bed_type
         coordinator._disable_angle_sensing = False
         coordinator._passive_position_reconciliation_enabled = True
         coordinator._disconnect_after_command = disconnect_after_command
@@ -2320,6 +2346,47 @@ class TestCoordinatorControllerStateCallbacks:
         assert coordinator.controller_state["is_on"] is True
         assert coordinator.controller_state["light_level"] == 3
         callback.assert_called_once_with(coordinator.controller_state)
+
+    async def test_quick_handoff_does_not_retry_failed_light_hydration(
+        self, hass, mock_config_entry,
+    ):
+        """Background retries cannot repeatedly renew the remote handoff window."""
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        coordinator._disconnect_after_command = True
+        coordinator._client = MagicMock(is_connected=True)
+        controller = make_controller_mock(
+            supports_under_bed_lights=True, supports_discrete_light_control=True,
+        )
+        controller.read_light_state = AsyncMock(side_effect=TimeoutError("unavailable"))
+        coordinator._controller = controller
+        with patch("custom_components.adjustable_bed.coordinator._READABLE_LIGHT_STATE_RETRY_DELAY", 0):
+            coordinator.register_controller_state_callback(MagicMock())
+            await hass.async_block_till_done()
+            await hass.async_block_till_done()
+        controller.read_light_state.assert_awaited_once()
+        assert coordinator._controller_state_refresh_retry_timer is None
+        assert coordinator._disconnect_timer is not None
+
+    async def test_queued_light_read_does_not_reconnect_released_link(
+        self, hass, mock_config_entry,
+    ):
+        """A refresh scheduled on a live link cannot reclaim it after disconnect."""
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        coordinator._client = MagicMock(is_connected=True)
+        coordinator._controller = make_controller_mock(
+            supports_under_bed_lights=True, supports_discrete_light_control=True,
+        )
+        coordinator._controller.read_light_state = AsyncMock(return_value={"is_on": True})
+        async with coordinator._command_lock:
+            coordinator.register_controller_state_callback(MagicMock())
+            task = coordinator._controller_state_refresh_task
+            assert task is not None
+            await asyncio.sleep(0)
+            coordinator._client.is_connected = False
+        with patch.object(coordinator, "async_ensure_connected", new=AsyncMock()) as connect:
+            await task
+        connect.assert_not_awaited()
+        assert "is_on" not in coordinator.controller_state
 
     async def test_register_controller_state_callback_retries_after_transient_failure(
         self,
@@ -6096,6 +6163,11 @@ class TestStopAfterCancel:
                 cancel_running=False,
             )
 
+            assert events == ["command", "read"]
+            assert coordinator._disconnect_timer is not None
+            coordinator._cancel_disconnect_timer()
+            await coordinator.async_disconnect()
+
         assert events == ["command", "read", "disconnect"]
         assert coordinator._background_read_task is None
 
@@ -6149,13 +6221,15 @@ class TestStopAfterCancel:
 
         assert coordinator._async_release_command_connection.await_count == 1
 
-    async def test_linak_burst_reuses_link_then_releases_it_for_remote(
-        self, hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client
+    @pytest.mark.parametrize("bed_type", [BED_TYPE_LINAK, BED_TYPE_KEESON, BED_TYPE_OCTO])
+    async def test_burst_reuses_link_then_releases_it_for_remote(
+        self, hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client, bed_type
     ):
         """Rapid taps renew the short handoff timer instead of reconnecting or holding for 40s."""
         coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
         coordinator._disconnect_after_command = True
         await coordinator.async_connect()
+        coordinator._bed_type = bed_type
         command = AsyncMock()
         await coordinator.async_execute_controller_command(command)
         first_timer = coordinator._disconnect_timer
@@ -6175,25 +6249,31 @@ class TestStopAfterCancel:
         mock_bleak_client.disconnect.assert_awaited_once()
         assert not coordinator.is_connected
 
-    async def test_linak_explicit_disconnect_does_not_wait_for_burst_grace(
-        self, hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client
+    @pytest.mark.parametrize("bed_type", [BED_TYPE_LINAK, BED_TYPE_KEESON, BED_TYPE_OCTO])
+    async def test_explicit_disconnect_does_not_wait_for_burst_grace(
+        self, hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client, bed_type
     ):
         """The explicit Disconnect action releases the remote immediately."""
         coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
         coordinator._disconnect_after_command = True
         await coordinator.async_connect()
+        coordinator._bed_type = bed_type
         await coordinator.async_execute_controller_command(AsyncMock())
         await coordinator.async_disconnect()
         assert coordinator._disconnect_timer is None
         mock_bleak_client.disconnect.assert_awaited_once()
 
-    async def test_linak_group_holds_delay_handoff_until_outer_cleanup(
-        self, hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client
+    @pytest.mark.parametrize("bed_type", [BED_TYPE_LINAK, BED_TYPE_KEESON, BED_TYPE_OCTO])
+    @pytest.mark.parametrize("quick_disconnect", [True, False])
+    async def test_group_holds_delay_handoff_until_outer_cleanup(
+        self, hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client,
+        bed_type, quick_disconnect,
     ):
         """An early-finishing side remains available for a linked STOP or follow-up."""
         coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
-        coordinator._disconnect_after_command = True
+        coordinator._disconnect_after_command = quick_disconnect
         await coordinator.async_connect()
+        coordinator._bed_type = bed_type
         with coordinator.hold_command_connection():
             with coordinator.hold_command_connection():
                 await coordinator.async_execute_controller_command(AsyncMock())
@@ -6202,8 +6282,92 @@ class TestStopAfterCancel:
             await coordinator._async_idle_disconnect()
             mock_bleak_client.disconnect.assert_not_awaited()
         assert coordinator._disconnect_timer is not None
-        assert coordinator._disconnect_timer.when() - hass.loop.time() == pytest.approx(1, abs=.1)
+        assert coordinator._disconnect_timer.when() - hass.loop.time() == pytest.approx(
+            1 if quick_disconnect else coordinator._idle_disconnect_seconds, abs=.1
+        )
         await coordinator.async_disconnect()
+
+    async def test_simultaneous_cancel_does_not_hide_controller_failure(
+        self, hass, mock_config_entry,
+    ):
+        """An error and a cancellation ready in the same tick still report the error."""
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        cancelled = asyncio.Event()
+
+        async def failing_cleanup():
+            cancelled.set()
+            raise BleakError("release failed")
+
+        with pytest.raises(BleakError, match="release failed"):
+            await coordinator._async_wait_for_controller_operation(
+                asyncio.create_task(failing_cleanup()),
+                cancel_event=cancelled,
+                operation_name="command",
+                raise_on_cancel=False,
+            )
+
+    @pytest.mark.parametrize("background", [False, True])
+    async def test_stop_preempts_slow_position_read(
+        self, hass, mock_config_entry, background,
+    ):
+        """Telemetry must release the wire for STOP without waiting for its read timeout."""
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        coordinator._client = MagicMock(is_connected=True)
+        coordinator._controller = make_controller_mock(allow_position_polling_during_commands=False)
+        coordinator._disable_angle_sensing = False
+        coordinator._disconnect_after_command = not background
+        reading = asyncio.Event()
+        stop_sent = asyncio.Event()
+        order = []
+
+        async def read_positions(_motor_count):
+            reading.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                order.append("read_done")
+
+        async def stop_all():
+            order.append("stop")
+            stop_sent.set()
+
+        coordinator._controller.read_positions = read_positions
+        coordinator._controller.stop_all = stop_all
+        command = asyncio.create_task(coordinator.async_execute_controller_command(AsyncMock()))
+        await reading.wait()
+        stopping = asyncio.create_task(coordinator.async_stop_command())
+        try:
+            async with asyncio.timeout(.5):
+                await stop_sent.wait()
+        finally:
+            await asyncio.gather(command, stopping)
+        assert order == ["read_done", "stop"]
+
+    async def test_background_read_captures_cancellation_when_scheduled(
+        self, hass, mock_config_entry,
+    ):
+        """STOP accepted before a background task starts must not be cleared by that task."""
+        coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+        coordinator._client = MagicMock(is_connected=True)
+        controller = make_controller_mock()
+        controller.read_positions = AsyncMock()
+        coordinator._controller = controller
+        start_task = asyncio.Event()
+
+        def defer_task(_hass, coro, **_kwargs):
+            async def deferred():
+                await start_task.wait()
+                await coro
+            return asyncio.create_task(deferred())
+
+        with patch.object(coordinator.entry, "async_create_background_task", side_effect=defer_task):
+            coordinator._start_background_position_read()
+        coordinator.request_command_cancel()
+        start_task.set()
+        assert coordinator._background_read_task is not None
+        await coordinator._background_read_task
+        controller.read_positions.assert_not_awaited()
+        assert coordinator._cancel_command.is_set()
 
     async def test_stop_after_movement_always_sent(
         self,

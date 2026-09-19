@@ -90,7 +90,7 @@
           "rmcontrol_side": "Use the side selected in RMControl. This applies only when an RMControl product is selected.",
           "motor_pulse_count": "Number of command pulses sent for motor movement (1-100). Higher = longer movement.",
           "motor_pulse_delay_ms": "Delay between command pulses in milliseconds (10-500). Lower = smoother movement.",
-          "disconnect_after_command": "Disconnect from the bed immediately after each command to free up the BLE connection for the physical remote. Recommended for beds that only allow one connection at a time.",
+          "disconnect_after_command": "Release the BLE connection one second after commands finish so the physical remote can reconnect. Rapid commands share this short window; periodic position polling stays off while idle. Recommended for beds that only allow one connection at a time.",
           "idle_disconnect_seconds": "How many seconds to wait before automatically disconnecting when idle (10-300). Lower values free up the connection faster for the physical remote, higher values reduce reconnection overhead.",
           "octo_pin": "PIN code for Octo bed authentication. Required to maintain connection. Leave empty if your bed doesn't require a PIN.",
           "jensen_pin": "PIN code for Jensen bed authentication. Default PIN is 3060.",
@@ -116,7 +116,7 @@
           "disconnect_after_command": "Disconnect after each command"
         },
         "data_description": {
-          "disconnect_after_command": "Disconnect immediately after each command to free the BLE connection for the physical remote. Leave disabled for beds that need to retain connection-scoped state."
+          "disconnect_after_command": "Release the BLE connection one second after commands finish so the physical remote can reconnect. Rapid commands share this short window; periodic position polling stays off while idle. Leave disabled for beds that need to retain connection-scoped state."
         }
       },
       "manual": {
@@ -154,7 +154,7 @@
           "preferred_adapter": "Select a specific Bluetooth adapter or proxy, or let Home Assistant choose automatically.",
           "motor_pulse_count": "Number of command pulses sent for motor movement (1-100). Higher = longer movement.",
           "motor_pulse_delay_ms": "Delay between command pulses in milliseconds (10-500). Lower = smoother movement.",
-          "disconnect_after_command": "Disconnect from the bed immediately after each command to free up the BLE connection for the physical remote. Recommended for beds that only allow one connection at a time.",
+          "disconnect_after_command": "Release the BLE connection one second after commands finish so the physical remote can reconnect. Rapid commands share this short window; periodic position polling stays off while idle. Recommended for beds that only allow one connection at a time.",
           "idle_disconnect_seconds": "How many seconds to wait before automatically disconnecting when idle (10-300). Lower values free up the connection faster for the physical remote, higher values reduce reconnection overhead."
         }
       },
@@ -188,7 +188,7 @@
           "preferred_adapter": "Select a specific Bluetooth adapter or proxy, or let Home Assistant choose automatically.",
           "motor_pulse_count": "Number of command pulses sent for motor movement (1-100). Higher = longer movement.",
           "motor_pulse_delay_ms": "Delay between command pulses in milliseconds (10-500). Lower = smoother movement.",
-          "disconnect_after_command": "Disconnect from the bed immediately after each command to free up the BLE connection for the physical remote. Recommended for beds that only allow one connection at a time.",
+          "disconnect_after_command": "Release the BLE connection one second after commands finish so the physical remote can reconnect. Rapid commands share this short window; periodic position polling stays off while idle. Recommended for beds that only allow one connection at a time.",
           "idle_disconnect_seconds": "How many seconds to wait before automatically disconnecting when idle (10-300). Lower values free up the connection faster for the physical remote, higher values reduce reconnection overhead."
         }
       },
@@ -606,7 +606,7 @@
           "rmcontrol_side": "Use the side selected in RMControl. This applies only when an RMControl product is selected.",
           "motor_pulse_count": "Number of command pulses sent for motor movement (1-100). Higher = longer movement.",
           "motor_pulse_delay_ms": "Delay between command pulses in milliseconds (10-500). Lower = smoother movement.",
-          "disconnect_after_command": "Disconnect from the bed immediately after each command to free up the BLE connection for the physical remote.",
+          "disconnect_after_command": "Release the BLE connection one second after commands finish so the physical remote can reconnect. Rapid commands share this short window; periodic position polling stays off while idle.",
           "idle_disconnect_seconds": "How many seconds to wait before automatically disconnecting when idle (10-300).",
           "octo_pin": "PIN code for Octo bed authentication. Required to maintain connection. Leave empty if your bed doesn't require a PIN.",
           "jensen_pin": "PIN code for Jensen bed authentication. Default PIN is 3060.",

@@ -1046,9 +1046,8 @@ async def _timed_move_plan(
         move_fn = spec.open_fn if direction == "up" else spec.close_fn
         stop_fn = spec.stop_fn
 
-        # Execute timed movement
-        # Calculate repeat count: duration_ms / pulse_delay_ms
-        # Example: 3500ms on Octo (350ms delay) = 10 repeats
+        # Preserve the controller's repeat planning and cadence. An elapsed
+        # ceiling below also bounds slow acknowledged writes and proxy latency.
         _, pulse_delay_ms = controller.motor_pulse_settings()
         if pulse_delay_ms <= 0:
             _LOGGER.warning(
@@ -1076,11 +1075,30 @@ async def _timed_move_plan(
             _stop_fn: Callable[..., Coroutine[Any, Any, None]] = stop_fn,
         ) -> None:
             """Execute movement for specified duration, always sending stop."""
+            deadline = asyncio.timeout(duration_ms / 1000)
+            controller_timed_out = False
             try:
-                await _move_fn(ctrl)
+                try:
+                    async with deadline:
+                        try:
+                            await _move_fn(ctrl)
+                        except TimeoutError:
+                            # Controller cleanup can time out while responding
+                            # to our cancellation; that is still a real failure.
+                            controller_timed_out = True
+                            raise
+                except TimeoutError:
+                    if controller_timed_out or not deadline.expired():
+                        raise
             finally:
-                # Always send stop command
-                await asyncio.shield(_stop_fn(ctrl))
+                # Release is outside the movement ceiling. Keep the wire lane
+                # until it settles even if the caller is cancelled during STOP.
+                stop_task = asyncio.create_task(_stop_fn(ctrl))
+                try:
+                    await asyncio.shield(stop_task)
+                except asyncio.CancelledError:
+                    await stop_task
+                    raise
 
         return (
             timed_movement,
