@@ -39,7 +39,7 @@ from .const import (
 )
 from .detection import detect_bed_type_detailed
 from .diagnostic_payloads import format_mapping_payloads
-from .redaction import redact_pins_only, redact_string
+from .redaction import redact_pins_only
 from .support_report import (
     _get_bluetooth_info,
     _get_connection_info,
@@ -193,9 +193,6 @@ async def _build_bluetooth_section(
             "last_advertisement": None, "scanners": [],
             "reachability": connection_reachability(hass, address),
         }
-    if isinstance(reason := info.get("reachability"), str):
-        info["reachability"] = redact_string(reason)
-
     info["last_advertisement"] = diagnostics_report.get("advertisement")
     info["advertisements_by_source"] = diagnostics_report.get("advertisements_by_source", [])
     info["scanner_count"] = diagnostics_report.get("device", {}).get("scanner_count")

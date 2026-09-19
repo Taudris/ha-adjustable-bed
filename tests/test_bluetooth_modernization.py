@@ -201,7 +201,7 @@ async def test_scan_refreshes_candidates_and_keeps_manual_setup(
             assert schema({CONF_ADDRESS: mock_bluetooth_service_info.address})
 
 
-async def test_raw_bundle_has_redacted_reachability_without_loaded_entry(hass):
+async def test_raw_bundle_preserves_reachability_addresses_without_loaded_entry(hass):
     from unittest.mock import AsyncMock
 
     from custom_components.adjustable_bed.support_bundle import _build_bluetooth_section
@@ -222,4 +222,4 @@ async def test_raw_bundle_has_redacted_reachability_without_loaded_entry(hass):
         ),
     ):
         section = await _build_bluetooth_section(hass, "AA:BB:CC:DD:EE:FF", {}, None)
-    assert section["reachability"] == "No scanner sees AA:BB:CC:**:**:**"
+    assert section["reachability"] == "No scanner sees AA:BB:CC:DD:EE:FF"
