@@ -996,7 +996,7 @@ class PairedBedCoordinator:
 
     @contextlib.contextmanager
     def _hold_command_connections(self, targets: Collection[tuple[str, BedChild]]) -> Iterator[None]:
-        """Keep early-finishing Linak sides available through combined action cleanup."""
+        """Keep early-finishing sides available through combined action cleanup."""
         with contextlib.ExitStack() as stack:
             for _, child in targets:
                 stack.enter_context(child.hold_command_connection())

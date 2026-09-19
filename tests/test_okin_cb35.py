@@ -426,6 +426,10 @@ async def test_stop_after_preset_disconnect_keeps_bounded_interrupt_window(
         try:
             assert coordinator._disconnect_after_operation_enabled()
             await coordinator.async_execute_controller_command(lambda bed: bed.preset_flat())
+            assert coordinator.controller is not None
+            assert coordinator._disconnect_timer is not None
+            coordinator._cancel_disconnect_timer()
+            await coordinator._async_idle_disconnect()
             assert coordinator.controller is None
             assert coordinator.okin_cb35_preset_started_at is not None
             mock_cb35_client.disconnect.assert_awaited_once()

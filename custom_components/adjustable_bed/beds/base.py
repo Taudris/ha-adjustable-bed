@@ -628,13 +628,17 @@ class BedController(ABC):
 
             write_started: float | None = None
             try:
-                client = self.client
-                if client is None or not client.is_connected:
-                    _LOGGER.error("Cannot write command: BLE client disconnected during write")
-                    raise ConnectionError("Not connected to bed")
                 # Acquire BLE lock for each individual write to prevent conflicts
                 # with concurrent position reads during movement
                 async with self._ble_lock:
+                    # A read may have held this lane while STOP invalidated the
+                    # movement. Do not send a stale write or acknowledge a no-op.
+                    if effective_cancel is not None and effective_cancel.is_set():
+                        return
+                    client = self.client
+                    if client is None or not client.is_connected:
+                        _LOGGER.error("Cannot write command: BLE client disconnected during write")
+                        raise ConnectionError("Not connected to bed")
                     if wall_clock_pacing:
                         write_started = asyncio.get_running_loop().time()
                     await client.write_gatt_char(char_uuid, command, response=response)
@@ -777,10 +781,7 @@ class BedController(ABC):
             pulse_count, pulse_delay = self.motor_pulse_settings()
             await self.write_command(command, repeat_count=pulse_count, repeat_delay_ms=pulse_delay)
         finally:
-            try:
-                await self._send_stop()
-            except BleakError, ConnectionError:
-                _LOGGER.debug("Failed to send STOP during cleanup", exc_info=True)
+            await self._send_stop()
 
     async def _preset_with_stop(
         self, command: bytes, repeat_count: int = 100, repeat_delay_ms: int = 300
@@ -800,10 +801,7 @@ class BedController(ABC):
                 command, repeat_count=repeat_count, repeat_delay_ms=repeat_delay_ms
             )
         finally:
-            try:
-                await self._send_stop()
-            except BleakError, ConnectionError:
-                _LOGGER.debug("Failed to send STOP during preset cleanup", exc_info=True)
+            await self._send_stop()
 
     async def read_non_notifying_positions(self) -> None:  # noqa: B027
         """Read positions only for motors that don't support notifications.

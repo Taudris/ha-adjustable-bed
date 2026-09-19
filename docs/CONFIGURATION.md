@@ -102,15 +102,22 @@ L600 is not a protocol name**: confirmed L600 hardware includes both OKIN CB24
 **Disconnect After Command**
 - On by default: these beds accept a single BLE connection, so holding it locks your physical remote and the vendor app out until the idle timeout expires
 - Off by default for beds whose protocol needs the link held open or whose controller must retain connection-scoped state between commands
-- Linak retains the link for one second between rapid commands, then releases it for the physical remote. Its explicit Disconnect button releases it immediately.
-- With this option enabled, Linak also skips background position polling to leave the remote's connection available while idle.
-- Turn it off if you prefer faster response on rapid consecutive commands over handing the connection back right away
+- Retains the link for one second between rapid commands, then releases it for the physical remote. New commands restart that window. The explicit Disconnect button releases it immediately.
+- Concurrent combined-bed actions retain both links until both sides finish, including STOP cleanup, then start the handoff window together. Sequential pairs still release one side before connecting the other.
+- Skips periodic position polling to leave the remote's connection available while idle. Position feedback still refreshes during HA operations, and slow reads yield to STOP or replacement commands.
+- Initial position and light-state hydration get one attempt with this option enabled. Missing feedback does not keep the link open through repeated background retries; later HA operations can refresh it.
+- Turn it off to reuse the connection across longer pauses, up to the configured idle timeout. Controllers that require persistent connections retain their existing behavior.
 - Changing it later only affects the bed whose options you edit; beds added before this became the default keep whatever they were set up with
 
 **Idle Disconnect Seconds**
 - How long to wait before automatically disconnecting when idle
 - Lower values free the connection faster for physical remotes
 - Higher values reduce reconnection overhead for frequent Home Assistant use
+
+**Timed Move**
+- `adjustable_bed.timed_move` treats the requested milliseconds as an elapsed movement ceiling, starting after connection preparation. Bluetooth write latency counts toward that ceiling instead of extending it.
+- Each controller keeps its existing repeat cadence and release sequence. Some controllers finish sooner; controller setup within the movement also consumes the budget. The service waits for STOP/release cleanup, so its total duration can include connection setup and cleanup in addition to the movement limit.
+- Transport errors and failed cleanup remain errors. Reaching the requested movement limit is normal completion.
 
 **Stop Discovering New Bluetooth Devices** (Default: Off)
 - Turn on once all your beds are added to stop Home Assistant suggesting new Bluetooth devices as adjustable beds

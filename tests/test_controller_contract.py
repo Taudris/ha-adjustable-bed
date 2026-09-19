@@ -12,6 +12,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from bleak.exc import BleakError
 
 from custom_components.adjustable_bed import const, controller_factory
 from custom_components.adjustable_bed.beds.base import (
@@ -684,6 +685,24 @@ async def test_base_preset_with_stop_always_sends_stop_on_error() -> None:
     assert controller.stop_calls == 1
 
 
+@pytest.mark.parametrize("helper", ["_move_with_stop", "_preset_with_stop"])
+@pytest.mark.parametrize("outcome", ["success", "cancel", "failure"])
+async def test_base_cleanup_failure_is_reported(helper: str, outcome: str) -> None:
+    """A failed release is observable even when the movement completed or was cancelled."""
+    controller = _ContractController(_FactoryCoordinator())
+    primary_error = {
+        "success": None,
+        "cancel": asyncio.CancelledError(),
+        "failure": RuntimeError("movement failed"),
+    }[outcome]
+    controller.write_command = AsyncMock(side_effect=primary_error)
+    controller._send_stop = AsyncMock(side_effect=BleakError("release failed"))
+    with pytest.raises(BleakError, match="release failed") as caught:
+        await getattr(controller, helper)(b"\x01")
+    assert caught.value.__context__ is primary_error
+    controller._send_stop.assert_awaited_once()
+
+
 async def test_base_wall_clock_pacing_absorbs_write_latency() -> None:
     """A paced stream subtracts BLE write time from the repeat interval."""
     events: list[str] = []
@@ -738,6 +757,35 @@ async def test_base_wall_clock_pacing_absorbs_write_latency() -> None:
     assert events[:3] == ["lock", "time", "write"]
     sleep.assert_awaited_once()
     assert sleep.await_args.args[0] == pytest.approx(0.07)
+
+
+async def test_base_write_cancelled_while_waiting_for_ble_lock_is_not_sent() -> None:
+    """A queued write must recheck cancellation after a concurrent read releases GATT."""
+    coordinator = _FactoryCoordinator()
+    client = SimpleNamespace(is_connected=True, services=(), write_gatt_char=AsyncMock())
+    coordinator.client = client
+    coordinator.record_command_trace = MagicMock()
+    controller = _ContractController(coordinator)
+    cancelled = asyncio.Event()
+    acknowledged = MagicMock()
+    async with controller._ble_lock:
+        write = asyncio.create_task(controller._write_gatt_with_retry(
+            controller.control_characteristic_uuid, b"\x01",
+            cancel_event=cancelled, on_write=acknowledged,
+        ))
+        await asyncio.sleep(0)
+        cancelled.set()
+    await write
+    client.write_gatt_char.assert_not_awaited()
+    acknowledged.assert_not_called()
+
+    # An explicit fresh cleanup event must still allow the release write.
+    await controller._write_gatt_with_retry(
+        controller.control_characteristic_uuid, b"\x00", cancel_event=asyncio.Event(),
+        on_write=acknowledged,
+    )
+    client.write_gatt_char.assert_awaited_once()
+    acknowledged.assert_called_once()
 
 
 async def test_overridden_stop_helpers_keep_finally_cleanup() -> None:
