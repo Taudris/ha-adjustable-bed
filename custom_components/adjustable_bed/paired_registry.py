@@ -26,6 +26,7 @@ from .const import (
     DOMAIN,
     PAIR_MODE_SINGLE_ADDRESS,
 )
+from .paired_devices import async_restore_full_device
 from .pairing import (
     KEY_ABSORBED_ENTRY_ID,
     KEY_ORIGIN_SOURCE,
@@ -47,21 +48,13 @@ def _device_for_entry_and_identifier(
     identifier: tuple[str, str],
 ) -> dr.DeviceEntry | None:
     """Return one config entry's device carrying an exact identifier."""
-    return next(
-        (
-            device
-            for device in dr.async_entries_for_config_entry(registry, config_entry_id)
-            if identifier in device.identifiers
-        ),
-        None,
-    )
+    return registry.async_get_device_by_identifier(identifier, config_entry_id)
 
 
 def _async_transfer_device_registry_entry(
     registry: dr.DeviceRegistry,
     device: dr.DeviceEntry,
     *,
-    source_entry_id: str,
     target_entry_id: str,
     identifier: tuple[str, str],
     via_device_id: str | None,
@@ -71,17 +64,14 @@ def _async_transfer_device_registry_entry(
     Home Assistant 2026.8 made devices single-owner. Registering the same
     identifier for the target entry now creates a separate placeholder instead
     of adding the target entry to the source device. Remove that placeholder
-    before transferring the customized source device. On older supported Home
-    Assistant releases the two lookups resolve to the same shared device, so the
-    removal is naturally skipped and the combined add/remove remains compatible.
+    before transferring the customized source device with the single-owner API.
     """
     target_device = _device_for_entry_and_identifier(registry, target_entry_id, identifier)
     if target_device is not None and target_device.id != device.id:
         registry.async_remove_device(target_device.id)
     registry.async_update_device(
         device.id,
-        add_config_entry_id=target_entry_id,
-        remove_config_entry_id=source_entry_id,
+        new_config_entry_id=target_entry_id,
         via_device_id=via_device_id,
     )
 
@@ -127,11 +117,11 @@ class _RegistryOwnership:
                 for move in self.devices
             ):
                 device = dev_reg.async_get(row.device_id)
-                if device is None or target not in device.config_entries:
+                if device is None or device.config_entry_id != target:
                     raise HomeAssistantError(f"No device ownership plan for {row.entity_id}")
         for move in self.devices:
             current = dev_reg.async_get(move.original.id)
-            if current is None or move.source not in current.config_entries:
+            if current is None or current.config_entry_id != move.source:
                 raise HomeAssistantError(f"Device ownership changed for {move.original.id}")
             if hass.config_entries.async_get_entry(move.target) is None:
                 raise HomeAssistantError(f"Target config entry {move.target} is missing")
@@ -158,7 +148,6 @@ class _RegistryOwnership:
             _async_transfer_device_registry_entry(
                 dev_reg,
                 move.original,
-                source_entry_id=move.source,
                 target_entry_id=move.target,
                 identifier=move.identifier,
                 via_device_id=move.via_device_id,
@@ -196,13 +185,12 @@ class _RegistryOwnership:
                 ):
                     raise HomeAssistantError("Device rollback would delete an unrestored entity")
                 if (
-                    move.target in current.config_entries
-                    and move.source not in current.config_entries
+                    current.config_entry_id == move.target
+                    and current.config_entry_id != move.source
                 ):
                     _async_transfer_device_registry_entry(
                         dev_reg,
                         current,
-                        source_entry_id=move.target,
                         target_entry_id=move.source,
                         identifier=move.identifier,
                         via_device_id=move.original.via_device_id,
@@ -425,6 +413,16 @@ async def async_unpair_entry(hass: HomeAssistant, entry: ConfigEntry) -> list[Co
                     ("_left", "_right", "_both")
                 ):
                     registry.async_remove(row.entity_id)
+            devices = dr.async_get(hass)
+            for child_device in dr.async_child_entries_for_config_entry(devices, entry.entry_id):
+                # Original rows have been adopted by the standalone platforms.
+                # Preserve disabled originals too, which may not have loaded.
+                parent_id = child_device.parent_device_id
+                for row in er.async_entries_for_device(registry, child_device.id, include_disabled_entities=True):
+                    if row.unique_id in preserved:
+                        registry.async_update_entity(row.entity_id, device_id=parent_id)
+                devices.async_remove_device(child_device.id)
+
         except (Exception, asyncio.CancelledError):
             _LOGGER.exception("Failed to revert single-address paired bed %s", entry.title)
             try:
@@ -500,6 +498,22 @@ async def async_unpair_entry(hass: HomeAssistant, entry: ConfigEntry) -> list[Co
         occupied_entry_ids.add(single.entry_id)
         occupied_unique_ids.add(unique_id)
 
+    unloaded = await hass.config_entries.async_unload(entry.entry_id)
+    if not unloaded:
+        raise HomeAssistantError("Could not unload the paired bed before unpairing")
+    # Child devices cannot change config-entry ownership. Restore their full
+    # records first, then use the same ownership transaction as standalone beds.
+    try:
+        for child in children:
+            device = dr.async_get(hass).async_get_child_device_by_identifier(
+                (DOMAIN, child.get(CONF_ADDRESS, "")), entry.entry_id,
+            )
+            if device is not None:
+                await async_restore_full_device(hass, entry, device, child.get(CONF_SIDE, ""))
+    except (Exception, asyncio.CancelledError):
+        await hass.config_entries.async_setup(entry.entry_id)
+        raise
+
     ent_reg = er.async_get(hass)
     dev_reg = dr.async_get(hass)
     child_devices: dict[str, dr.DeviceEntry] = {}
@@ -540,10 +554,6 @@ async def async_unpair_entry(hass: HomeAssistant, entry: ConfigEntry) -> list[Co
         ),
     )
 
-    unloaded = await hass.config_entries.async_unload(entry.entry_id)
-    if not unloaded:
-        raise HomeAssistantError("Could not unload the paired bed before unpairing")
-
     try:
         # async_add() normally sets an entry up immediately. These entries are
         # temporarily disabled, so both ids become valid registry owners without
@@ -582,7 +592,7 @@ async def async_unpair_entry(hass: HomeAssistant, entry: ConfigEntry) -> list[Co
                 continue
             if er.async_entries_for_config_entry(
                 ent_reg, single.entry_id
-            ) or dr.async_entries_for_config_entry(dev_reg, single.entry_id):
+            ) or dr.async_entries_for_config_entry(dev_reg, single.entry_id) or dr.async_child_entries_for_config_entry(dev_reg, single.entry_id):
                 restored = False
                 _LOGGER.error(
                     "Keeping restored entry %s because rollback left registry ownership there",

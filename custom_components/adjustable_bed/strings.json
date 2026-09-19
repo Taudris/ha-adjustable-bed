@@ -344,6 +344,10 @@
           "address": "MAC address in format XX:XX:XX:XX:XX:XX"
         }
       },
+      "scan": {
+        "title": "Scanning for beds",
+        "description": "Looking for nearby Bluetooth beds…"
+      },
       "setup_progress": {
         "title": "Checking the connection",
         "description": "Checking **{name}** ({address})…"
@@ -494,6 +498,7 @@
       "combine_cleanup_failed": "Couldn't remove one of the original beds, so the combined bed wasn't created. Try again or remove the beds manually first."
     },
     "error": {
+      "scan_failed": "Bluetooth scanning is unavailable. Check your adapters and try again, or choose a device from the list.",
       "cannot_connect": "Failed to connect to bed. Check that the bed is powered on and in range.",
       "invalid_mac_address": "Invalid Bluetooth address format. Use XX:XX:XX:XX:XX:XX.",
       "connection_timeout": "Connection timed out. The bed may be out of range or another device may be connected.",
@@ -2662,6 +2667,12 @@
     },
     "side_not_supported": {
       "message": "This is a single bed; the Left/Right/Both option only applies to paired beds."
+    },
+    "side_unavailable": {
+      "message": "The selected bed side is unavailable"
+    },
+    "side_selection_conflict": {
+      "message": "The selected {inferred_side} child device conflicts with side {side}"
     },
     "side_not_available": {
       "message": "This bed has no {side} side."

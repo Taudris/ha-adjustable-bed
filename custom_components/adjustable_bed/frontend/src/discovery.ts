@@ -95,6 +95,8 @@ export function bedEntitiesForDevice(
   const bed = emptyBed();
   if (!deviceId || !hass?.entities) return bed;
 
+  const nativePair = hass.devices?.[deviceId]?.parent_device_id ||
+    Object.values(hass.devices ?? {}).some((device) => device.parent_device_id === deviceId);
   const motorMap = new Map<string, MotorEntity>();
   const motor = (key: string): MotorEntity => {
     let m = motorMap.get(key);
@@ -131,7 +133,9 @@ export function bedEntitiesForDevice(
     if (selectedSide) {
       if (entitySide !== selectedSide) continue;
     }
-    const key = selectedSide ? split.key : rawKey;
+    // Native child devices already scope a side; single-address pairs retain
+    // their sided translation keys after migration.
+    const key = selectedSide || nativePair ? split.key : rawKey;
 
     let match: RegExpMatchArray | null;
 
@@ -274,10 +278,19 @@ export function pairedChildDeviceIds(
     const d = hass.devices[id];
     return (d?.name_by_user ?? d?.name ?? id).toLowerCase();
   };
+  const sideOrder = (id: string): number => {
+    for (const entry of Object.values(hass.entities ?? {})) {
+      if (entry.device_id !== id || entry.platform !== "adjustable_bed") continue;
+      const side = hass.states[entry.entity_id]?.attributes.bed_side ?? splitSide(keyOf(entry)).side;
+      if (side === "left") return 0;
+      if (side === "right") return 1;
+    }
+    return 2;
+  };
   return Object.values(hass.devices)
-    .filter((d) => d.via_device_id === parentId)
+    .filter((d) => (d.parent_device_id ?? d.via_device_id) === parentId)
     .map((d) => d.id)
-    .sort((a, b) => (name(a) < name(b) ? -1 : name(a) > name(b) ? 1 : 0));
+    .sort((a, b) => sideOrder(a) - sideOrder(b) || name(a).localeCompare(name(b)));
 }
 
 // If `deviceId` is one side (child) of a paired bed, return the synthetic
@@ -289,7 +302,7 @@ export function resolvePairedParentId(
   deviceId: string | undefined,
 ): string | undefined {
   if (!deviceId || !hass?.devices) return deviceId;
-  const parentId = hass.devices[deviceId]?.via_device_id;
+  const parentId = hass.devices[deviceId]?.parent_device_id ?? hass.devices[deviceId]?.via_device_id;
   // Only resolve to a parent that still exists in the registry (a stale
   // via_device_id would otherwise point at a deleted device).
   if (parentId && hass.devices[parentId] && pairedChildDeviceIds(hass, parentId).length) {

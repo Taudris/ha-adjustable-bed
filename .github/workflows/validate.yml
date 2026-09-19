@@ -52,8 +52,11 @@ jobs:
         with:
           python-version: "3.14"
           enable-cache: true
-      - name: Install dependencies
-        run: uv sync --extra dev
+      - name: Install dependencies and HA-managed Bluetooth stack
+        run: |
+          uv sync --extra dev
+          uv run --no-sync python scripts/ha_bluetooth_test_requirements.py > /tmp/ha-bluetooth-requirements.txt
+          uv pip install -r /tmp/ha-bluetooth-requirements.txt
       - name: Pyright
         run: uvx pyright@1.1.411 custom_components tests
 
@@ -95,7 +98,36 @@ jobs:
         with:
           python-version: "3.14"
           enable-cache: true
-      - name: Install dependencies
-        run: uv sync --extra dev
+      - name: Install dependencies and HA-managed Bluetooth stack
+        run: |
+          uv sync --extra dev
+          uv run --no-sync python scripts/ha_bluetooth_test_requirements.py > /tmp/ha-bluetooth-requirements.txt
+          uv pip install -r /tmp/ha-bluetooth-requirements.txt
       - name: Run tests (shard ${{ matrix.group }}/3)
-        run: uv run pytest -q --splits 3 --group ${{ matrix.group }}
+        run: uv run --no-sync pytest -q --splits 3 --group ${{ matrix.group }}
+
+  minimum-ha:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          python-version: "3.14"
+          enable-cache: true
+      - name: Install exact minimum HA and matching test helper
+        run: |
+          uv sync --extra dev
+          uv pip install 'homeassistant==2026.9.0' 'pytest-homeassistant-custom-component==0.13.363'
+          uv run --no-sync python scripts/ha_bluetooth_test_requirements.py > /tmp/ha-bluetooth-requirements.txt
+          uv pip install -r /tmp/ha-bluetooth-requirements.txt
+      - name: Validate minimum registry, flow, Bluetooth, and service APIs
+        run: >-
+          uv run --no-sync pytest -q
+          tests/test_adapter.py tests/test_bluetooth_modernization.py
+          tests/test_bluetooth_transport.py tests/test_bluetooth_freshness.py tests/test_coordinator.py
+          tests/test_config_flow.py tests/test_init.py
+          tests/test_paired_devices.py tests/test_paired_registry.py tests/test_paired_setup.py
+          tests/test_diagnostics.py tests/test_support_report_logs.py tests/test_support_bundle.py

@@ -6,7 +6,7 @@
   <a href="https://github.com/kristofferR/ha-adjustable-bed/releases"><img src="https://img.shields.io/github/v/release/kristofferR/ha-adjustable-bed" alt="GitHub Release"></a>
   <a href="https://github.com/kristofferR/ha-adjustable-bed/actions/workflows/validate.yml"><img src="https://img.shields.io/github/actions/workflow/status/kristofferR/ha-adjustable-bed/validate.yml?label=validation" alt="Validation"></a>
   <a href="https://github.com/hacs/integration"><img src="https://img.shields.io/badge/HACS-Default-blue.svg" alt="HACS"></a>
-  <img src="https://img.shields.io/badge/Home%20Assistant-2025.10%2B-blue" alt="Home Assistant 2025.10+">
+  <img src="https://img.shields.io/badge/Home%20Assistant-2026.9%2B-blue" alt="Home Assistant 2026.9+">
   <a href="https://github.com/sponsors/kristofferR"><img src="https://img.shields.io/badge/Sponsor-%E2%99%A1-ec6cb9" alt="Sponsor"></a>
 </p>
 
@@ -135,6 +135,8 @@ Some brands span multiple controller families. For example, many older Rize beds
 
 ## Installation
 
+v4 requires **Home Assistant 2026.9.0 or newer**. See the [compatibility and migration notes](docs/HA_2026_9.md).
+
 ### HACS (Recommended)
 
 1. Open HACS in Home Assistant
@@ -188,7 +190,7 @@ If the card is missing or shows a configuration error, see the
 [dashboard card troubleshooting guide](docs/TROUBLESHOOTING.md#dashboard-card-missing-or-configuration-error).
 
 To add it: edit a dashboard → **Add Card** → search for **Adjustable Bed**, then
-pick your bed device. On Home Assistant 2026.6 or newer, selecting one of the
+pick your bed device. Selecting one of the
 bed's entities first also suggests the Adjustable Bed Card. Or in YAML:
 
 ```yaml

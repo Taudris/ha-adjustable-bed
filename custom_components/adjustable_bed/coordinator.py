@@ -19,14 +19,7 @@ from uuid import uuid4
 from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
-from bleak_retry_connector import establish_connection
-
-try:
-    from bleak_retry_connector import close_stale_connections_by_address
-except ImportError:
-    # Older bleak-retry-connector versions may not expose this helper.
-    close_stale_connections_by_address = None
-
+from bleak_retry_connector import close_stale_connections_by_address, establish_connection
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, CONF_NAME
@@ -44,6 +37,7 @@ from .adapter import (
 )
 from .address_lock import async_get_connect_lock
 from .ble_auth import is_ble_authentication_error, is_ble_pairing_auth_failure
+from .bluetooth_diagnostics import connection_reachability
 from .bluetooth_transport import (
     ConnectionPath,
     TransportClass,
@@ -2420,8 +2414,7 @@ class AdjustableBedCoordinator:
             # Connected but half-initialised. Release the orphan before making a
             # fresh attempt: establish_connection() would otherwise overwrite
             # self._client and leak this still-live link, and the
-            # close_stale_connections_by_address() fallback is None on
-            # non-BlueZ backends, so nothing else would ever close it.
+            # stale-connection cleanup only operates on BlueZ backends.
             _LOGGER.debug(
                 "Releasing half-initialised connection to %s before reconnecting",
                 self._address,
@@ -2729,23 +2722,20 @@ class AdjustableBedCoordinator:
                     # Best-effort BlueZ cleanup. Some failed attempts leave stale
                     # pending connections behind, which can cause repeated
                     # connect timeouts.
-                    if close_stale_connections_by_address is not None:
-                        try:
-                            close_result = close_stale_connections_by_address(self._address)
-                            if inspect.isawaitable(close_result):
-                                await close_result
-                        except (OSError, BleakError) as err:
-                            _LOGGER.debug(
-                                "Could not close stale connections for %s: %s",
-                                self._address,
-                                err,
-                            )
-                        except Exception:
-                            _LOGGER.warning(
-                                "Unexpected error closing stale connections for %s",
-                                self._address,
-                                exc_info=True,
-                            )
+                    try:
+                        await close_stale_connections_by_address(self._address)
+                    except (OSError, BleakError) as err:
+                        _LOGGER.debug(
+                            "Could not close stale connections for %s: %s",
+                            self._address,
+                            err,
+                        )
+                    except Exception:
+                        _LOGGER.warning(
+                            "Unexpected error closing stale connections for %s",
+                            self._address,
+                            exc_info=True,
+                        )
 
                     # Use max_attempts=1 here since outer loop handles retries
                     # Disable the services cache to force fresh GATT discovery for
@@ -3359,6 +3349,20 @@ class AdjustableBedCoordinator:
 
                 return True
 
+            except asyncio.CancelledError:
+                # The transport releases its own slot wait, but a cancellation
+                # after establish_connection returned leaves our client and any
+                # startup subscriptions/tasks owned by this coordinator.
+                self._connecting = False
+                self._last_disconnect_reason = "connect_cancelled"
+                try:
+                    await self._async_cancel_position_hydration()
+                    async with async_get_connect_lock(self.hass, self._address):
+                        await self._async_disconnect_locked("connect_cancelled")
+                except Exception:
+                    _LOGGER.exception("Cleanup after cancelled connection to %s failed", self._address)
+                self._notify_connection_state_change(self.is_connected)
+                raise
             except (BleakError, TimeoutError, OSError) as err:
                 if isinstance(err, BleakError) and _is_ble_authentication_error(err):
                     # Authentication can first fail during controller startup,
@@ -3489,6 +3493,11 @@ class AdjustableBedCoordinator:
                 self._connection_attempt_details.append(attempt_details)
                 # Delay is handled at the start of the next iteration with progressive backoff
 
+        reason = connection_reachability(self.hass, self._address)
+        if reason:
+            _LOGGER.warning("Bluetooth reachability for %s: %s", self._address, reason)
+            if self._connection_attempt_details:
+                self._connection_attempt_details[-1]["reachability"] = reason
         total_elapsed = time.monotonic() - overall_start
         # All attempts failed: the bed is unreachable, not idle-disconnected, so
         # ensure the connectivity sensor reports "disconnected" rather than "idle"
@@ -4075,8 +4084,7 @@ class AdjustableBedCoordinator:
                 # The link outlived the disconnect, either because bleak raised
                 # or because it returned without actually closing the link.
                 # Force it closed before raising, or nothing ever will:
-                # close_stale_connections_by_address is None on non-BlueZ
-                # backends.
+                # stale-connection cleanup only operates on BlueZ backends.
                 await self._async_force_close(client)
                 if client.is_connected:
                     raise RuntimeError(

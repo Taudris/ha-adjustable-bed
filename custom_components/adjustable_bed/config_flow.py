@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Final, cast
 from uuid import UUID
 
 import voluptuous as vol
+from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
 )
@@ -1113,6 +1114,7 @@ class AdjustableBedConfigFlow(BluetoothOperationMixin, ConfigFlow, domain=DOMAIN
 
     def __init__(self) -> None:
         """Initialize the config flow."""
+        self._scan_error: str | None = None
         self._discovery_info: BluetoothServiceInfoBleak | None = None
         self._discovered_devices: dict[str, BluetoothServiceInfoBleak] = {}
         self._all_ble_devices: dict[str, BluetoothServiceInfoBleak] = {}
@@ -2222,6 +2224,10 @@ class AdjustableBedConfigFlow(BluetoothOperationMixin, ConfigFlow, domain=DOMAIN
 
         if user_input is not None:
             address = user_input[CONF_ADDRESS]
+            if address == "scan":
+                self._scan_error = None
+                self.async_begin_operation(action=SetupAction.LOCATING)
+                return await self.async_step_scan()
             if address.startswith(CONFIGURED_RETRY_PREFIX):
                 return self._async_abort_retrying_entry(
                     address.removeprefix(CONFIGURED_RETRY_PREFIX)
@@ -2366,6 +2372,7 @@ class AdjustableBedConfigFlow(BluetoothOperationMixin, ConfigFlow, domain=DOMAIN
                 }
             )
             devices["select_by_brand"] = "Select by actuator brand (recommended)"
+        devices["scan"] = "Scan again for beds"
         devices["manual"] = "Show all BLE devices"
         devices["diagnostic"] = "Browse unsupported BLE devices"
         if len(self._pairable_single_entries()) >= 2:
@@ -2374,7 +2381,29 @@ class AdjustableBedConfigFlow(BluetoothOperationMixin, ConfigFlow, domain=DOMAIN
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema({vol.Required(CONF_ADDRESS): vol.In(devices)}),
+            errors={"base": self._scan_error} if self._scan_error else {},
         )
+
+    async def async_step_scan(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Run an explicit discovery sweep behind the existing progress view."""
+        async def scan() -> OperationResult:
+            try:
+                await bluetooth.async_request_active_scan(self.hass)
+            except Exception:
+                _LOGGER.debug("Active Bluetooth scan unavailable", exc_info=True)
+                self._scan_error = "scan_failed"
+                return OperationResult(outcome=OperationOutcome.CONNECTION_FAILED)
+            return OperationResult(outcome=OperationOutcome.SUCCESS)
+
+        return await self.async_run_operation_step(
+            step_id="scan", worker=scan, next_step_id="scan_result",
+        )
+
+    async def async_step_scan_result(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Refresh selection without replaying the input that started the scan."""
+        return await self.async_step_user()
 
     def _pairable_single_entries(self) -> list[ConfigEntry]:
         """Configured single-bed entries that could be combined into a pair.

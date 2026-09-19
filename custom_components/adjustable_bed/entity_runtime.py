@@ -7,7 +7,7 @@ from collections.abc import Callable, Collection, Coroutine, Mapping
 from datetime import datetime
 from typing import TYPE_CHECKING, Protocol
 
-from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.device_registry import ChildDeviceInfo, DeviceInfo
 
 from .beds.base import BedController, SideBoundController
 
@@ -81,7 +81,7 @@ class EntityRuntime(Protocol):
     def connection_rssi(self) -> int | None: ...
 
     @property
-    def device_info(self) -> DeviceInfo: ...
+    def device_info(self) -> DeviceInfo | ChildDeviceInfo: ...
 
     async def async_disconnect(
         self, reason: str = "intentional", *, serialize_with_commands: bool = False
@@ -219,7 +219,7 @@ class EntityRuntimeView(ABC):
         return self._entity_source.connection_rssi
 
     @property
-    def device_info(self) -> DeviceInfo:
+    def device_info(self) -> DeviceInfo | ChildDeviceInfo:
         return self._entity_source.device_info
 
     async def async_disconnect(

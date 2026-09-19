@@ -62,6 +62,7 @@ from .const import (
 from .coordinator import AdjustableBedCoordinator, ChildEntryView
 from .kaidi_metadata import add_kaidi_entry_metadata, resolve_kaidi_advertisement
 from .paired_coordinator import PairedBedCoordinator, SingleAddressPairedCoordinator
+from .paired_devices import async_register_children
 from .paired_registry import (
     _async_rehome_absorbed_singles,
 )
@@ -204,8 +205,7 @@ PLATFORMS: list[Platform] = [
 ]
 
 # Platforms a paired bed (Dual Bed 4.0) sets up. Each builds per-side entities
-# against logical child coordinators; single-address pairs keep every entity on
-# the one physical MAC device while separate-address pairs use child devices.
+# against native child devices for both single- and separate-address pairs.
 PAIRED_PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
@@ -460,14 +460,16 @@ def _build_paired_children(
 def _async_ensure_paired_device_registry(
     hass: HomeAssistant, entry: ConfigEntry, coordinator: PairedBedCoordinator
 ) -> None:
-    """Eagerly create the synthetic parent device and its child sub-devices.
+    """Eagerly create the paired parent before connecting.
 
     Created before the first connect so the device (and its diagnostics) survive
-    a half-available pair or a SETUP_RETRY.
+    a half-available pair or a SETUP_RETRY. Side children are registered after
+    absorbed standalone devices have transferred ownership; other sides can be
+    registered immediately for diagnostics during SETUP_RETRY.
     """
     registry = dr.async_get(hass)
     parent_info = coordinator.device_info
-    parent = registry.async_get_or_create(
+    registry.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers=parent_info.get("identifiers"),
         name=parent_info.get("name"),
@@ -475,30 +477,8 @@ def _async_ensure_paired_device_registry(
         model=parent_info.get("model"),
         model_id=parent_info.get("model_id"),
     )
-    parent_identifier = (DOMAIN, coordinator.pair_id)
-    for child in coordinator.children.values():
-        child_info = child.device_info
-        if hasattr(registry, "async_get_device_by_identifier"):
-            registry.async_get_or_create(
-                config_entry_id=entry.entry_id,
-                identifiers=child_info.get("identifiers"),
-                name=child_info.get("name"),
-                manufacturer=child_info.get("manufacturer"),
-                model=child_info.get("model"),
-                model_id=child_info.get("model_id"),
-                via_device_id=parent.id,
-            )
-        else:
-            # Home Assistant before 2026.8 identifies a parent by identifier.
-            registry.async_get_or_create(
-                config_entry_id=entry.entry_id,
-                identifiers=child_info.get("identifiers"),
-                name=child_info.get("name"),
-                manufacturer=child_info.get("manufacturer"),
-                model=child_info.get("model"),
-                model_id=child_info.get("model_id"),
-                via_device=parent_identifier,
-            )
+
+    async_register_children(hass, coordinator)
 
 
 async def _async_release_absorbed_singles(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -610,7 +590,6 @@ async def _async_setup_paired_entry(hass: HomeAssistant, entry: ConfigEntry) -> 
         raise ConfigEntryNotReady(f"No side of paired bed {entry.title} could be connected")
 
     hass.data[DOMAIN][entry.entry_id] = coordinator
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     # At least one child connected, so the pair can provide controls. ONLY NOW
     # absorb the original single entries — re-home their entity/device registry
     # rows onto the pair, then remove them. Deferring this until after a successful
@@ -669,7 +648,14 @@ async def _async_setup_paired_entry(hass: HomeAssistant, entry: ConfigEntry) -> 
     for child in coordinator.children.values():
         assert isinstance(child, AdjustableBedCoordinator)
         await child.async_prime_offline_controller()
-    await hass.config_entries.async_forward_entry_setups(entry, PAIRED_PLATFORMS)
+    try:
+        async_register_children(hass, coordinator)
+        entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+        await hass.config_entries.async_forward_entry_setups(entry, PAIRED_PLATFORMS)
+    except (Exception, asyncio.CancelledError):
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        await coordinator.async_shutdown()
+        raise
 
     # Seed each connected child's positions, like the single-bed path does, so
     # per-side covers don't sit at "unknown" until the first movement.
@@ -695,6 +681,7 @@ async def _async_setup_single_address_paired_entry(hass: HomeAssistant, entry: C
         model=info.get("model"),
         model_id=info.get("model_id"),
     )
+    async_register_children(hass, coordinator)
     try:
         async with asyncio.timeout(SETUP_TIMEOUT):
             connected = await coordinator.async_connect()
@@ -716,8 +703,14 @@ async def _async_setup_single_address_paired_entry(hass: HomeAssistant, entry: C
         )
 
     hass.data[DOMAIN][entry.entry_id] = coordinator
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
-    await hass.config_entries.async_forward_entry_setups(entry, PAIRED_PLATFORMS)
+    try:
+        async_register_children(hass, coordinator)
+        entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+        await hass.config_entries.async_forward_entry_setups(entry, PAIRED_PLATFORMS)
+    except (Exception, asyncio.CancelledError):
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        await coordinator.async_shutdown()
+        raise
     if inner.bed_type != BED_TYPE_SLEEP_NUMBER:
         for side, child in coordinator.children.items():
             entry.async_create_background_task(

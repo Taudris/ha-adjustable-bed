@@ -18,6 +18,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.loader import async_get_integration
 
 from .adapter import find_service_info_by_address
+from .bluetooth_diagnostics import connection_reachability
 from .const import (
     CONF_BED_TYPE,
     CONF_BLE_BOND_ESTABLISHED,
@@ -245,7 +246,7 @@ async def _get_bluetooth_info(
     hass: HomeAssistant, coordinator: BedChild
 ) -> dict[str, Any]:
     """Get Bluetooth adapter and advertisement information."""
-    info: dict[str, Any] = {}
+    info: dict[str, Any] = {"reachability": connection_reachability(hass, coordinator.address)}
 
     # Get last known advertisement data
     service_info, service_info_connectable = find_service_info_by_address(

@@ -49,7 +49,7 @@ export function renderBedGraphic(
   return svg`
     <svg
       class="bed-graphic bed-graphic-${tone} ${opts.moving ? "is-moving" : ""}"
-      viewBox="0 0 300 116"
+      viewBox="0 -44 300 180"
       role="img"
       aria-hidden="true"
     >
@@ -82,8 +82,8 @@ export function renderBedGraphic(
         </g>
       </g>
 
-      <text x="86" y="22" text-anchor="middle" class="bed-graphic-label">${fmt(opts.upper)}</text>
-      <text x="214" y="22" text-anchor="middle" class="bed-graphic-label">${fmt(opts.lower)}</text>
+      <text x="86" y="128" text-anchor="middle" class="bed-graphic-label">${fmt(opts.upper)}</text>
+      <text x="214" y="128" text-anchor="middle" class="bed-graphic-label">${fmt(opts.lower)}</text>
     </svg>
   `;
 }
@@ -130,7 +130,7 @@ export function renderDualBedGraphic(
       class="bed-graphic dual-bed-graphic ${
         opts.left.moving || opts.right.moving ? "is-moving" : ""
       }"
-      viewBox="0 0 300 116"
+      viewBox="0 -44 300 160"
       role="img"
       aria-hidden="true"
     >

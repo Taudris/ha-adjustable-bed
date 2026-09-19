@@ -24,6 +24,7 @@ from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.service import async_get_device_and_config_entry
 
 from .beds.linak_protocol import LinakAlarmAction, LinakAlarmStep
 from .const import (
@@ -47,7 +48,8 @@ from .const import (
     bed_type_has_position_feedback,
     resolve_explicit_bed_type,
 )
-from .paired_coordinator import BedChild, PairedBedCoordinator, SingleAddressPairedCoordinator
+from .paired_coordinator import BedChild, PairedBedCoordinator
+from .paired_devices import side_identifier
 from .pairing import is_paired, pair_member_addresses
 
 if TYPE_CHECKING:
@@ -224,26 +226,33 @@ def _resolve_sided_target(
     paired parent device. Lets a caller targeting one side's device act on
     just that side without passing ``side`` explicitly.
     """
-    device_registry = dr.async_get(hass)
-    device = device_registry.async_get(device_id)
-    if not device:
-        return None
-    coordinator: BedTarget | None = None
-    for entry_id in device.config_entries:
-        if entry_id in hass.data.get(DOMAIN, {}):
-            coordinator = hass.data[DOMAIN][entry_id]
-            break
+    selected = dr.async_get(hass).async_get(device_id)
+    # HA's validation helper accepts full devices only. Validate a native
+    # child's parent, then retain the child for side routing.
+    validation_id = selected.parent_device_id if isinstance(selected, dr.ChildDeviceEntry) else device_id
+    device, entry = async_get_device_and_config_entry(hass, DOMAIN, validation_id)
+    if isinstance(selected, dr.ChildDeviceEntry):
+        device = selected
+    coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     if coordinator is None:
         return None
     inferred_side: str | None = None
-    if isinstance(coordinator, PairedBedCoordinator) and not isinstance(
-        coordinator, SingleAddressPairedCoordinator
-    ):
-        macs = {ident[1].upper() for ident in device.identifiers if ident[0] == DOMAIN}
-        for side, child in coordinator.children.items():
-            if child.address.upper() in macs:
+    if isinstance(coordinator, PairedBedCoordinator):
+        identifiers = {value.upper() for domain, value in device.identifiers if domain == DOMAIN}
+        for side in coordinator.children:
+            if side_identifier(coordinator, side)[1].upper() in identifiers:
                 inferred_side = side
                 break
+        parent_identifiers = {
+            value.upper() for domain, value in coordinator.device_info.get("identifiers", set())
+            if domain == DOMAIN
+        }
+        if inferred_side is None and not identifiers.intersection(parent_identifiers):
+            raise ServiceValidationError(
+                "The selected bed side is unavailable",
+                translation_domain=DOMAIN,
+                translation_key="side_unavailable",
+            )
     return coordinator, inferred_side
 
 
@@ -268,6 +277,13 @@ def _resolve_sided_targets(
             missing.append(device_id)
             continue
         coordinator, inferred_side = resolved
+        if inferred_side is not None and explicit_side is not None and explicit_side != inferred_side:
+            raise ServiceValidationError(
+                f"The selected {inferred_side} child device conflicts with side {explicit_side}",
+                translation_domain=DOMAIN,
+                translation_key="side_selection_conflict",
+                translation_placeholders={"inferred_side": inferred_side, "side": explicit_side},
+            )
         key = id(coordinator)
         if key not in by_key:
             by_key[key] = (coordinator, set())
@@ -304,53 +320,49 @@ def _get_support_bundle_target_from_device(
     hass: HomeAssistant, device_id: str
 ) -> tuple[str, BedChild | None, ConfigEntry] | None:
     """Resolve support-bundle target details from a device registry ID."""
-    device_registry = dr.async_get(hass)
-    device = device_registry.async_get(device_id)
-    if not device:
+    selected = dr.async_get(hass).async_get(device_id)
+    validation_id = selected.parent_device_id if isinstance(selected, dr.ChildDeviceEntry) else device_id
+    device, entry = dr.async_get_device_and_config_entry_for_domain(hass, validation_id, domain=DOMAIN)
+    if isinstance(selected, dr.ChildDeviceEntry):
+        device = selected
+    if device is None or entry is None:
+        return None
+    entry_id = entry.entry_id
+    address = entry.data.get(CONF_ADDRESS)
+    if not isinstance(address, str) and is_paired(entry.data):
+        # Paired entries keep addresses only in pair_children. Resolve to
+        # the targeted child sub-device's MAC (else the first member) so
+        # the bundle can still capture BLE/GATT for that side by address.
+        members = pair_member_addresses(entry.data)
+        device_macs = {ident[1].upper() for ident in device.identifiers if ident[0] == DOMAIN}
+        address = next((m for m in members if m in device_macs), None)
+        if address is None and members:
+            # The synthetic parent device (pair_id identifier) covers both
+            # sides; a bundle is per-address, so make the user pick one
+            # side's device instead of silently capturing only the first.
+            raise ServiceValidationError(
+                f"{entry.title} is a paired bed; target one side's device "
+                "for the support bundle.",
+                translation_domain=DOMAIN,
+                translation_key="bundle_needs_side_for_paired",
+                translation_placeholders={"device_name": entry.title},
+            )
+    if not isinstance(address, str):
         return None
 
-    for entry_id in device.config_entries:
-        entry = hass.config_entries.async_get_entry(entry_id)
-        if entry is None or entry.domain != DOMAIN:
-            continue
-
-        address = entry.data.get(CONF_ADDRESS)
-        if not isinstance(address, str) and is_paired(entry.data):
-            # Paired entries keep addresses only in pair_children. Resolve to
-            # the targeted child sub-device's MAC (else the first member) so
-            # the bundle can still capture BLE/GATT for that side by address.
-            members = pair_member_addresses(entry.data)
-            device_macs = {ident[1].upper() for ident in device.identifiers if ident[0] == DOMAIN}
-            address = next((m for m in members if m in device_macs), None)
-            if address is None and members:
-                # The synthetic parent device (pair_id identifier) covers both
-                # sides; a bundle is per-address, so make the user pick one
-                # side's device instead of silently capturing only the first.
-                raise ServiceValidationError(
-                    f"{entry.title} is a paired bed; target one side's device "
-                    "for the support bundle.",
-                    translation_domain=DOMAIN,
-                    translation_key="bundle_needs_side_for_paired",
-                    translation_placeholders={"device_name": entry.title},
-                )
-        if not isinstance(address, str):
-            continue
-
-        coordinator: BedChild | None = None
-        stored = hass.data.get(DOMAIN, {}).get(entry_id)
-        if isinstance(stored, PairedBedCoordinator):
-            # Reuse the matching live child coordinator so the bundle pauses
-            # and reuses its connection instead of opening a second BLE link
-            # (single-connection beds can't take two).
-            for child in stored.children.values():
-                if child.address.upper() == address.upper():
-                    coordinator = child
-                    break
-        else:
-            coordinator = cast("BedChild | None", stored)
-        return address, coordinator, entry
-
-    return None
+    coordinator: BedChild | None = None
+    stored = hass.data.get(DOMAIN, {}).get(entry_id)
+    if isinstance(stored, PairedBedCoordinator):
+        # Reuse the matching live child coordinator so the bundle pauses
+        # and reuses its connection instead of opening a second BLE link
+        # (single-connection beds can't take two).
+        for child in stored.children.values():
+            if child.address.upper() == address.upper():
+                coordinator = child
+                break
+    else:
+        coordinator = cast("BedChild | None", stored)
+    return address, coordinator, entry
 
 
 async def _get_controller_for_service(

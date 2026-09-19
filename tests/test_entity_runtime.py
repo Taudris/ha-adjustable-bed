@@ -10,12 +10,16 @@ import pytest
 from homeassistant.core import HomeAssistant
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.adjustable_bed import _build_paired_children
+from custom_components.adjustable_bed import (
+    _async_ensure_paired_device_registry,
+    _build_paired_children,
+)
 from custom_components.adjustable_bed.const import (
     BED_TYPE_SBI,
     CONF_BED_TYPE,
     CONF_MOTOR_COUNT,
     CONF_PAIR_ID,
+    CONF_PAIR_MODE,
     CONF_PROTOCOL_VARIANT,
     DOMAIN,
     SIDE_LEFT,
@@ -68,6 +72,7 @@ async def test_every_platform_uses_typed_runtime_without_identity_changes(
                 CONF_MOTOR_COUNT: 2,
                 CONF_PROTOCOL_VARIANT: "both",
                 CONF_PAIR_ID: "pair_test",
+                CONF_PAIR_MODE: topology,
             },
         )
         entry.add_to_hass(hass)
@@ -78,6 +83,8 @@ async def test_every_platform_uses_typed_runtime_without_identity_changes(
             if topology == "single_address"
             else physical
         )
+    if isinstance(owner, PairedBedCoordinator):
+        _async_ensure_paired_device_registry(hass, entry, owner)
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = owner
     runtimes = entity_runtimes(owner)
     entities = []
