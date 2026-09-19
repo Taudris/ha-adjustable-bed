@@ -32,6 +32,10 @@ def test_authentication_stage_failures_are_recognised(message: str) -> None:
         "Insufficient authentication",
         "GATT error 5",
         "error=5",
+        "Bluetooth GATT Error handle=27 error=15 description=Insufficient encryption",
+        "Insufficient Encryption",
+        "GATT error 15",
+        "error=15",
     ],
 )
 def test_gatt_auth_errors_are_not_pairing_failures(message: str) -> None:
@@ -58,6 +62,12 @@ def test_unrelated_errors_match_neither() -> None:
     err = BleakError("[org.bluez.Error.NotConnected] Not Connected")
     assert is_ble_pairing_auth_failure(err) is False
     assert is_ble_authentication_error(err) is False
+
+
+@pytest.mark.parametrize("message", ["GATT error 50", "error=150", "Write not permitted"])
+def test_non_authentication_gatt_errors_do_not_request_pairing(message: str) -> None:
+    """A CCCD write rejection alone is not proof of missing link encryption."""
+    assert not is_ble_authentication_error(BleakError(message))
 
 
 def test_repair_text_does_not_assume_the_bond_lives_on_the_host() -> None:

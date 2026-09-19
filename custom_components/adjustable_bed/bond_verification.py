@@ -39,10 +39,12 @@ from .bluetooth_transport import ConnectionPath, TransportClass
 from .const import (
     BED_TYPE_OKIMAT,
     BED_TYPE_OKIN_UUID,
+    BED_TYPE_SLEEP_NUMBER,
     CONF_BLE_BOND_CONTEXT,
     DEVICE_INFO_CHARS,
     DEVICE_INFO_READ_TIMEOUT,
 )
+from .sleep_number_auth import async_read_sleep_number_session
 
 if TYPE_CHECKING:
     from bleak import BleakClient
@@ -140,7 +142,10 @@ def has_evidence_backed_verifier(bed_type: str | None, protocol_variant: str | N
     sufficient evidence: other protocols gate a different characteristic, so a
     successful model-number read would prove nothing about their bond.
     """
-    return bed_type in (BED_TYPE_OKIMAT, BED_TYPE_OKIN_UUID)
+    # Sleep Number's Auth read is encryption-gated in #574. Its response must
+    # also be a usable session UUID; a successful read of two zero bytes (#565)
+    # does not authenticate a session.
+    return bed_type in (BED_TYPE_OKIMAT, BED_TYPE_OKIN_UUID, BED_TYPE_SLEEP_NUMBER)
 
 
 async def async_verify_authenticated_access(
@@ -172,10 +177,13 @@ async def async_verify_authenticated_access(
         )
 
     try:
-        await asyncio.wait_for(
-            client.read_gatt_char(DEVICE_INFO_CHARS["model_number"]),
-            DEVICE_INFO_READ_TIMEOUT,
-        )
+        if bed_type == BED_TYPE_SLEEP_NUMBER:
+            await async_read_sleep_number_session(client)
+        else:
+            await asyncio.wait_for(
+                client.read_gatt_char(DEVICE_INFO_CHARS["model_number"]),
+                DEVICE_INFO_READ_TIMEOUT,
+            )
     except Exception as err:  # noqa: BLE001 - the failure mode is the result
         if is_ble_authentication_error(err):
             return BondEvidence(

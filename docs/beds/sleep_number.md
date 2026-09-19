@@ -1,249 +1,131 @@
 # Sleep Number
 
-**Status:** Supported
-
-**Credit:** Reverse engineering by [kristofferR](https://github.com/kristofferR/ha-adjustable-bed) with protocol detail and field testing from [@homer-aty](https://github.com/homer-aty) and [@JonGilmore](https://github.com/JonGilmore)
-
-## Known Models
-
-- Sleep Number Climate 360 bases advertising as `Smart bed *`
-- Sleep Number FlexFit / FlexFit Smart bases using the Fuzion bamkey protocol
-- Older Sleep Number BAM/MCR bases such as some i8 / 360 FlexFit 2 beds advertising the MCR UART service
-
-## Apps
-
-| Analyzed | App | Package ID |
-|----------|-----|------------|
-| ✅ | SleepIQ | `com.selectcomfort.SleepIQ` |
-
-## Pairing
-
-Neither Sleep Number protocol family needs an OS-level BLE bond:
-
-- **Fuzion / Climate 360 / FlexFit (`Smart bed *`)**: does **not** require OS-level BLE pairing/bonding. The bed authenticates at the application layer — the integration reads the Auth (`8d4675a5-…`) and TransferInfo (`e8d06e2a-…`) characteristics after every connect, exactly like the SleepIQ app (which never creates a BLE bond). Just make sure no phone app holds the connection; the bed allows only one BLE client at a time.
-- **BAM / MCR (`ffffd1fd-…`, older i8 / 360 FlexFit 2)**: basic BLE control works without OS-level pairing.
-
-> **Do not OS-pair a Fuzion base.** Earlier releases forced `pair=True`, which made ESP32 / ESPHome Bluetooth proxies report `auth fail reason=82` and leave the connection wedged in the `ESTABLISHED` state, breaking every reconnect until the proxy was factory-reset (issue #318). If your bed isn't discoverable, hold the side button until the indicator flashes blue to make it connectable — but do **not** complete an OS-level pairing.
->
-> If you previously got stuck in this state, reboot the ESPHome Bluetooth proxy once after updating: the integration no longer re-pairs, so the proxy will reconnect cleanly instead of re-wedging on boot.
-
-## Features
-
-### Fuzion / Climate 360 / FlexFit
-
-| Feature | Supported |
-|---------|-----------|
-| Motor Control | ✅ |
-| Direct Position Control | ✅ (0-100%) |
-| Position Feedback | ✅ (queried on demand) |
-| Flat Preset | ✅ |
-| Zero-G Preset | ✅ |
-| Anti-Snore Preset | ✅ |
-| TV Preset | ✅ |
-| Numbered Memory Presets | ❌ |
-| Under Bed Lights | ✅ |
-| Sleep Number Setting | ✅ |
-| Presence Detection | ✅ (left/right polling sensors, disabled by default) |
-| Climate (cool/heat) | ✅ — unified entity, heating only on Heidi-equipped beds |
-| Footwarming | ✅ |
-
-### BAM / MCR (older i8 / 360 FlexFit 2)
-
-| Feature | Supported |
-|---------|-----------|
-| Motor Control | ❌ |
-| Direct Position Control | ❌ |
-| Position Feedback | ❌ |
-| Side-specific Firmness | ✅ |
-| Side-specific Foundation Presets | ✅ |
-| Under Bed Lights | ✅ |
-| Presence Detection | ❌ |
-| Cooling / Heating / Footwarming | ❌ |
-
-## Current Integration Scope
-
-The Fuzion controller currently controls one side of the base per config entry.
-
-- `auto` protocol variant defaults to the left side
-- `left` explicitly targets the left side
-- `right` explicitly targets the right side
-
-This keeps the implementation compatible with the current entity model while still exposing split-base control.
-
-Older BAM/MCR bases use a different controller path. They expose both firmness sides from one config entry, create separate left/right firmness numbers plus left/right foundation preset selects, and intentionally keep the BLE connection open once established.
-
-## Protocol Details
-
-### Fuzion / Climate 360 / FlexFit
-
-**Service UUID:** `09d23fae-90e6-44c2-95b6-0b3d0f1abf25`  
-**BamKey UUID:** `421e00f3-ae76-4c49-ab6e-39e4df4a5333`  
-**Auth UUID:** `8d4675a5-b5fa-42b2-b587-0ee71c46b709`  
-**Transfer Info UUID:** `e8d06e2a-c987-48f8-93a8-4d18d56b4337`  
-**Bulk Transfer Notify UUID:** `0ec9a5a3-8ac3-4582-92f3-1666421f323d`  
-**Format:** `fUzIoN` framed bamkey blobs with CRC validation  
-**Pairing Required:** No (application-layer auth via Auth/TransferInfo reads — no OS-level BLE bond)
-
-## Detection
-
-Auto-detection uses the unique Sleep Number service UUID for each protocol family:
-
-- `09d23fae-90e6-44c2-95b6-0b3d0f1abf25`
-- `ffffd1fd-388d-938b-344a-939d1f6efee0`
-
-Typical device names look like:
-
-- `Smart bed 0074E7`
-- `64:DB:A0:07:DD:02`
-
-## Command Format
-
-The logical command payloads are bamkey strings:
-
-```text
-<BAMKEY> <arg1> <arg2> ...
-```
-
-The integration wraps those payloads in the SleepIQ app's `fUzIoN` framing, writes them to the BamKey characteristic without response, and accepts either of these response flows:
-
-```text
-1. Full framed response arrives as a notification
-2. A notify hint/ack arrives, then the integration reads the BamKey characteristic to fetch the framed response
-```
-
-It also primes the Auth and Transfer Info characteristics once per connection before occupancy reads, and listens on the bulk-transfer notify characteristic because some beds use it during the readback flow.
-
-## Implemented Commands
-
-### Actuator Control
-
-| Action | Command |
-|--------|---------|
-| Read head position | `ACTG <side> head` |
-| Read foot position | `ACTG <side> foot` |
-| Set head target | `ACTS <side> head <0-100>` |
-| Set foot target | `ACTS <side> foot <0-100>` |
-| Stop head | `ACTH <side> head` |
-| Stop foot | `ACTH <side> foot` |
-| Stop configured side | `ACTH <side> head` and `ACTH <side> foot` |
-
-`head` is mapped to the integration's `back` actuator and `foot` is mapped to `legs`.
-The protocol also exposes a global `ACHA` halt, but the integration avoids it so one side does not stop its split-base partner.
-
-### Presets
-
-| Action | Command |
-|--------|---------|
-| Flat | `ACSP <side> flat 0` |
-| Zero-G | `ACSP <side> zero_g 0` |
-| Anti-Snore | `ACSP <side> snore 0` |
-| TV | `ACSP <side> watch_tv 0` |
-
-### Under-Bed Light
-
-| Action | Command |
-|--------|---------|
-| Read light settings | `UBLG` |
-| Set light level and timer | `UBLS <off\|low\|medium\|high> <minutes>` |
-
-The integration exposes:
-
-- an `Under Bed Lights` switch
-- a `Light Level` number entity with values `0-3`
-- a `Light Timer` select with `Off`, `15 min`, `30 min`, `45 min`, `1 hr`, `2 hr`, and `3 hr`
-
-### Bed Presence
-
-| Action | Command |
-|--------|---------|
-| Read occupancy | `BAMG [{"bamkey":"LBPG","args":"left"},{"bamkey":"LBPG","args":"right"}]` |
-
-The integration exposes `Left Bed Presence` and `Right Bed Presence` binary sensors, plus a legacy `Bed Presence` alias mirroring the configured side for backwards compatibility. All three are disabled by default because they require active polling over BLE.
-
-### Sleep Number Setting
-
-| Action | Command |
-|--------|---------|
-| Read Sleep Number setting | `PSNG <side>` |
-| Set Sleep Number setting | `PSNS <side> <5-100>` |
-
-The integration exposes a `Sleep Number Setting` number entity for the configured side.
-
-### Climate / Thermal Controls
-
-The SleepIQ app internally names the two thermal hardware modules **Frosty**
-(the "Cooling Module", cooling-only) and **Heidi** (the "Core Temperature
-Module", which supports both heating *and* cooling). Only one is typically
-present on a given bed; Heidi is the more modern superset.
-
-| Action | Command |
-|--------|---------|
-| Check footwarming presence | `FWPG <side>` |
-| Read footwarming state | `FWTG <side>` |
-| Set footwarming level/timer | `FWTS <side> <off\|low\|medium\|high> <minutes>` |
-| Check cooling-module (Frosty) presence | `CLPG <side>` |
-| Read cooling-module mode | `CLMG <side>` |
-| Set cooling-module mode/timer | `CLMS <side> <mode> <minutes>` |
-| Check core-temperature-module (Heidi) presence | `THPG <side>` |
-| Read core-temperature-module mode | `THMG <side>` |
-| Set core-temperature-module mode/timer | `THMS <side> <mode> <minutes>` |
-
-Mode values come from the SleepIQ app's `ThermalMode` enum:
-
-- `off`
-- `cooling_pull_low`, `cooling_pull_med`, `cooling_pull_high` — Frosty + Heidi
-- `cooling_push_high` — Heidi only (exposed as the `boost` preset)
-- `heating_push_low`, `heating_push_med`, `heating_push_high` — Heidi only
-
-Turning Frosty or Heidi off sends `timer=0` to match the SleepIQ app's
-behaviour. Footwarming keeps the current remaining timer when turned off, also
-matching the app.
-
-The integration exposes a single unified `Climate` climate entity that
-routes to whichever module the bed has, plus a separate `Footwarming` climate
-entity:
-
-- `Climate`
-  - HVAC modes: `off`, `cool`, and (Heidi only) `heat`
-  - Preset modes: `low`, `medium`, `high`, and (Heidi only) `boost`
-- `Footwarming` climate entity with `low`, `medium`, and `high` presets
-- `Climate Timer` select (`30 min` through `10 hr`) and `Footwarming Timer`
-  select (`30 min` through `6 hr`)
-
-## Notes
-
-1. Position values are already native percentages, so the integration exposes 0-100 direct-position controls instead of degree-based sliders.
-2. Command acknowledgements and query responses depend on the notification/readback path, so the integration keeps the BamKey notification channel subscribed even when angle sensing is disabled.
-3. Occupancy polling sends a grouped `BAMG` request for both sides in one call, then publishes separate left/right binary sensors.
-
-## BAM / MCR Notes
-
-Older BAM/MCR Sleep Number beds use a binary request/response protocol instead of BamKey text commands.
-
-- **Service UUID:** `ffffd1fd-388d-938b-344a-939d1f6efee0`
-- **Notify UUID:** `ffffd1fd-388d-938b-344a-939d1f6efee1`
-- **Write UUID:** `ffffd1fd-388d-938b-344a-939d1f6efee2`
-- **Transport:** MCR binary frames with `0x16 0x16` sync bytes and Fletcher-style CRC
-- **Known device names:** the BLE name may just be the MAC address
-
-The integration currently exposes:
-
-- `Sleep Number Setting Left` and `Sleep Number Setting Right` number entities
-- `Foundation Preset Left` and `Foundation Preset Right` selects
-- `Under Bed Lights` switch
-
-Implemented BAM/MCR operations:
-
-- init handshake
-- read left/right firmness
-- set left/right firmness
-- trigger left/right foundation presets (`Favorite`, `Read`, `Watch TV`, `Flat`, `Zero G`, `Snore`)
-- read and write under-bed light state
-
-Current BAM/MCR limitations:
-
-- no live head/foot cover entities yet
-- no climate entities
-- no occupancy sensors or chamber polling in normal operation
-
-The BAM/MCR controller intentionally keeps a persistent BLE connection once startup succeeds. Idle disconnects, disconnect-after-command, and timer-based auto-reconnect are disabled for this path because older BAM/MCR firmware is sensitive to reconnect churn between the notify subscribe, init handshake, and follow-up reads.
+**Status:** Supported. The expanded BLE controls below are based on the SleepIQ
+5.4.11 application; physical validation of the new behavior remains pending.
+
+**Credit:** Reverse engineering by
+[kristofferR](https://github.com/kristofferR/ha-adjustable-bed), with field reports
+from [@homer-aty](https://github.com/homer-aty) and
+[@JonGilmore](https://github.com/JonGilmore).
+
+## Connection and authentication
+
+Sleep Number uses two distinct BLE transports. Detection selects the controller
+from the advertised service, rather than assuming all models share one protocol.
+
+| Transport | Service | Typical models |
+|---|---|---|
+| Fuzion | `09d23fae-90e6-44c2-95b6-0b3d0f1abf25` | Climate 360, FlexFit, FlexFit Smart |
+| MCR | `ffffd1fd-388d-938b-344a-939d1f6efee0` | Older BAM / i8 / 360 FlexFit 2 |
+
+### Fuzion
+
+The application connects and discovers GATT services, requests bonding, reads
+Auth, and only then subscribes to notifications. The integration follows that
+order. It does not request pairing during the initial connection or repeatedly
+pair a connection whose bond is still usable.
+
+Auth must return a 16-byte session UUID. A short value such as `0000` is invalid;
+the all-zero and UUID-one values are explicit failure responses. A failed or
+malformed Auth read prevents notification startup and commands. Successful
+notification subscription alone does not prove authentication.
+
+An ATT error 15 (`Insufficient encryption`) is an authentication failure, just
+like ATT error 5. Recovery tracks the adapter or Bluetooth proxy that actually
+carried the connection. Pairing on the Home Assistant host does not establish a
+bond on a separate ESPHome proxy. Use the integration's pairing repair for the
+active transport and close the phone app before connecting.
+
+Earlier documentation incorrectly stated that Fuzion never bonds. The 5.4.11
+application explicitly bonds after service discovery. This ordering matters for
+the proxy failures reported in #318 and the startup failures in #565 and #574.
+
+### MCR
+
+MCR uses its own binary session binding. The integration persists a random
+nonzero 64-bit client identity and uses the addresses assigned by the bind
+response for subsequent frames. It does not derive the client identity from the
+bed's Bluetooth address or continue after a missing bind response.
+
+MCR keeps its BLE connection open after startup. Idle disconnect and
+disconnect-after-command are disabled for this transport to avoid reconnect
+churn during its session handshake.
+
+## Controls
+
+Features are enabled from the connected bed's system or foundation capability
+responses. A model name alone does not enable optional hardware.
+
+| Feature | Fuzion | MCR |
+|---|---|---|
+| Head/foot movement and percentage targets | Yes | When foundation supports them |
+| Position feedback | Queried | Foundation response |
+| Foundation presets | Supported presets | Supported presets per side |
+| Firmness | Configured side | Left and right |
+| Favorite firmness and responsive air | Named service commands | Named service commands |
+| Under-bed lighting | Level and timer | Foundation lighting and options |
+| Core heating/cooling | Hardware dependent | Not in this transport's exposed controls |
+| Footwarming | Hardware dependent | Supported foundation |
+| Temperature schedules | Named service commands | Not exposed by the app |
+| Massage and outlets | Not exposed by this transport | Supported foundation commands |
+| Presence polling | Left/right, disabled by default | Not exposed as occupancy sensors |
+
+Use the normal cover, position, firmness, preset, lighting and climate entities
+for everyday controls. Additional controls and structured queries are available
+through [`adjustable_bed.sleep_number_command`](sleep-number-services.md),
+including temperature programs, firmness favorites, responsive air, older-bed
+massage, footwarming, outlets and foundation settings. The service validates
+parameters and capabilities before executing requests; it does not accept raw
+protocol bytes or arbitrary command strings.
+
+Fuzion entries control the selected side (`auto` defaults to left). Paired
+entries bind commands to their selected side. A standalone MCR entry exposes
+both sides, with separate firmness, preset and supported motor controls.
+
+Position values are native percentages, not degrees. Enable position feedback
+in integration options to expose position sliders. Optional polling can keep the
+BLE connection occupied, so leave it disabled if it interferes with another
+controller.
+
+## Protocol behavior
+
+Fuzion reads Auth (`8d4675a5-b5fa-42b2-b587-0ee71c46b709`) before subscribing to
+BamKey (`421e00f3-ae76-4c49-ab6e-39e4df4a5333`) and bulk notifications
+(`0ec9a5a3-8ac3-4582-92f3-1666421f323d`). Text commands, including the trailing
+space on commands without arguments, are wrapped in CRC-checked `fUzIoN`
+frames. Writes respect the characteristic's supported chunk size. Session UUID
+notifications signal that a framed response is available to read; unrelated
+sessions are ignored and fragmented reads are assembled before parsing.
+
+Actuator targets use `ACTS`; explicit halt uses the app's global `ACHA` command.
+That halt can stop the other side of a split base too. The integration does not
+invent a side-specific release from unused generated methods. Firmness is read
+from `SNCG`; system capabilities come from `SYCG`.
+
+MCR receives notifications on `ffffd1fd-388d-938b-344a-939d1f6efee1` and writes
+on `ffffd1fd-388d-938b-344a-939d1f6efee2`. Its framed requests use assigned
+session addresses, integrity checks, response correlation and fragmented
+transport. On the wire, right is side 0 and left is side 1. Foundation and pump
+operations retain their distinct message layouts and capability checks.
+
+## Evidence and discovery disposition
+
+The clean-room analysis and independent audit covered the complete application,
+both BLE stacks, generated command catalogs, call sites and decompiler failures.
+The frozen report remains machine-local with the APK and decompilation output.
+
+- Package: `com.selectcomfort.SleepIQ`, version `5.4.11`, code `1787576046`.
+- APK SHA-256: `710b7dfd536007fc4812ad9a16402be3c1bf882cfc27fa9214ad72154bf36f5f`.
+- Frozen `REPORT.SHA256` digest: `1c751b8ba76fd89d85eb0fb96f20d1f7fbc40171e3c3e3a7c59be3d36463475d`.
+- [Fuzion discovery disposition](sleep-number-fuzion-disposition.md).
+- [MCR discovery disposition](sleep-number-mcr-disposition.md).
+
+These ledgers distinguish implemented controls, internal transport behavior,
+unreachable generated methods and explicit exclusions. Wi-Fi/account
+provisioning, firmware/file transfers, destructive factory operations and cloud
+report export are outside the integration's bed-control scope. Hardware testing
+is deferred to users of the beta or release; static protocol evidence does not
+establish compatibility with every firmware/model combination.
+
+This supplemental 5.4.11 analysis does not replace the separately frozen 5.4
+acquisition item or silently change its completion status.

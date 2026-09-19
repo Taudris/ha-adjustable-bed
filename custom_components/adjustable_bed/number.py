@@ -22,6 +22,7 @@ from .const import (
     BED_TYPE_JIECANG_APP,
     BED_TYPE_LINAK,
     BED_TYPE_LOGICDATA_APP,
+    BED_TYPE_SLEEP_NUMBER_MCR,
     BED_TYPE_SLEEPSTAR,
     BED_TYPE_SOLACE,
     BEDS_WITHOUT_ANGLE_FEEDBACK,
@@ -327,7 +328,7 @@ def _number_entities_for(
     # existing installs do not keep dead orphaned numbers (#322, #344).
     if bed_type in BEDS_WITHOUT_ANGLE_FEEDBACK:
         _async_remove_stale_position_entities(hass, coordinator)
-    elif bed_type == BED_TYPE_LINAK and controller is not None:
+    elif bed_type in (BED_TYPE_LINAK, BED_TYPE_SLEEP_NUMBER_MCR) and controller is not None:
         supported_keys = {spec.key for spec in controller.position_number_specs}
         _async_remove_stale_position_entities(
             hass,

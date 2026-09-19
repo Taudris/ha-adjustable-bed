@@ -2,9 +2,8 @@
 
 This implements Select Comfort's Fuzion "bamkey" BLE protocol used by the
 SleepIQ app. Commands are UTF-8 text wrapped in the app's `fUzIoN` blob framing
-and sent to the BamKey characteristic. Some beds deliver full framed responses
-as notifications, while others use notifications as a readback trigger, so the
-controller supports both patterns.
+and sent to the BamKey characteristic. After bonding, Auth supplies a session
+UUID. Matching UUID notifications trigger reads of the framed command response.
 """
 
 from __future__ import annotations
@@ -15,21 +14,19 @@ import contextlib
 import json
 import logging
 import struct
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from bleak.exc import BleakError
 
 from ..const import (
-    SLEEP_NUMBER_AUTH_CHAR_UUID,
     SLEEP_NUMBER_BAMKEY_CHAR_UUID,
-    SLEEP_NUMBER_BULK_TRANSFER_CHAR_UUID,
-    SLEEP_NUMBER_TRANSFER_INFO_CHAR_UUID,
     SLEEP_NUMBER_VARIANT_LEFT,
     SLEEP_NUMBER_VARIANT_RIGHT,
     VARIANT_AUTO,
 )
+from ..sleep_number_auth import async_read_sleep_number_session
 from .base import (
     POSITION_UNIT_PERCENT,
     BedController,
@@ -37,17 +34,22 @@ from .base import (
     PositionNumberSpec,
     build_position_number_spec,
 )
+from .sleep_number_commands import (
+    COMMANDS,
+    combine_temperature_programs,
+    format_command,
+    parse_response,
+)
 
 if TYPE_CHECKING:
     from ..coordinator import AdjustableBedCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-_BAMKEY_RESPONSE_TIMEOUT = 7.5
+_BAMKEY_RESPONSE_TIMEOUT = 7.128
 _BAMKEY_BLOB_PREAMBLE = b"fUzIoN"
 _BAMKEY_BLOB_HEADER_LENGTH = len(_BAMKEY_BLOB_PREAMBLE) + 4
 _BAMKEY_BLOB_MIN_LENGTH = _BAMKEY_BLOB_HEADER_LENGTH + 4
-_BAMKEY_READBACK_TRIGGER_DELAY = 0.05
 # Time-to-live for the cached bed presence result. Multiple binary sensors
 # (legacy + per-side) all poll independently via Home Assistant's entity
 # update cycle, but `read_bed_presence` already refreshes both sides in one
@@ -226,10 +228,9 @@ class SleepNumberController(BedController):
         self._notify_callback: Callable[[str, float], None] | None = None
         self._configured_side = self._normalize_side(side)
         self._notify_started = False
-        self._bulk_notify_started = False
-        self._response_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._session_uuid: bytes | None = None
+        self._system_config: dict[str, object] = {}
         self._readback_hint_queue: asyncio.Queue[None] = asyncio.Queue()
-        self._response_buffer = bytearray()
         self._underbed_light_level: str | None = None
         self._underbed_light_timer_minutes: int | None = None
         self._underbed_light_last_active_level = "high"
@@ -275,6 +276,130 @@ class SleepNumberController(BedController):
         self._heidi_last_active_heating_preset = "low"
         self._heidi_last_active_cooling_preset = "low"
 
+    @property
+    def sleep_number_command_names(self) -> tuple[str, ...]:
+        """Return only the artifact-proven semantic service operations."""
+        return tuple(COMMANDS)
+
+    def validate_sleep_number_command(self, command: str, parameters: Mapping[str, object]) -> None:
+        """Validate the entire command before any GATT operation."""
+        format_command(command, parameters)
+        requested_side = parameters.get("side")
+        program = parameters.get("program")
+        if isinstance(program, Mapping):
+            requested_side = program.get("side")
+        if (
+            self.command_side is not None
+            and requested_side is not None
+            and requested_side != self.command_side
+        ):
+            raise ValueError("Command side does not match the selected physical bed side")
+        spec = COMMANDS[command]
+        if self._system_config:
+            if requested_side is not None and requested_side not in self._feature_sides:
+                raise ValueError("This bed does not expose the requested chamber")
+            pressure_keys = {"SNCG", "SNFG", "SNFS", "PSNS", "PSNI", "LRAG", "LRAS", "LBPS"}
+            articulation_keys = {
+                "ACTG",
+                "ACTS",
+                "ASTM",
+                "ACTM",
+                "AGCP",
+                "ACGP",
+                "ACSP",
+                "ASTP",
+                "ACPS",
+                "ACCP",
+                "ACHA",
+                "ACHG",
+                "ACHS",
+            }
+            if spec.key in pressure_keys and not self.supports_sleep_number_setting:
+                raise ValueError("Pressure control is not enabled on this bed")
+            if (
+                spec.key in articulation_keys
+                and self._system_config["articulation_enable_flag"] != "yes"
+            ):
+                raise ValueError("Articulation is not enabled on this bed")
+            if spec.key in {"UBLS", "UBLG", "UBAS", "UBAG"} and not self.supports_lights:
+                raise ValueError("Underbed light is not enabled on this bed")
+            if (
+                spec.key in {"FWPG", "FWTG", "FWTS"}
+                and self._system_config["rapid_sleep_setting_enable_flag"] != "yes"
+            ):
+                raise ValueError("Footwarming is not enabled on this bed")
+            thermal = self._system_config["thermal_control_enabled_flag"]
+            if spec.key in {"CLPG", "CLMG", "CLMS"} and thermal != "cool":
+                raise ValueError("Cooling module is not enabled on this bed")
+            if spec.key in {"THPG", "THMG", "THMS"} and thermal != "heat_cool":
+                raise ValueError("Core temperature module is not enabled on this bed")
+            if (
+                spec.key.startswith("TTP")
+                and thermal == "none"
+                and self._system_config["rapid_sleep_setting_enable_flag"] != "yes"
+            ):
+                raise ValueError("Temperature programs require a thermal feature")
+            if isinstance(program, Mapping):
+                segments = program.get("segments")
+                if isinstance(segments, list):
+                    for segment in segments:
+                        mode = segment["core_temperature"]
+                        if thermal == "cool" and mode not in {
+                            "off",
+                            "cooling_low",
+                            "cooling_med",
+                            "cooling_high",
+                        }:
+                            raise ValueError(
+                                "This cooling module does not support the program's thermal mode"
+                            )
+                        if thermal == "none" and mode != "off":
+                            raise ValueError(
+                                "Footwarming-only programs cannot control core temperature"
+                            )
+            actuator = parameters.get("actuator")
+            if (
+                actuator is not None
+                and self._system_config.get(f"{requested_side}_{actuator}_actuator") != "yes"
+            ):
+                raise ValueError("The requested actuator is not enabled")
+            preset = parameters.get(
+                "target_preset",
+                parameters.get("target_preset_with_timer", parameters.get("articulation_preset")),
+            )
+            preset_field = {
+                "zero_g": "zero_gravity",
+                "watch_tv": "watch_tv",
+                "snore": "snore",
+                "flat": "flat",
+                "favorite": "favorite",
+                "read": "read",
+            }.get(str(preset))
+            if (
+                preset_field is not None
+                and self._system_config.get(f"{preset_field}_preset") != "yes"
+            ):
+                raise ValueError("The requested preset is not enabled")
+
+    async def async_execute_sleep_number_command(
+        self, command: str, parameters: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Execute one validated semantic command under the coordinator lock."""
+        self.validate_sleep_number_command(command, parameters)
+        spec, args = format_command(command, parameters)
+        values = await self._send_bamkey_command(spec.key, *args, expected_args=len(spec.response))
+        result = parse_response(spec, values)
+        if command == "get_temperature_programs":
+            settings = await self.async_execute_sleep_number_command(
+                "get_temperature_program_settings", parameters
+            )
+            return {
+                "programs": combine_temperature_programs(
+                    result["program_json"], settings["program_json"]
+                )
+            }
+        return result
+
     @staticmethod
     def _normalize_side(side: str | None) -> str:
         """Normalize the configured side selection."""
@@ -285,14 +410,23 @@ class SleepNumberController(BedController):
     @property
     def _side(self) -> str:
         """Return the per-call side, falling back to the legacy configured side."""
+        if self._system_config.get("chamber_type") == "single":
+            return SLEEP_NUMBER_VARIANT_RIGHT
         if self.command_side in _SLEEP_NUMBER_BED_PRESENCE_QUERY_SIDES:
-            return cast("str", self.command_side)
+            return self.command_side
         return self._configured_side
 
     @property
     def control_characteristic_uuid(self) -> str:
         """Return the Fuzion BamKey characteristic UUID."""
         return SLEEP_NUMBER_BAMKEY_CHAR_UUID
+
+    @property
+    def _feature_sides(self) -> tuple[str, ...]:
+        """A single chamber is represented by the app's right-side commands."""
+        if self._system_config.get("chamber_type") == "single":
+            return (SLEEP_NUMBER_VARIANT_RIGHT,)
+        return _SLEEP_NUMBER_BED_PRESENCE_QUERY_SIDES
 
     @property
     def supports_position_feedback(self) -> bool:
@@ -312,22 +446,22 @@ class SleepNumberController(BedController):
     @property
     def supports_lights(self) -> bool:
         """Sleep Number exposes underbed light control."""
-        return True
+        return self._system_config.get("underbed_light_enable_flag", "yes") == "yes"
 
     @property
     def supports_under_bed_lights(self) -> bool:
         """Sleep Number exposes dedicated underbed light settings."""
-        return True
+        return self._system_config.get("underbed_light_enable_flag", "yes") == "yes"
 
     @property
     def supports_discrete_light_control(self) -> bool:
         """Sleep Number has explicit underbed light on/off states."""
-        return True
+        return self._system_config.get("underbed_light_enable_flag", "yes") == "yes"
 
     @property
     def supports_light_level_control(self) -> bool:
         """Sleep Number supports off/low/medium/high light levels."""
-        return True
+        return self._system_config.get("underbed_light_enable_flag", "yes") == "yes"
 
     @property
     def light_level_max(self) -> int:
@@ -337,7 +471,7 @@ class SleepNumberController(BedController):
     @property
     def supports_light_timer(self) -> bool:
         """Sleep Number exposes underbed light timers."""
-        return True
+        return self._system_config.get("underbed_light_enable_flag", "yes") == "yes"
 
     @property
     def light_timer_options(self) -> list[str]:
@@ -367,12 +501,12 @@ class SleepNumberController(BedController):
     @property
     def supports_sleep_number_setting(self) -> bool:
         """Sleep Number exposes firmness adjustment for the configured side."""
-        return True
+        return self._system_config.get("pressure_control_enabled_flag", "yes") == "yes"
 
     @property
     def sleep_number_setting_sides(self) -> tuple[str, ...]:
         """Return the sides that expose Sleep Number firmness controls."""
-        return _SLEEP_NUMBER_BED_PRESENCE_QUERY_SIDES
+        return self._feature_sides
 
     @property
     def sleep_number_setting_min(self) -> int:
@@ -466,29 +600,34 @@ class SleepNumberController(BedController):
         return False
 
     @property
+    def supports_preset_flat(self) -> bool:
+        return self._system_config.get("flat_preset", "yes") == "yes"
+
+    @property
     def supports_preset_zero_g(self) -> bool:
-        return True
+        return self._system_config.get("zero_gravity_preset", "yes") == "yes"
 
     @property
     def supports_preset_anti_snore(self) -> bool:
-        return True
+        return self._system_config.get("snore_preset", "yes") == "yes"
 
     @property
     def supports_preset_tv(self) -> bool:
-        return True
+        return self._system_config.get("watch_tv_preset", "yes") == "yes"
 
     @property
     def position_number_specs(self) -> tuple[PositionNumberSpec, ...]:
         """Expose back/legs as percentage sliders; the foundation reports percent."""
-        return (
-            build_position_number_spec("back", max_value=100.0, unit=POSITION_UNIT_PERCENT),
-            build_position_number_spec("legs", max_value=100.0, unit=POSITION_UNIT_PERCENT),
+        return tuple(
+            build_position_number_spec(motor, max_value=100.0, unit=POSITION_UNIT_PERCENT)
+            for motor, actuator in (("back", "head"), ("legs", "foot"))
+            if self._actuator_enabled(actuator)
         )
 
     @property
     def motor_control_specs(self) -> tuple[MotorControlSpec, ...]:
         """Expose the selected side as a two-axis bed."""
-        return (
+        specs = (
             MotorControlSpec(
                 key="back",
                 translation_key="back",
@@ -505,6 +644,15 @@ class SleepNumberController(BedController):
                 stop_fn=lambda ctrl: ctrl.move_legs_stop(),
                 max_angle=100,
             ),
+        )
+        return tuple(
+            spec for spec in specs if self._actuator_enabled(self._motor_to_actuator(spec.key))
+        )
+
+    def _actuator_enabled(self, actuator: str) -> bool:
+        return (
+            self._system_config.get("articulation_enable_flag", "yes") == "yes"
+            and self._system_config.get(f"{self._side}_{actuator}_actuator", "yes") == "yes"
         )
 
     def angle_to_native_position(self, motor: str, angle: float) -> int:  # noqa: ARG002
@@ -654,28 +802,14 @@ class SleepNumberController(BedController):
         if client is None or not client.is_connected:
             raise ConnectionError("Not connected to bed")
 
-        self._response_buffer.clear()
-        self._drain_response_queue()
         self._drain_readback_hint_queue()
+        async with self.ble_lock:
+            self._session_uuid = await async_read_sleep_number_session(client)
         await client.start_notify(
             SLEEP_NUMBER_BAMKEY_CHAR_UUID,
             self._handle_bamkey_notification,
         )
         self._notify_started = True
-
-        if self._has_characteristic(SLEEP_NUMBER_BULK_TRANSFER_CHAR_UUID):
-            try:
-                await client.start_notify(
-                    SLEEP_NUMBER_BULK_TRANSFER_CHAR_UUID,
-                    self._handle_bamkey_readback_hint_notification,
-                )
-            except BleakError:
-                _LOGGER.debug(
-                    "Failed to start Sleep Number bulk-transfer notifications",
-                    exc_info=True,
-                )
-            else:
-                self._bulk_notify_started = True
 
     async def stop_notify(self) -> None:
         """Unsubscribe from bamkey notifications."""
@@ -688,29 +822,19 @@ class SleepNumberController(BedController):
         except BleakError:
             _LOGGER.debug("Failed to stop Sleep Number notifications", exc_info=True)
         finally:
-            if client is not None and client.is_connected and self._bulk_notify_started:
-                try:
-                    await client.stop_notify(SLEEP_NUMBER_BULK_TRANSFER_CHAR_UUID)
-                except BleakError:
-                    _LOGGER.debug(
-                        "Failed to stop Sleep Number bulk-transfer notifications",
-                        exc_info=True,
-                    )
             self._notify_started = False
-            self._bulk_notify_started = False
+            self._session_uuid = None
             self._bed_presence_channel_primed = False
-            self._response_buffer.clear()
-            self._drain_response_queue()
             self._drain_readback_hint_queue()
 
     async def read_positions(self, motor_count: int = 2) -> None:  # noqa: ARG002
         """Read the current head and foot target positions for the selected side."""
-        head_position = await self._read_actuator_position("head")
-        foot_position = await self._read_actuator_position("foot")
-
-        if self._notify_callback is not None:
-            self._notify_callback("back", float(head_position))
-            self._notify_callback("legs", float(foot_position))
+        for motor, actuator in (("back", "head"), ("legs", "foot")):
+            if not self._actuator_enabled(actuator):
+                continue
+            position = await self._read_actuator_position(actuator)
+            if self._notify_callback is not None:
+                self._notify_callback(motor, float(position))
 
     async def read_non_notifying_positions(self) -> None:
         """Sleep Number uses request/response reads rather than streaming positions."""
@@ -720,19 +844,19 @@ class SleepNumberController(BedController):
         """Set a motor target position on the selected side."""
         actuator = self._motor_to_actuator(motor)
         normalized = max(_SLEEP_NUMBER_MIN_POSITION, min(_SLEEP_NUMBER_MAX_POSITION, int(position)))
-        await self._send_bamkey_command(
-            SleepNumberCommands.SET_ACTUATOR_TARGET_POSITION,
-            self._side,
-            actuator,
-            str(normalized),
+        await self.async_execute_sleep_number_command(
+            "set_actuator_target_position",
+            {
+                "side": self._side,
+                "actuator": actuator,
+                "target_actuator_position": normalized,
+            },
         )
 
     async def _send_stop_for_motor(self, motor: str) -> None:
-        """Stop a specific actuator on the selected side."""
+        """Use the app's global foundation halt, including on user release."""
         await self._send_bamkey_command(
-            SleepNumberCommands.HALT_ACTUATOR,
-            self._side,
-            self._motor_to_actuator(motor),
+            SleepNumberCommands.HALT_ALL_ACTUATORS,
             cancel_event=asyncio.Event(),
         )
 
@@ -773,15 +897,7 @@ class SleepNumberController(BedController):
         await self.move_legs_stop()
 
     async def stop_all(self) -> None:
-        errors: list[Exception] = []
-        for motor in ("back", "legs"):
-            try:
-                await self._send_stop_for_motor(motor)
-            except Exception as err:
-                errors.append(err)
-
-        if errors:
-            raise ExceptionGroup("Failed to stop one or more Sleep Number actuators", errors)
+        await self._send_bamkey_command("ACHA", cancel_event=asyncio.Event())
 
     async def lights_on(self) -> None:
         """Turn on the underbed light using the last active or default level."""
@@ -832,8 +948,7 @@ class SleepNumberController(BedController):
             now = asyncio.get_running_loop().time()
             if (
                 self._bed_presence_states
-                and now - self._bed_presence_last_poll_monotonic
-                < _BED_PRESENCE_POLL_TTL_SECONDS
+                and now - self._bed_presence_last_poll_monotonic < _BED_PRESENCE_POLL_TTL_SECONDS
             ):
                 cached = self._bed_presence_states.get(self._side)
                 if cached is not None:
@@ -850,44 +965,31 @@ class SleepNumberController(BedController):
         entities for the rest of the setup; the caller will retry the
         connection on its next cycle.
         """
-        await self._ensure_bed_presence_channel_primed()
-
-        for side in _SLEEP_NUMBER_BED_PRESENCE_QUERY_SIDES:
-            try:
+        await self._ensure_notifications_started()
+        self._system_config = await self.async_execute_sleep_number_command(
+            "get_system_configuration", {}
+        )
+        self.forward_controller_state_updates({"sleep_number_configuration": self._system_config})
+        if self.supports_sleep_number_setting:
+            for side in self._feature_sides:
                 await self.read_sleep_number_setting_for_side(side)
-            except ValueError:
-                _LOGGER.debug(
-                    "Sleep Number setting query returned an unexpected payload for side %s",
-                    side,
-                    exc_info=True,
-                )
-
         for side in _SLEEP_NUMBER_BED_PRESENCE_QUERY_SIDES:
-            await self._query_optional_presence_feature_for_side(
-                side=side,
-                presence_bamkey=SleepNumberCommands.GET_FOOTWARMING_PRESENCE,
-                store_present=self._store_footwarming_present_for_side,
-                read_state=self.read_footwarming_state_for_side,
-            )
-            await self._query_optional_presence_feature_for_side(
-                side=side,
-                presence_bamkey=SleepNumberCommands.GET_FROSTY_PRESENCE,
-                store_present=self._store_frosty_present_for_side,
-                read_state=self.read_frosty_state_for_side,
-            )
-            await self._query_optional_presence_feature_for_side(
-                side=side,
-                presence_bamkey=SleepNumberCommands.GET_HEIDI_PRESENCE,
-                store_present=self._store_heidi_present_for_side,
-                read_state=self.read_heidi_state_for_side,
-            )
-        try:
-            await self.read_bed_presence()
-        except (TypeError, ValueError):
-            _LOGGER.debug(
-                "Sleep Number bed presence query returned an unexpected payload",
-                exc_info=True,
-            )
+            if side not in self._feature_sides:
+                self._store_footwarming_present_for_side(side, False)
+                self._store_frosty_present_for_side(side, False)
+                self._store_heidi_present_for_side(side, False)
+        for side in self._feature_sides:
+            footwarming = self._system_config["rapid_sleep_setting_enable_flag"] == "yes"
+            thermal = self._system_config["thermal_control_enabled_flag"]
+            self._store_footwarming_present_for_side(side, footwarming)
+            self._store_frosty_present_for_side(side, thermal == "cool")
+            self._store_heidi_present_for_side(side, thermal == "heat_cool")
+            if footwarming:
+                await self.read_footwarming_state_for_side(side)
+            if thermal == "cool":
+                await self.read_frosty_state_for_side(side)
+            elif thermal == "heat_cool":
+                await self.read_heidi_state_for_side(side)
 
     async def read_sleep_number_setting(self) -> int:
         """Read the configured side's Sleep Number setting."""
@@ -896,12 +998,17 @@ class SleepNumberController(BedController):
     async def read_sleep_number_setting_for_side(self, side: str) -> int:
         """Read a specific side's Sleep Number setting."""
         normalized_side = self._require_side(side)
-        response = await self._send_bamkey_command(
-            SleepNumberCommands.GET_SLEEP_NUMBER_SETTING,
-            normalized_side,
-            expected_args=1,
+        state = await self.async_execute_sleep_number_command(
+            "get_sleep_number_controls", {"side": normalized_side}
         )
-        value = self._normalize_sleep_number_setting(int(response[0]))
+        value = self._normalize_sleep_number_setting(int(cast("int", state["user_sleep_number"])))
+        self.forward_controller_state_updates(
+            {
+                f"sleep_number_adjusting_{normalized_side}": state["sleep_number_adjustment_status"]
+                == "1",
+                f"sleep_number_ambient_{normalized_side}": state["ambient_sleep_number"],
+            }
+        )
         self._store_sleep_number_setting_for_side(normalized_side, value)
         return value
 
@@ -955,14 +1062,11 @@ class SleepNumberController(BedController):
         # want to keep whatever the user had last picked in the UI.
         seeded_timer = total if level != "off" and total > 0 else None
         self._store_footwarming_state_for_side(
-            normalized_side,
-            level, remaining, total, selected_timer_minutes=seeded_timer
+            normalized_side, level, remaining, total, selected_timer_minutes=seeded_timer
         )
         return self.get_footwarming_state_for_side(normalized_side)
 
-    async def _send_footwarming_settings(
-        self, level: str, *, timer_minutes: int
-    ) -> None:
+    async def _send_footwarming_settings(self, level: str, *, timer_minutes: int) -> None:
         """Send FWTS with a validated level and explicit timer.
 
         This is the single write path for footwarming state. It commits the
@@ -1231,20 +1335,14 @@ class SleepNumberController(BedController):
                 target_hvac = (hvac_mode or side_state.last_active_hvac).strip().lower()
             if target_hvac == _THERMAL_HVAC_HEAT:
                 if normalized_preset not in _HEIDI_HEATING_PRESET_TO_MODE:
-                    raise ValueError(
-                        f"Unsupported Sleep Number heating preset: {preset}"
-                    )
+                    raise ValueError(f"Unsupported Sleep Number heating preset: {preset}")
                 raw_mode = _HEIDI_HEATING_PRESET_TO_MODE[normalized_preset]
             elif target_hvac == _THERMAL_HVAC_COOL:
                 if normalized_preset not in _HEIDI_COOLING_PRESET_TO_MODE:
-                    raise ValueError(
-                        f"Unsupported Sleep Number cooling preset: {preset}"
-                    )
+                    raise ValueError(f"Unsupported Sleep Number cooling preset: {preset}")
                 raw_mode = _HEIDI_COOLING_PRESET_TO_MODE[normalized_preset]
             else:
-                raise ValueError(
-                    f"Unsupported Sleep Number thermal hvac mode: {hvac_mode}"
-                )
+                raise ValueError(f"Unsupported Sleep Number thermal hvac mode: {hvac_mode}")
             await self._send_heidi_mode_for_side(
                 normalized_side,
                 raw_mode,
@@ -1254,13 +1352,9 @@ class SleepNumberController(BedController):
 
         # Frosty (cooling-only)
         if hvac_mode is not None and hvac_mode.strip().lower() == _THERMAL_HVAC_HEAT:
-            raise ValueError(
-                "Frosty (cooling module) cannot heat; only Heidi supports heating"
-            )
+            raise ValueError("Frosty (cooling module) cannot heat; only Heidi supports heating")
         if normalized_preset not in _FROSTY_COOLING_PRESET_TO_MODE:
-            raise ValueError(
-                f"Unsupported Sleep Number frosty preset: {preset}"
-            )
+            raise ValueError(f"Unsupported Sleep Number frosty preset: {preset}")
         await self._send_frosty_mode_for_side(
             normalized_side,
             _FROSTY_COOLING_PRESET_TO_MODE[normalized_preset],
@@ -1337,15 +1431,15 @@ class SleepNumberController(BedController):
             )
             return
         # frosty
-        state = self._frosty_states[normalized_side]
-        if state.mode == "off":
-            state.timer_minutes = timer_minutes
+        frosty_state = self._frosty_states[normalized_side]
+        if frosty_state.mode == "off":
+            frosty_state.timer_minutes = timer_minutes
             self._publish_frosty_state_for_side(normalized_side)
             self._publish_thermal_state_for_side(normalized_side)
             return
         await self._send_frosty_mode_for_side(
             normalized_side,
-            state.mode,
+            frosty_state.mode,
             timer_minutes=timer_minutes,
         )
 
@@ -1361,17 +1455,27 @@ class SleepNumberController(BedController):
     async def preset_tv(self) -> None:
         await self._send_preset(SleepNumberPresets.TV)
 
+    @property
+    def memory_slot_count(self) -> int:
+        return int(self.supports_memory_programming)
+
+    @property
+    def supports_memory_programming(self) -> bool:
+        return self._system_config.get("favorite_preset", "yes") == "yes"
+
     async def preset_memory(self, memory_num: int) -> None:
-        """Sleep Number does not expose numbered memory slots via this integration."""
-        raise NotImplementedError(
-            f"Sleep Number controller does not support memory slot {memory_num}"
-        )
+        """The single native memory is the Favorite preset."""
+        if memory_num != 1:
+            raise ValueError("Sleep Number exposes only Favorite memory slot 1")
+        await self._send_preset("favorite")
 
     async def program_memory(self, memory_num: int) -> None:
-        """Sleep Number preset programming is not exposed as generic memory slots."""
-        raise NotImplementedError(
-            f"Sleep Number controller does not support programming memory slot {memory_num}"
-        )
+        """Save the selected side's present actuator positions as Favorite."""
+        if memory_num != 1:
+            raise ValueError("Sleep Number exposes only Favorite memory slot 1")
+        head = await self._read_actuator_position("head")
+        foot = await self._read_actuator_position("foot")
+        await self._send_bamkey_command("ACPS", self._side, "favorite", str(head), str(foot))
 
     async def _send_preset(self, preset: str) -> None:
         """Send a Fuzion articulation preset with timer=0."""
@@ -1499,6 +1603,8 @@ class SleepNumberController(BedController):
             normalized_side,
             expected_args=1,
         )
+        if bamkey == SleepNumberCommands.GET_FOOTWARMING_PRESENCE:
+            return int(response[0]) == 1
         return self._normalize_presence_flag(response[0])
 
     async def _read_bed_presence_states(self) -> dict[str, str]:
@@ -1515,6 +1621,15 @@ class SleepNumberController(BedController):
                 separators=(",", ":"),
             ),
         )
+        try:
+            self._parse_bamkey_response("BAMG", grouped_response, 1)
+        except BamkeyNotSupportedError:
+            # The grouped transport falls back only for unknown BAMKEY.
+            states: dict[str, str] = {}
+            for side in _SLEEP_NUMBER_BED_PRESENCE_QUERY_SIDES:
+                response = await self._send_bamkey_command("LBPG", side, expected_args=1)
+                states[side] = response[0]
+            return self._publish_bed_presence_states(states)
         return self._publish_bed_presence_states(
             self._parse_grouped_bed_presence_response(grouped_response)
         )
@@ -1522,8 +1637,7 @@ class SleepNumberController(BedController):
     def _publish_bed_presence_states(self, states: dict[str, str]) -> dict[str, str]:
         """Normalize and publish Sleep Number bed-presence state for both sides."""
         normalized_states = {
-            side: self._normalize_bed_presence(value)
-            for side, value in states.items()
+            side: self._normalize_bed_presence(value) for side, value in states.items()
         }
         self._bed_presence_states = normalized_states
         self._bed_presence_state = normalized_states[self._side]
@@ -1625,9 +1739,7 @@ class SleepNumberController(BedController):
         state = self._footwarming_states[normalized_side]
         updates: dict[str, Any] = {
             f"footwarming_present_{normalized_side}": state.present,
-            f"footwarming_hvac_mode_{normalized_side}": (
-                "heat" if state.level != "off" else "off"
-            ),
+            f"footwarming_hvac_mode_{normalized_side}": ("heat" if state.level != "off" else "off"),
             f"footwarming_preset_{normalized_side}": (
                 None if state.level == "off" else state.level
             ),
@@ -1651,14 +1763,10 @@ class SleepNumberController(BedController):
                 {
                     "footwarming_present": state.present,
                     "footwarming_hvac_mode": "heat" if state.level != "off" else "off",
-                    "footwarming_preset": (
-                        None if state.level == "off" else state.level
-                    ),
+                    "footwarming_preset": (None if state.level == "off" else state.level),
                     "footwarming_level": state.level,
                     "footwarming_remaining_time_minutes": state.remaining_minutes,
-                    "footwarming_total_remaining_time_minutes": (
-                        state.total_remaining_minutes
-                    ),
+                    "footwarming_total_remaining_time_minutes": (state.total_remaining_minutes),
                     "footwarming_timer_option": self._format_thermal_timer_option(
                         state.timer_minutes
                     ),
@@ -1749,9 +1857,7 @@ class SleepNumberController(BedController):
                 "frosty_preset": preset,
                 "frosty_mode": state.mode,
                 "frosty_remaining_time_minutes": state.remaining_minutes,
-                "frosty_timer_option": self._format_thermal_timer_option(
-                    state.timer_minutes
-                ),
+                "frosty_timer_option": self._format_thermal_timer_option(state.timer_minutes),
             }
         )
 
@@ -1841,9 +1947,7 @@ class SleepNumberController(BedController):
                 "heidi_preset": preset,
                 "heidi_mode": state.mode,
                 "heidi_remaining_time_minutes": state.remaining_minutes,
-                "heidi_timer_option": self._format_thermal_timer_option(
-                    state.timer_minutes
-                ),
+                "heidi_timer_option": self._format_thermal_timer_option(state.timer_minutes),
             }
         )
 
@@ -1875,9 +1979,7 @@ class SleepNumberController(BedController):
             f"thermal_resume_preset_cool_{normalized_side}": resume_preset_cool,
             f"thermal_resume_preset_heat_{normalized_side}": resume_preset_heat,
             f"thermal_mode_{normalized_side}": state["mode"],
-            f"thermal_remaining_time_minutes_{normalized_side}": state[
-                "remaining_time_minutes"
-            ],
+            f"thermal_remaining_time_minutes_{normalized_side}": state["remaining_time_minutes"],
             f"thermal_timer_option_{normalized_side}": state["timer_option"],
             f"thermal_supports_heating_{normalized_side}": state["supports_heating"],
         }
@@ -1908,14 +2010,7 @@ class SleepNumberController(BedController):
         if self._bed_presence_channel_primed:
             return
 
-        client = self.client
-        if client is None or not client.is_connected:
-            raise ConnectionError("Not connected to bed")
-
-        for char_uuid in (SLEEP_NUMBER_AUTH_CHAR_UUID, SLEEP_NUMBER_TRANSFER_INFO_CHAR_UUID):
-            async with self.ble_lock:
-                await client.read_gatt_char(char_uuid)
-
+        await self._ensure_notifications_started()
         self._bed_presence_channel_primed = True
 
     async def _send_bamkey_command(
@@ -1947,67 +2042,53 @@ class SleepNumberController(BedController):
         await self._ensure_notifications_started()
         if effective_cancel.is_set():
             raise asyncio.CancelledError
-        self._response_buffer.clear()
-        self._drain_response_queue()
         self._drain_readback_hint_queue()
 
         payload = self._format_bamkey_command(bamkey, *args)
-        # Sleep Number returns BamKey results over the notify/readback path on the
-        # same characteristic, so waiting for a GATT write response only adds latency.
-        await self._write_gatt_with_retry(
-            SLEEP_NUMBER_BAMKEY_CHAR_UUID,
-            self._build_bamkey_blob(payload),
-            cancel_event=effective_cancel,
-            response=False,
-        )
-        deadline = asyncio.get_running_loop().time() + _BAMKEY_RESPONSE_TIMEOUT
-        response_task = asyncio.create_task(self._response_queue.get())
-        hint_task = asyncio.create_task(self._readback_hint_queue.get())
+        frame = self._build_bamkey_blob(payload)
+        client = self.client
+        if client is None:
+            raise ConnectionError("Not connected to bed")
+        characteristic = client.services.get_characteristic(SLEEP_NUMBER_BAMKEY_CHAR_UUID)
+        if characteristic is None:
+            raise BleakError("Sleep Number BamKey characteristic is missing")
+        # Respect the backend's ATT write capacity. Each frame is sent once;
+        # retrying an individual chunk would corrupt the peripheral accumulator.
+        chunk_size = characteristic.max_write_without_response_size
+        async with asyncio.timeout(7):
+            async with self.ble_lock:
+                for offset in range(0, len(frame), chunk_size):
+                    if effective_cancel.is_set():
+                        raise asyncio.CancelledError
+                    await client.write_gatt_char(
+                        SLEEP_NUMBER_BAMKEY_CHAR_UUID,
+                        frame[offset : offset + chunk_size],
+                        response=False,
+                    )
+
+        async def read_response() -> str:
+            async with asyncio.timeout(_BAMKEY_RESPONSE_TIMEOUT):
+                await self._readback_hint_queue.get()
+                return await self._read_bamkey_response_after_hint(
+                    remaining_timeout=_BAMKEY_RESPONSE_TIMEOUT,
+                    cancel_event=effective_cancel,
+                )
+
+        response_task = asyncio.create_task(read_response())
         cancel_task = asyncio.create_task(effective_cancel.wait())
         try:
-            while True:
-                timeout = deadline - asyncio.get_running_loop().time()
-                if timeout <= 0:
-                    raise TimeoutError(f"{bamkey} timed out waiting for response")
-
-                done, _ = await asyncio.wait(
-                    {response_task, hint_task, cancel_task},
-                    timeout=timeout,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if not done:
-                    raise TimeoutError(f"{bamkey} timed out waiting for response")
-
-                if cancel_task in done:
-                    raise asyncio.CancelledError
-
-                if response_task in done:
-                    return response_task.result()
-
-                if hint_task in done:
-                    hint_task = asyncio.create_task(self._readback_hint_queue.get())
-                    try:
-                        return await self._read_bamkey_response_after_hint(
-                            remaining_timeout=deadline - asyncio.get_running_loop().time(),
-                            cancel_event=effective_cancel,
-                        )
-                    except (TimeoutError, ValueError):
-                        _LOGGER.debug(
-                            "Sleep Number readback after notification hint did not yield a full response",
-                            exc_info=True,
-                        )
+            done, _ = await asyncio.wait(
+                {response_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if cancel_task in done:
+                raise asyncio.CancelledError
+            return response_task.result()
         finally:
-            for task in (response_task, hint_task, cancel_task):
-                if task.done():
-                    continue
-                task.cancel()
+            for task in (response_task, cancel_task):
+                if not task.done():
+                    task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
-
-    def _drain_response_queue(self) -> None:
-        """Discard stale bamkey responses before sending a new command."""
-        while not self._response_queue.empty():
-            self._response_queue.get_nowait()
 
     def _drain_readback_hint_queue(self) -> None:
         """Discard stale readback hints before sending a new command."""
@@ -2025,30 +2106,25 @@ class SleepNumberController(BedController):
         if client is None or not client.is_connected:
             raise ConnectionError("Not connected to bed")
 
-        deadline = asyncio.get_running_loop().time() + remaining_timeout
-        while True:
-            if cancel_event.is_set():
-                raise asyncio.CancelledError
-
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                raise TimeoutError("Timed out waiting for Sleep Number readback response")
-
-            await asyncio.sleep(min(_BAMKEY_READBACK_TRIGGER_DELAY, remaining))
-            async with asyncio.timeout(remaining):
+        buffer = bytearray()
+        async with asyncio.timeout(remaining_timeout):
+            while True:
+                if cancel_event.is_set():
+                    raise asyncio.CancelledError
                 async with self.ble_lock:
-                    raw_response = bytes(await client.read_gatt_char(SLEEP_NUMBER_BAMKEY_CHAR_UUID))
-
-            if not raw_response:
-                continue
-
-            try:
-                decoded = self._decode_bamkey_text(raw_response)
-            except ValueError:
-                continue
-            if not self._looks_like_bamkey_response(decoded):
-                continue
-            return decoded
+                    chunk = bytes(await client.read_gatt_char(SLEEP_NUMBER_BAMKEY_CHAR_UUID))
+                if not chunk:
+                    raise ValueError("Sleep Number returned an empty blob fragment")
+                buffer.extend(chunk)
+                if len(buffer) < _BAMKEY_BLOB_HEADER_LENGTH:
+                    continue
+                if not buffer.startswith(_BAMKEY_BLOB_PREAMBLE):
+                    raise ValueError("Sleep Number response is missing the Fuzion preamble")
+                total = struct.unpack("<I", buffer[6:10])[0]
+                if total < _BAMKEY_BLOB_MIN_LENGTH or len(buffer) > total:
+                    raise ValueError("Sleep Number response has an invalid blob length")
+                if len(buffer) == total:
+                    return self._parse_bamkey_blob(bytes(buffer))
 
     def _parse_bamkey_response(
         self,
@@ -2059,8 +2135,10 @@ class SleepNumberController(BedController):
         """Parse PASS:/FAIL: bamkey responses into argument lists."""
         response = raw_response.strip()
 
-        if response.startswith("PASS:ACK"):
-            payload = ""
+        if response.startswith("["):
+            payload = response
+        elif response.startswith("PASS:ACK"):
+            payload = response.removeprefix("PASS:ACK").strip()
         elif response.startswith("PASS:"):
             payload = response.removeprefix("PASS:").strip()
         elif response.startswith("FAIL:0"):
@@ -2070,7 +2148,7 @@ class SleepNumberController(BedController):
         elif response.startswith("FAIL:1"):
             raise TimeoutError(f"{bamkey} failed: device timeout")
         elif response.startswith("FAIL:2"):
-            raise BamkeyNotSupportedError(f"{bamkey} failed: generic protocol error")
+            raise ValueError(f"{bamkey} failed: generic protocol error")
         else:
             raise ValueError(f"{bamkey} returned unknown response: {response}")
 
@@ -2093,71 +2171,21 @@ class SleepNumberController(BedController):
         raw = bytes(data)
         self.forward_raw_notification(SLEEP_NUMBER_BAMKEY_CHAR_UUID, raw)
 
-        try:
-            responses = self._extract_bamkey_text_responses(raw)
-            for decoded in responses:
-                self._response_queue.put_nowait(decoded)
-        except ValueError:
-            _LOGGER.debug("Failed to decode Sleep Number bamkey notification", exc_info=True)
+        if (
+            self._session_uuid is not None
+            and len(raw) == 16
+            and raw in (self._session_uuid, bytes(16))
+        ):
             self._queue_readback_hint()
-            return
-
-        if not responses and not self._response_buffer:
-            self._queue_readback_hint()
-
-    def _handle_bamkey_readback_hint_notification(self, _sender: object, data: bytearray) -> None:
-        """Treat secondary Sleep Number notifications as readback triggers."""
-        raw = bytes(data)
-        self.forward_raw_notification(SLEEP_NUMBER_BULK_TRANSFER_CHAR_UUID, raw)
-        self._queue_readback_hint()
 
     def _queue_readback_hint(self) -> None:
         """Queue a notification hint that the BamKey characteristic should be read."""
         self._readback_hint_queue.put_nowait(None)
 
-    def _extract_bamkey_text_responses(self, raw: bytes) -> list[str]:
-        """Extract zero or more decoded bamkey payloads from the notification stream."""
-        if not raw:
-            return []
-
-        if not self._response_buffer and not raw.startswith(_BAMKEY_BLOB_PREAMBLE):
-            decoded = raw.decode("utf-8", errors="ignore").strip()
-            if self._looks_like_bamkey_response(decoded):
-                return [decoded]
-            return []
-
-        self._response_buffer.extend(raw)
-        responses: list[str] = []
-
-        while self._response_buffer:
-            preamble_index = self._response_buffer.find(_BAMKEY_BLOB_PREAMBLE)
-            if preamble_index == -1:
-                self._response_buffer.clear()
-                return responses
-            if preamble_index > 0:
-                del self._response_buffer[:preamble_index]
-
-            if len(self._response_buffer) < _BAMKEY_BLOB_HEADER_LENGTH:
-                return responses
-
-            total_length = struct.unpack("<I", self._response_buffer[6:10])[0]
-            if total_length < _BAMKEY_BLOB_MIN_LENGTH:
-                raise ValueError(f"Invalid Sleep Number blob length: {total_length}")
-            if len(self._response_buffer) < total_length:
-                return responses
-
-            frame = bytes(self._response_buffer[:total_length])
-            del self._response_buffer[:total_length]
-            decoded = self._parse_bamkey_blob(frame)
-            if self._looks_like_bamkey_response(decoded):
-                responses.append(decoded)
-
-        return responses
-
     @staticmethod
     def _format_bamkey_command(bamkey: str, *args: str) -> str:
         """Format a bamkey request payload."""
-        return bamkey if not args else f"{bamkey} {' '.join(args)}"
+        return f"{bamkey} {' '.join(args)}"
 
     @staticmethod
     def _build_bamkey_blob(payload: str) -> bytes:
@@ -2167,34 +2195,6 @@ class SleepNumberController(BedController):
         header = _BAMKEY_BLOB_PREAMBLE + struct.pack("<I", total_length)
         checksum = binascii.crc32(header + encoded_payload) & 0xFFFFFFFF
         return header + encoded_payload + struct.pack("<I", checksum)
-
-    @staticmethod
-    def _decode_bamkey_text(raw: bytes) -> str:
-        """Decode either a framed blob or a plain-text bamkey response."""
-        if raw.startswith(_BAMKEY_BLOB_PREAMBLE):
-            return SleepNumberController._parse_bamkey_blob(raw)
-
-        decoded = raw.decode("utf-8", errors="ignore").strip()
-        if not decoded:
-            raise ValueError("Sleep Number returned an empty response")
-        return decoded
-
-    def _has_characteristic(self, char_uuid: str) -> bool:
-        """Return True if the current connection exposed the characteristic UUID."""
-        client = self.client
-        if client is None or not client.services:
-            return False
-
-        for service in client.services:
-            for characteristic in service.characteristics:
-                if characteristic.uuid == char_uuid:
-                    return True
-        return False
-
-    @staticmethod
-    def _looks_like_bamkey_response(decoded: str) -> bool:
-        """Return True when a decoded plain-text notification looks like a real response."""
-        return decoded.startswith(("PASS:", "FAIL:", "["))
 
     @staticmethod
     def _parse_bamkey_blob(frame: bytes) -> str:
@@ -2232,15 +2232,15 @@ class SleepNumberController(BedController):
         except json.JSONDecodeError as err:
             raise ValueError(f"Invalid Sleep Number BAMG response: {response}") from err
 
-        if not isinstance(values, list) or len(values) != len(_SLEEP_NUMBER_BED_PRESENCE_QUERY_SIDES):
+        if not isinstance(values, list) or len(values) != len(
+            _SLEEP_NUMBER_BED_PRESENCE_QUERY_SIDES
+        ):
             raise ValueError(f"Unexpected Sleep Number BAMG bed-presence response: {response}")
 
         states: dict[str, str] = {}
         for side, value in zip(_SLEEP_NUMBER_BED_PRESENCE_QUERY_SIDES, values, strict=True):
             if not isinstance(value, str):
-                raise TypeError(
-                    f"Unexpected Sleep Number BAMG bed-presence item: {value!r}"
-                )
+                raise TypeError(f"Unexpected Sleep Number BAMG bed-presence item: {value!r}")
             if value.startswith("PASS:"):
                 states[side] = value.removeprefix("PASS:").strip()
                 continue
@@ -2290,10 +2290,10 @@ class SleepNumberController(BedController):
     def _normalize_sleep_number_setting(value: int) -> int:
         """Clamp and snap a Sleep Number setting to the supported range."""
         bounded = max(_SLEEP_NUMBER_SLEEP_SETTING_MIN, min(_SLEEP_NUMBER_SLEEP_SETTING_MAX, value))
-        rounded_steps = round((bounded - _SLEEP_NUMBER_SLEEP_SETTING_MIN) / _SLEEP_NUMBER_SLEEP_SETTING_STEP)
-        return _SLEEP_NUMBER_SLEEP_SETTING_MIN + (
-            rounded_steps * _SLEEP_NUMBER_SLEEP_SETTING_STEP
+        rounded_steps = round(
+            (bounded - _SLEEP_NUMBER_SLEEP_SETTING_MIN) / _SLEEP_NUMBER_SLEEP_SETTING_STEP
         )
+        return _SLEEP_NUMBER_SLEEP_SETTING_MIN + (rounded_steps * _SLEEP_NUMBER_SLEEP_SETTING_STEP)
 
     @staticmethod
     def _normalize_underbed_light_level(value: str) -> str:

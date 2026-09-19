@@ -53,6 +53,12 @@ Some beds require OS-level Bluetooth pairing before the integration can communic
 
 Older Sleep Number BAM/MCR bases connect without OS-level pairing.
 
+For Sleep Number Fuzion, let the integration connect and discover services before
+requesting the bond. It then validates the Auth session before subscribing to
+notifications. An `Insufficient encryption` error means the current transport
+has not authenticated; a host bond does not transfer to an ESPHome proxy. See
+[Sleep Number authentication](beds/sleep_number.md#connection-and-authentication).
+
 **Note:** Pair on the device running Home Assistant's Bluetooth stack, **not your phone**. ESPHome Bluetooth proxies support pairing only on **ESPHome 2024.3.0+**; if pairing keeps failing, use a local adapter near the bed. If a bed connects but stays unbonded, Home Assistant raises a **"Bluetooth pairing required"** repair with a **Fix** button that walks you through it.
 
 ---

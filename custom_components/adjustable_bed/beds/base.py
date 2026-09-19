@@ -11,7 +11,7 @@ import asyncio
 import inspect
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Collection, Coroutine, Sequence
+from collections.abc import Callable, Collection, Coroutine, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final, Literal
@@ -1085,6 +1085,11 @@ class BedController(ABC):
         Empty when the bed has no thermal climate zones.
         """
         return ()
+
+    @property
+    def supports_footwarming_climate(self) -> bool:
+        """Return whether a foot warmer can be controlled as a climate entity."""
+        return False
 
     @property
     def footwarming_climate_sides(self) -> tuple[str, ...]:
@@ -2551,6 +2556,23 @@ class BedController(ABC):
             NotImplementedError: If the bed doesn't support light timer
         """
         raise NotImplementedError("Light timer not supported on this bed")
+
+    @property
+    def sleep_number_command_names(self) -> tuple[str, ...]:
+        """Return the supported semantic Sleep Number configuration actions."""
+        return ()
+
+    def validate_sleep_number_command(
+        self, command: str, parameters: Mapping[str, object]
+    ) -> None:
+        """Validate a complete action without changing the bed."""
+        raise ValueError("Sleep Number configuration actions are not supported on this bed")
+
+    async def async_execute_sleep_number_command(
+        self, command: str, parameters: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Execute an allowlisted action and return its structured result."""
+        raise NotImplementedError("Sleep Number configuration actions are not supported on this bed")
 
     async def read_bed_presence(self) -> bool | None:
         """Read bed occupancy state for the configured side.

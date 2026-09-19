@@ -46,8 +46,9 @@ def _decode_sleep_number_payload(payload: bytes) -> str:
 
 
 @pytest.fixture
-def sleep_number_coordinator(hass: HomeAssistant, mock_coordinator_connected):
+def sleep_number_coordinator(hass: HomeAssistant, mock_coordinator_connected, mock_bleak_client):
     """Create and connect a coordinator for a Sleep Number test device."""
+    mock_bleak_client.services.get_characteristic.return_value.max_write_without_response_size = 512
 
     async def _create(
         *,
@@ -82,19 +83,10 @@ def sleep_number_coordinator(hass: HomeAssistant, mock_coordinator_connected):
 
 
 class TestSleepNumberPairing:
-    """Regression coverage for issue #318 — the bed must never OS-pair.
+    """Fuzion links bond after profile discovery and before Auth/CCCD."""
 
-    The Fuzion / Climate 360 base authenticates at the application layer by
-    reading the Auth + TransferInfo characteristics after each connect (exactly
-    like the SleepIQ app, which never creates a BLE bond). Forcing OS-level
-    ``pair=True`` made ESP-IDF / ESPHome Bluetooth proxies return
-    ``auth fail reason=82`` and wedge the link in the ``ESTABLISHED`` state,
-    breaking every subsequent reconnect until the proxy was factory reset.
-    """
-
-    def test_sleep_number_is_not_a_pairing_required_bed(self) -> None:
-        """Sleep Number must not be classified as requiring OS-level pairing."""
-        assert requires_pairing(BED_TYPE_SLEEP_NUMBER) is False
+    def test_sleep_number_requires_pairing(self) -> None:
+        assert requires_pairing(BED_TYPE_SLEEP_NUMBER) is True
 
     async def test_connect_never_requests_ble_pairing(
         self, sleep_number_coordinator, mock_establish_connection
@@ -159,15 +151,14 @@ class TestSleepNumberController:
         controller = coordinator.controller
         controller._send_bamkey_command = AsyncMock()
 
-        await controller.bind_side(SLEEP_NUMBER_VARIANT_RIGHT).set_motor_position(
-            "back", 57
-        )
+        await controller.bind_side(SLEEP_NUMBER_VARIANT_RIGHT).set_motor_position("back", 57)
 
         controller._send_bamkey_command.assert_awaited_once_with(
             SleepNumberCommands.SET_ACTUATOR_TARGET_POSITION,
             SLEEP_NUMBER_VARIANT_RIGHT,
             "head",
             "57",
+            expected_args=0,
         )
         assert controller._side == SLEEP_NUMBER_VARIANT_LEFT
 
@@ -186,10 +177,9 @@ class TestSleepNumberController:
         assert coordinator.controller_state["sleep_number"] == 45
         assert coordinator.controller_state["sleep_number_left"] == 45
         assert coordinator.controller_state["sleep_number_right"] == 65
-        # Both Frosty (cooling) and Heidi (core temperature) modules are
-        # present in the mock, so Heidi wins as the thermal backend and
-        # reports heat because the mock currently has heating_push_low active.
-        assert coordinator.controller_state["frosty_hvac_mode"] == "cool"
+        # SYCG heat_cool selects Heidi; the cooling-only module is not queried.
+        assert coordinator.controller.supports_thermal_climate is True
+        assert coordinator.controller._frosty_states["left"].present is False
         assert coordinator.controller_state["heidi_hvac_mode"] == "heat"
         assert coordinator.controller_state["thermal_backend"] == "heidi"
         assert coordinator.controller_state["thermal_hvac_mode"] == "heat"
@@ -216,43 +206,6 @@ class TestSleepNumberController:
 
         assert coordinator.controller.allow_position_polling_during_commands is False
 
-    async def test_set_motor_position_writes_bamkey_and_waits_for_ack(
-        self,
-        sleep_number_coordinator,
-        mock_bleak_client: MagicMock,
-    ) -> None:
-        """Direct position writes should send an ACTS command and parse PASS:ACK."""
-        coordinator = await sleep_number_coordinator(
-            address="AA:BB:CC:DD:EE:25",
-            name="Smart bed 0074EB",
-            entry_id="sleep_number_set_position",
-        )
-        mock_bleak_client.write_gatt_char.reset_mock()
-
-        async def _write_side_effect(
-            _char_uuid: str, payload: bytes, response: bool = False
-        ) -> None:
-            del response
-            assert _decode_sleep_number_payload(payload) == "ACTS left head 57"
-            coordinator.controller._handle_bamkey_notification(
-                None,
-                bytearray(_build_sleep_number_blob("PASS:ACK")),
-            )
-
-        mock_bleak_client.write_gatt_char.side_effect = _write_side_effect
-
-        await coordinator.controller.set_motor_position("back", 57)
-
-        mock_bleak_client.start_notify.assert_awaited_once_with(
-            SLEEP_NUMBER_BAMKEY_CHAR_UUID,
-            coordinator.controller._handle_bamkey_notification,
-        )
-        mock_bleak_client.write_gatt_char.assert_awaited_once_with(
-            SLEEP_NUMBER_BAMKEY_CHAR_UUID,
-            _build_sleep_number_blob("ACTS left head 57"),
-            response=False,
-        )
-
     async def test_set_motor_position_reads_ack_after_notification_hint(
         self,
         sleep_number_coordinator,
@@ -271,81 +224,8 @@ class TestSleepNumberController:
         ) -> None:
             assert response is False
             assert _decode_sleep_number_payload(payload) == "ACTS left head 42"
-            coordinator.controller._handle_bamkey_notification(None, bytearray(b"hint"))
-
-        async def _read_side_effect(target) -> bytes:
-            if str(target) == SLEEP_NUMBER_BAMKEY_CHAR_UUID:
-                return _build_sleep_number_blob("PASS:ACK")
-            return b""
-
-        mock_bleak_client.write_gatt_char.side_effect = _write_side_effect
-        mock_bleak_client.read_gatt_char = AsyncMock(side_effect=_read_side_effect)
-
-        await coordinator.controller.set_motor_position("back", 42)
-
-        mock_bleak_client.read_gatt_char.assert_awaited_with(SLEEP_NUMBER_BAMKEY_CHAR_UUID)
-
-    async def test_set_motor_position_ignores_placeholder_readback_until_ack(
-        self,
-        sleep_number_coordinator,
-        mock_bleak_client: MagicMock,
-    ) -> None:
-        """Hint-driven readback should keep polling until a real bamkey response arrives."""
-        coordinator = await sleep_number_coordinator(
-            address="AA:BB:CC:DD:EE:34",
-            name="Smart bed 0074FA",
-            entry_id="sleep_number_set_position_readback_placeholder",
-        )
-        mock_bleak_client.write_gatt_char.reset_mock()
-
-        async def _write_side_effect(
-            _char_uuid: str, payload: bytes, response: bool = False
-        ) -> None:
-            assert response is False
-            assert _decode_sleep_number_payload(payload) == "ACTS left head 43"
-            coordinator.controller._handle_bamkey_notification(None, bytearray(b"hint"))
-
-        read_responses = [b"hint", _build_sleep_number_blob("PASS:ACK")]
-        read_call_count = 0
-
-        async def _read_side_effect(target) -> bytes:
-            nonlocal read_call_count
-            if str(target) == SLEEP_NUMBER_BAMKEY_CHAR_UUID:
-                if read_call_count >= len(read_responses):
-                    pytest.fail(f"Unexpected extra read call #{read_call_count + 1}")
-                response = read_responses[read_call_count]
-                read_call_count += 1
-                return response
-            return b""
-
-        mock_bleak_client.write_gatt_char.side_effect = _write_side_effect
-        mock_bleak_client.read_gatt_char = AsyncMock(side_effect=_read_side_effect)
-
-        await coordinator.controller.set_motor_position("back", 43)
-
-        assert mock_bleak_client.read_gatt_char.await_count == 2
-
-    async def test_set_motor_position_ignores_framed_placeholder_notification(
-        self,
-        sleep_number_coordinator,
-        mock_bleak_client: MagicMock,
-    ) -> None:
-        """Framed trigger tokens should fall through to readback instead of completing early."""
-        coordinator = await sleep_number_coordinator(
-            address="AA:BB:CC:DD:EE:37",
-            name="Smart bed 0074FD",
-            entry_id="sleep_number_set_position_framed_placeholder",
-        )
-        mock_bleak_client.write_gatt_char.reset_mock()
-
-        async def _write_side_effect(
-            _char_uuid: str, payload: bytes, response: bool = False
-        ) -> None:
-            assert response is False
-            assert _decode_sleep_number_payload(payload) == "ACTS left head 45"
             coordinator.controller._handle_bamkey_notification(
-                None,
-                bytearray(_build_sleep_number_blob("hint")),
+                None, bytearray(coordinator.controller._session_uuid)
             )
 
         async def _read_side_effect(target) -> bytes:
@@ -356,7 +236,7 @@ class TestSleepNumberController:
         mock_bleak_client.write_gatt_char.side_effect = _write_side_effect
         mock_bleak_client.read_gatt_char = AsyncMock(side_effect=_read_side_effect)
 
-        await coordinator.controller.set_motor_position("back", 45)
+        await coordinator.controller.set_motor_position("back", 42)
 
         mock_bleak_client.read_gatt_char.assert_awaited_with(SLEEP_NUMBER_BAMKEY_CHAR_UUID)
 
@@ -404,10 +284,12 @@ class TestSleepNumberController:
             _char_uuid: str, payload: bytes, response: bool = False
         ) -> None:
             assert response is False
-            assert _decode_sleep_number_payload(payload) == "ACTH left head"
+            assert _decode_sleep_number_payload(payload) == "ACHA"
+            mock_bleak_client.read_gatt_char.return_value = _build_sleep_number_blob("PASS:ACK")
+            mock_bleak_client.read_gatt_char.side_effect = None
             coordinator.controller._handle_bamkey_notification(
                 None,
-                bytearray(_build_sleep_number_blob("PASS:ACK")),
+                bytearray(coordinator.controller._session_uuid),
             )
 
         mock_bleak_client.write_gatt_char.side_effect = _write_side_effect
@@ -416,11 +298,11 @@ class TestSleepNumberController:
 
         mock_bleak_client.write_gatt_char.assert_awaited_once()
 
-    async def test_stop_all_only_stops_the_configured_side(
+    async def test_stop_all_uses_global_halt(
         self,
         sleep_number_coordinator,
     ) -> None:
-        """stop_all should not send the global ACHA halt on split bases."""
+        """The app uses one global halt for foundation stop."""
         coordinator = await sleep_number_coordinator(
             address="AA:BB:CC:DD:EE:2B",
             name="Smart bed 0074F1",
@@ -433,30 +315,9 @@ class TestSleepNumberController:
 
         coordinator.controller._send_bamkey_command.assert_has_awaits(
             [
-                call("ACTH", "right", "head", cancel_event=ANY),
-                call("ACTH", "right", "foot", cancel_event=ANY),
+                call("ACHA", cancel_event=ANY),
             ]
         )
-
-    async def test_stop_all_attempts_both_actuators_when_one_stop_fails(
-        self,
-        sleep_number_coordinator,
-    ) -> None:
-        """stop_all should still try the second actuator if the first stop fails."""
-        coordinator = await sleep_number_coordinator(
-            address="AA:BB:CC:DD:EE:2C",
-            name="Smart bed 0074F2",
-            entry_id="sleep_number_stop_all_best_effort",
-        )
-        coordinator.controller._send_stop_for_motor = AsyncMock(
-            side_effect=[TimeoutError("head timeout"), None]
-        )
-
-        with pytest.raises(ExceptionGroup) as exc_info:
-            await coordinator.controller.stop_all()
-
-        assert len(exc_info.value.exceptions) == 1
-        coordinator.controller._send_stop_for_motor.assert_has_awaits([call("back"), call("legs")])
 
     async def test_read_positions_maps_head_and_foot_to_back_and_legs(
         self,
@@ -556,7 +417,7 @@ class TestSleepNumberController:
         async def _read_presence() -> None:
             call_order.append("presence")
 
-        controller._ensure_bed_presence_channel_primed = AsyncMock(side_effect=_prime)
+        controller._ensure_notifications_started = AsyncMock(side_effect=_prime)
         controller.read_sleep_number_setting_for_side = AsyncMock(side_effect=_read_sleep)
         controller._query_optional_presence_feature_for_side = AsyncMock(side_effect=_query_feature)
         controller.read_bed_presence = AsyncMock(side_effect=_read_presence)
@@ -564,8 +425,13 @@ class TestSleepNumberController:
         await controller.query_config()
 
         assert call_order[0] == "prime"
-        assert call_order[1:3] == ["sleep:left", "sleep:right"]
-        assert call_order[-1] == "presence"
+        assert [item for item in call_order if item.startswith("sleep:")] == [
+            "sleep:left",
+            "sleep:right",
+        ]
+        assert "CLPG:left" not in call_order
+        assert "THPG:left" not in call_order
+        controller._query_optional_presence_feature_for_side.assert_not_awaited()
 
     async def test_set_thermal_preset_uses_heidi_for_cooling_when_present(
         self,
@@ -587,18 +453,9 @@ class TestSleepNumberController:
             "cooling_pull_high",
             "120",
         )
-        assert (
-            coordinator.controller._coordinator.controller_state["thermal_backend"]
-            == "heidi"
-        )
-        assert (
-            coordinator.controller._coordinator.controller_state["thermal_preset"]
-            == "high"
-        )
-        assert (
-            coordinator.controller._coordinator.controller_state["thermal_hvac_mode"]
-            == "cool"
-        )
+        assert coordinator.controller._coordinator.controller_state["thermal_backend"] == "heidi"
+        assert coordinator.controller._coordinator.controller_state["thermal_preset"] == "high"
+        assert coordinator.controller._coordinator.controller_state["thermal_hvac_mode"] == "cool"
 
     async def test_set_thermal_preset_boost_uses_special_high_cooling(
         self,
@@ -620,10 +477,7 @@ class TestSleepNumberController:
             "cooling_push_high",
             "120",
         )
-        assert (
-            coordinator.controller._coordinator.controller_state["thermal_preset"]
-            == "boost"
-        )
+        assert coordinator.controller._coordinator.controller_state["thermal_preset"] == "boost"
 
     async def test_set_thermal_preset_heating_uses_heidi(
         self,
@@ -645,10 +499,7 @@ class TestSleepNumberController:
             "heating_push_med",
             "120",
         )
-        assert (
-            coordinator.controller._coordinator.controller_state["thermal_hvac_mode"]
-            == "heat"
-        )
+        assert coordinator.controller._coordinator.controller_state["thermal_hvac_mode"] == "heat"
 
     async def test_set_thermal_preset_for_right_side_uses_right_backend(
         self,
@@ -662,7 +513,9 @@ class TestSleepNumberController:
         )
         coordinator.controller._send_bamkey_command = AsyncMock(return_value=[])
 
-        await coordinator.controller.set_thermal_preset_for_side("right", "medium", hvac_mode="cool")
+        await coordinator.controller.set_thermal_preset_for_side(
+            "right", "medium", hvac_mode="cool"
+        )
 
         coordinator.controller._send_bamkey_command.assert_awaited_once_with(
             "THMS",
@@ -675,8 +528,7 @@ class TestSleepNumberController:
             == "cool"
         )
         assert (
-            coordinator.controller._coordinator.controller_state["thermal_preset_right"]
-            == "medium"
+            coordinator.controller._coordinator.controller_state["thermal_preset_right"] == "medium"
         )
 
     async def test_turn_thermal_off_sends_zero_timer(
@@ -919,7 +771,9 @@ class TestSleepNumberController:
             assert _decode_sleep_number_payload(payload) == (
                 'BAMG [{"bamkey":"LBPG","args":"left"},{"bamkey":"LBPG","args":"right"}]'
             )
-            coordinator.controller._handle_bamkey_notification(None, bytearray(b"hint"))
+            coordinator.controller._handle_bamkey_notification(
+                None, bytearray(coordinator.controller._session_uuid)
+            )
 
         async def _read_side_effect(target) -> bytes:
             if str(target) in {
@@ -937,27 +791,10 @@ class TestSleepNumberController:
         presence = await coordinator.controller.read_bed_presence()
 
         assert presence is True
-        assert _decode_sleep_number_payload(
-            mock_bleak_client.write_gatt_char.await_args.args[1]
-        ) == 'BAMG [{"bamkey":"LBPG","args":"left"},{"bamkey":"LBPG","args":"right"}]'
-
-    async def test_bulk_transfer_notification_triggers_readback_hint(
-        self,
-        sleep_number_coordinator,
-    ) -> None:
-        """Secondary Sleep Number notifications should queue a BamKey readback."""
-        coordinator = await sleep_number_coordinator(
-            address="AA:BB:CC:DD:EE:32",
-            name="Smart bed 0074F8",
-            entry_id="sleep_number_bulk_hint",
+        assert (
+            _decode_sleep_number_payload(mock_bleak_client.write_gatt_char.await_args.args[1])
+            == 'BAMG [{"bamkey":"LBPG","args":"left"},{"bamkey":"LBPG","args":"right"}]'
         )
-
-        coordinator.controller._handle_bamkey_readback_hint_notification(
-            None,
-            bytearray(b"\x01"),
-        )
-
-        assert await coordinator.controller._readback_hint_queue.get() is None
 
     async def test_stop_notify_clears_session_state_when_client_is_already_disconnected(
         self,
@@ -971,40 +808,15 @@ class TestSleepNumberController:
             entry_id="sleep_number_stop_notify_cleanup",
         )
         coordinator.controller._notify_started = True
-        coordinator.controller._bulk_notify_started = True
         coordinator.controller._bed_presence_channel_primed = True
-        coordinator.controller._response_buffer.extend(_build_sleep_number_blob("PASS:ACK"))
-        coordinator.controller._response_queue.put_nowait("PASS:ACK")
         coordinator.controller._readback_hint_queue.put_nowait(None)
         mock_bleak_client.is_connected = False
 
         await coordinator.controller.stop_notify()
 
         assert coordinator.controller._notify_started is False
-        assert coordinator.controller._bulk_notify_started is False
         assert coordinator.controller._bed_presence_channel_primed is False
-        assert coordinator.controller._response_buffer == bytearray()
-        assert coordinator.controller._response_queue.empty()
         assert coordinator.controller._readback_hint_queue.empty()
-
-    async def test_bamkey_notification_handler_reassembles_blob_chunks(
-        self,
-        sleep_number_coordinator,
-    ) -> None:
-        """Chunked bamkey notifications should be reassembled before parsing."""
-        coordinator = await sleep_number_coordinator(
-            address="AA:BB:CC:DD:EE:30",
-            name="Smart bed 0074F6",
-            entry_id="sleep_number_chunked_notification",
-        )
-        blob = _build_sleep_number_blob("PASS:ACK")
-
-        coordinator.controller._handle_bamkey_notification(None, bytearray(blob[:8]))
-        assert coordinator.controller._response_queue.empty()
-
-        coordinator.controller._handle_bamkey_notification(None, bytearray(blob[8:]))
-
-        assert await coordinator.controller._response_queue.get() == "PASS:ACK"
 
     def test_parse_bamkey_blob_rejects_invalid_crc(self) -> None:
         """Framed blobs with a corrupted checksum should fail CRC validation."""
@@ -1014,12 +826,13 @@ class TestSleepNumberController:
         with pytest.raises(ValueError):
             SleepNumberController._parse_bamkey_blob(bytes(blob))
 
-    def test_parse_bamkey_response_treats_fail_2_as_not_supported(self) -> None:
-        """FAIL:2 should be treated as an absent optional feature, not a disconnect-worthy error."""
+    def test_parse_bamkey_response_treats_fail_2_as_generic_error(self) -> None:
+        """Only FAIL:0 means a missing feature; FAIL:2 is a genuine error."""
         controller = SleepNumberController(MagicMock())
 
-        with pytest.raises(BamkeyNotSupportedError):
+        with pytest.raises(ValueError) as exc_info:
             controller._parse_bamkey_response("THPG", "FAIL:2", expected_args=1)
+        assert not isinstance(exc_info.value, BamkeyNotSupportedError)
 
     async def test_read_underbed_light_settings_updates_cached_state(
         self,

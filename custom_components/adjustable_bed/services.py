@@ -2028,8 +2028,10 @@ async def async_register_services(hass: HomeAssistant) -> None:
         return  # Services already registered
 
     from .rmcontrol_services import async_register_rmcontrol_services
+    from .sleep_number_services import async_register_sleep_number_services
 
     async_register_rmcontrol_services(hass)
+    async_register_sleep_number_services(hass)
 
     hass.services.async_register(
         DOMAIN,

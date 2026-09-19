@@ -827,10 +827,13 @@ class TestPairingPersistence:
         assert flow._pairing_verify_source == "11:22:33:44:55:66"
         assert flow._pairing_route_certain is False
 
-    async def test_leggett_gen2_pairs_after_service_discovery(self, hass: HomeAssistant) -> None:
-        """LP Comfort Connect must connect and discover GATT before bonding."""
+    @pytest.mark.parametrize("bed_type", [BED_TYPE_LEGGETT_GEN2, BED_TYPE_SLEEP_NUMBER])
+    async def test_pairs_after_service_discovery(
+        self, hass: HomeAssistant, bed_type: str
+    ) -> None:
+        """The verified app sequence discovers GATT before bonding and Auth."""
         flow = self._new_pairing_flow(hass)
-        flow._manual_data[CONF_BED_TYPE] = BED_TYPE_LEGGETT_GEN2
+        flow._manual_data[CONF_BED_TYPE] = bed_type
 
         service_info = MagicMock()
         service_info.address = flow._manual_data[CONF_ADDRESS]
@@ -847,8 +850,13 @@ class TestPairingPersistence:
         async def disconnect() -> None:
             events.append("disconnect")
 
+        async def read_auth(_uuid: str) -> bytes:
+            events.append("auth")
+            return bytes.fromhex("00112233445566778899aabbccddeeff")
+
         client.pair = AsyncMock(side_effect=pair)
         client.disconnect = AsyncMock(side_effect=disconnect)
+        client.read_gatt_char = AsyncMock(side_effect=read_auth)
 
         async def establish(*_args: object, **_kwargs: object) -> MagicMock:
             events.append("connect")
@@ -865,9 +873,12 @@ class TestPairingPersistence:
         # This protocol has no evidence-backed Device Information verifier.
         # Pairing still runs after service discovery, but an unrelated read
         # must not be presented as proof that the resulting bond works.
-        assert evidence.status is BondVerificationStatus.UNSUPPORTED
-
-        assert events == ["connect", "pair", "disconnect"]
+        if bed_type == BED_TYPE_SLEEP_NUMBER:
+            assert evidence.status is BondVerificationStatus.VERIFIED
+            assert events == ["connect", "pair", "auth", "disconnect"]
+        else:
+            assert evidence.status is BondVerificationStatus.UNSUPPORTED
+            assert events == ["connect", "pair", "disconnect"]
         # The keyword is omitted rather than passed False: this bed bonds after
         # service discovery, so the backend is never asked to bond on connect,
         # and older connectors without the keyword must not raise here.

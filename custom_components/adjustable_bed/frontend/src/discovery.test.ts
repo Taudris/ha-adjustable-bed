@@ -76,6 +76,24 @@ test("read-only light state is visible independently of light controls", () => {
   expect(bedIsEmpty(bed)).toBe(false);
 });
 
+test("standalone MCR sides keep percentage sliders with their motor covers", () => {
+  const hass = hassWith([
+    entry("cover.b_back_left", "back_left"),
+    entry("cover.b_back_right", "back_right"),
+    entry("number.b_back_left", "back_position_left"),
+    entry("number.b_back_right", "back_position_right"),
+  ]);
+  const bed = bedEntitiesForDevice(hass, "dev1");
+  expect(bed.motors).toEqual([
+    { key: "back_left", cover: "cover.b_back_left", position: "number.b_back_left" },
+    { key: "back_right", cover: "cover.b_back_right", position: "number.b_back_right" },
+  ]);
+  const left = bedEntitiesForDevice(hass, "dev1", "left");
+  expect(left.motors).toEqual([
+    { key: "back", cover: "cover.b_back_left", position: "number.b_back_left" },
+  ]);
+});
+
 test("paired parent's stop_both maps to the stop slot", () => {
   const hass = hassWith([entry("button.master_bed_stop_both", "stop_both")]);
   const bed = bedEntitiesForDevice(hass, "dev1");

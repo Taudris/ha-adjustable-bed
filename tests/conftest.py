@@ -50,6 +50,8 @@ from custom_components.adjustable_bed.const import (  # noqa: E402
     RICHMAT_NORDIC_SERVICE_UUID,
     RICHMAT_WILINKE_SERVICE_UUIDS,
     RONDURE_SERVICE_UUID,
+    SLEEP_NUMBER_AUTH_CHAR_UUID,
+    SLEEP_NUMBER_BAMKEY_CHAR_UUID,
     SLEEP_NUMBER_MCR_RX_CHAR_UUID,
     SLEEP_NUMBER_MCR_TX_CHAR_UUID,
     SOLACE_SERVICE_UUID,
@@ -201,10 +203,13 @@ def mock_bleak_client() -> MagicMock:
     from bleak import BleakClient
 
     mcr_sync = b"\x16\x16"
+    mcr_write_buffer = bytearray()
     sleep_number_preamble = b"fUzIoN"
     client = MagicMock(spec=BleakClient)
     notify_callbacks: dict[str, Callable[..., None]] = {}
-    readable_values: dict[str, bytes] = {}
+    sleep_number_session = bytes.fromhex("00112233445566778899aabbccddeeff")
+    readable_values: dict[str, bytes] = {SLEEP_NUMBER_AUTH_CHAR_UUID: sleep_number_session}
+    sleep_number_write_buffer = bytearray()
     sleep_number_state: dict[str, object] = {
         "underbed_light_level": "high",
         "underbed_light_timer": 15,
@@ -242,7 +247,7 @@ def mock_bleak_client() -> MagicMock:
         "right_sleep_number": 65,
         "underbed_light_on": True,
         # 0.4.x BAM firmware on the tested i8 returns only 4 bytes here.
-        "chamber_payload": b"\x01\x00\x00\x00",
+        "chamber_payload": b"\x01\x00\x01\x00",
     }
 
     def _build_sleep_number_blob(payload: str) -> bytes:
@@ -314,48 +319,53 @@ def mock_bleak_client() -> MagicMock:
         side = int(request["side"])
         payload = bytes(request["payload"])
 
+        node = int(request["command_type"])
         response_payload = b""
-        if function_code in {0, 2, 21}:
-            pass
-        elif function_code == 17:
-            if len(payload) >= 2:
-                value = payload[1]
-                if side == 0:
-                    sleep_number_mcr_state["left_sleep_number"] = value
-                elif side == 1:
-                    sleep_number_mcr_state["right_sleep_number"] = value
-        elif function_code == 18:
+        if function_code == 0:
+            response_payload = bytes(8) + b"\x12\x34"
+        elif node == 0x72 and function_code == 0x12:
+            response_payload = bytes((1, 0x31, 0x41, 0x51))
+        elif node == 0x42 and function_code == 0x25:
+            response_payload = bytes((2, 45, 75, 30, 1, 0, 0))
+        elif node == 0x42 and function_code == 0x12:
+            response_payload = bytes((64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x44))
+        elif node == 0x42 and function_code == 0x1A:
+            response_payload = bytes(11)
+        elif node == 0x42 and function_code == 0x2A:
+            response_payload = bytes(3)
+        elif node == 2 and function_code == 17 and len(payload) >= 2:
+            key = "right_sleep_number" if side == 0 else "left_sleep_number"
+            sleep_number_mcr_state[key] = payload[1]
+        elif node == 2 and function_code == 18:
             response_payload = bytes(
-                [
+                (
                     1,
                     int(sleep_number_mcr_state["left_sleep_number"]),
                     int(sleep_number_mcr_state["right_sleep_number"]),
                     0,
                     0,
-                ]
+                )
             )
-        elif function_code == 19:
-            if payload:
-                sleep_number_mcr_state["underbed_light_on"] = bool(payload[0])
-        elif function_code == 20:
-            response_payload = bytes([1 if sleep_number_mcr_state["underbed_light_on"] else 0])
+        elif node == 2 and function_code == 20:
+            response_payload = bytes((65, 35))
+        elif node == 0x42 and function_code == 19 and payload:
+            sleep_number_mcr_state["underbed_light_on"] = bool(payload[0])
+        elif node == 0x42 and function_code == 20:
+            response_payload = bytes(
+                (1 if sleep_number_mcr_state["underbed_light_on"] else 0, 0, 0)
+            )
         elif function_code == 97:
             response_payload = bytes(sleep_number_mcr_state["chamber_payload"])
-        else:
-            return None
-
-        # Echo the request's address fields back so this mock actually
-        # exercises the controller's target/echo encoding. Hard-coding
-        # ``mcr_bed_address`` would mask any controller bug that mis-encoded
-        # the bed-address derived from the BLE MAC.
-        request_target = int(request["target"])
-        request_echo = int(request["echo"])
+        elif node == 0x52 and function_code == 0x1C:
+            response_payload = bytes((0,))
+        if node == 2 and function_code == 18:
+            side = 1  # Pump reports DUAL chambers independently of requested selector.
         return _build_mcr_frame(
-            command_type=1,
-            target=request_target,
-            sub_address=int(request["sub_address"]),
+            command_type=node,
+            target=0x5678 if function_code == 0 else int(request["sub_address"]),
+            sub_address=int(request["echo"]),
             status=int(request["status"]),
-            echo=request_echo if request_echo else request_target,
+            echo=int(request["sub_address"]),
             function_code=function_code | 0x80,
             side=side,
             payload=response_payload,
@@ -378,6 +388,13 @@ def mock_bleak_client() -> MagicMock:
     client.address = TEST_ADDRESS
     client.mtu_size = 23
     client.services = MagicMock()
+    default_characteristic = client.services.get_characteristic.return_value
+    mcr_characteristic = MagicMock()
+    mcr_characteristic.properties = ["write", "write-without-response"]
+    client.services.get_characteristic.side_effect = lambda uuid: (
+        mcr_characteristic if str(uuid) == SLEEP_NUMBER_MCR_RX_CHAR_UUID else default_characteristic
+    )
+    default_characteristic.max_write_without_response_size = 20
     client.services.__iter__ = lambda self: iter([])
     client.services.__len__ = lambda self: 0
     # Return None for service lookups to avoid false positives in variant detection
@@ -391,7 +408,24 @@ def mock_bleak_client() -> MagicMock:
 
     async def _write_gatt_char(char_uuid: str, data: bytes, response: bool = False) -> None:
         del response
+        if str(char_uuid) == SLEEP_NUMBER_BAMKEY_CHAR_UUID:
+            sleep_number_write_buffer.extend(data)
+            if len(sleep_number_write_buffer) < 10:
+                return
+            total_length = struct.unpack("<I", sleep_number_write_buffer[6:10])[0]
+            if len(sleep_number_write_buffer) < total_length:
+                return
+            data = bytes(sleep_number_write_buffer)
+            sleep_number_write_buffer.clear()
         if str(char_uuid) == SLEEP_NUMBER_MCR_RX_CHAR_UUID:
+            mcr_write_buffer.extend(data)
+            if len(mcr_write_buffer) < 12:
+                return
+            length = 14 + (mcr_write_buffer[11] & 15)
+            if len(mcr_write_buffer) < length:
+                return
+            data = bytes(mcr_write_buffer[:length])
+            del mcr_write_buffer[:length]
             request = _parse_mcr_frame(data)
             callback = notify_callbacks.get(SLEEP_NUMBER_MCR_TX_CHAR_UUID)
             if request is None or callback is None:
@@ -424,7 +458,16 @@ def mock_bleak_client() -> MagicMock:
             return
 
         response_text: str | None = None
-        if decoded_payload == "UBLG":
+        if decoded_payload == "SYCG":
+            response_text = (
+                "PASS:dual yes yes yes yes heat_cool yes yes yes yes yes yes yes yes yes yes"
+            )
+        elif decoded_payload.startswith("SNCG "):
+            side = decoded_payload.split(" ")[1]
+            side_state = sleep_number_state[side]
+            assert isinstance(side_state, dict)
+            response_text = f"PASS:0 {side_state['sleep_number']} {side_state['sleep_number']}"
+        elif decoded_payload == "UBLG":
             response_text = (
                 "PASS:"
                 f"{sleep_number_state['underbed_light_level']} "
@@ -450,7 +493,7 @@ def mock_bleak_client() -> MagicMock:
             _, side = decoded_payload.split(" ", maxsplit=1)
             side_state = sleep_number_state[side]
             assert isinstance(side_state, dict)
-            response_text = "PASS:true" if side_state["footwarming_present"] else "PASS:false"
+            response_text = "PASS:1" if side_state["footwarming_present"] else "PASS:0"
         elif decoded_payload.startswith("FWTG "):
             _, side = decoded_payload.split(" ", maxsplit=1)
             side_state = sleep_number_state[side]
@@ -526,7 +569,7 @@ def mock_bleak_client() -> MagicMock:
         response_payload = _build_sleep_number_blob(response_text)
         readable_values[char_uuid] = response_payload
         if callback is not None:
-            callback(char_uuid, bytearray(response_payload))
+            callback(char_uuid, bytearray(sleep_number_session))
 
     async def _read_gatt_char(target) -> bytes:
         return readable_values.get(str(target), b"")

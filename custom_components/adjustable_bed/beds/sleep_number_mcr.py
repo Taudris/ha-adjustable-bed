@@ -9,19 +9,35 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
 import struct
 import time
-from collections.abc import Callable
+import zlib
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
-from bleak.exc import BleakError
-
 from ..const import (
+    CONF_SLEEP_NUMBER_MCR_CLIENT_ID,
     SLEEP_NUMBER_MCR_RX_CHAR_UUID,
     SLEEP_NUMBER_MCR_TX_CHAR_UUID,
 )
-from .base import BedController
+from .base import (
+    POSITION_UNIT_PERCENT,
+    BedController,
+    MotorCommandCallable,
+    MotorControlSpec,
+    PositionNumberSpec,
+)
+from .sleep_number_mcr_protocol import (
+    FoundationFeatures,
+    classify_smartpump,
+    decode_foundation,
+    decode_massage,
+    decode_pinch,
+    decode_system,
+    require_payload,
+)
 
 if TYPE_CHECKING:
     from ..coordinator import AdjustableBedCoordinator
@@ -44,12 +60,14 @@ _MCR_FUNC_PRESET: Final = 21
 _MCR_FUNC_FOUNDATION_LIGHT_READ: Final = 20
 _MCR_FUNC_FOUNDATION_OUTLET: Final = 19
 
-_MCR_SIDE_LEFT: Final = 0
-_MCR_SIDE_RIGHT: Final = 1
+_MCR_SIDE_LEFT: Final = 1
+_MCR_SIDE_RIGHT: Final = 0
 _MCR_SIDE_ALL: Final = 0x0F
 _MCR_OUTLET_UNDERBED_LIGHT: Final = 3
 _OPTIONAL_RESPONSE_GRACE_SECONDS: Final = 0.2
-_INIT_HANDSHAKE_TIMEOUT_SECONDS: Final = 10.0
+_INIT_HANDSHAKE_TIMEOUT_SECONDS: Final = 0.9
+# HA safety bound: do not hold the serialized command path indefinitely.
+_PUMP_CLEANUP_TIMEOUT_SECONDS: Final = 10.0
 
 _SLEEP_NUMBER_MCR_PRESETS: Final[dict[str, int]] = {
     "Favorite": 1,
@@ -66,15 +84,58 @@ _SIDE_NAME_TO_VALUE: Final[dict[str, int]] = {
 }
 
 
-class _ResponseTimeout(TimeoutError):
-    """Raised when a required MCR *response* does not arrive in time.
+# Semantic service schema: required fields, optional fields. No raw opcode interface.
+_COMMAND_FIELDS: Final[dict[str, tuple[set[str], set[str]]]] = {
+    "mcr_status": (set(), set()),
+    "foundation_status": (set(), set()),
+    "position": ({"side", "axis", "position"}, set()),
+    "stop": ({"side"}, set()),
+    "preset_save": ({"side", "preset"}, set()),
+    "preset_reset": ({"side", "preset"}, set()),
+    "preset_timer": ({"side", "preset", "timer"}, set()),
+    "firmness_favorite": ({"side", "firmness"}, set()),
+    "firmness_favorites": (set(), set()),
+    "responsive_air": ({"side", "enabled"}, set()),
+    "responsive_air_status": (set(), set()),
+    "massage": ({"side"}, {"head", "foot", "mode", "timer"}),
+    "massage_status": ({"side"}, set()),
+    "foot_warming": ({"side", "level"}, {"duration"}),
+    "foot_warming_status": ({"side"}, set()),
+    "outlet": ({"outlet", "enabled"}, {"duration"}),
+    "outlet_status": ({"outlet"}, set()),
+    "light_intensity": ({"side", "intensity"}, set()),
+    "underbed_auto": ({"enabled"}, set()),
+    "underbed_auto_status": (set(), set()),
+    "pinch_status": (set(), set()),
+    "sense_and_do": ({"enabled"}, set()),
+    "sense_and_do_status": (set(), set()),
+    "kid_outlet": ({"device"}, {"outlet_on", "light_on"}),
+    "kid_outlet_status": ({"device"}, set()),
+    "head_tilt": ({"enabled"}, set()),
+    "software_versions": (set(), set()),
+}
+_FOUNDATION_COMMANDS: Final = {
+    "foundation_status",
+    "position",
+    "stop",
+    "preset_save",
+    "preset_reset",
+    "preset_timer",
+    "massage",
+    "massage_status",
+    "foot_warming",
+    "foot_warming_status",
+    "outlet",
+    "outlet_status",
+    "light_intensity",
+    "underbed_auto",
+    "underbed_auto_status",
+    "pinch_status",
+}
 
-    Distinct from a write/transport ``TimeoutError`` (raised by
-    ``_async_write_frame``/``write_gatt_char``) so the init handshake can treat
-    a missing *echo* as non-fatal while still forcing a reconnect when the init
-    *write* itself fails. Subclasses ``TimeoutError`` so existing callers that
-    catch ``TimeoutError`` keep working.
-    """
+
+class _ResponseTimeout(TimeoutError):
+    """A missing protocol response, retried separately from transport failures."""
 
 
 @dataclass(slots=True)
@@ -107,20 +168,53 @@ def _normalize_sleep_number_setting(value: int) -> int:
     return int(round(normalized / 5) * 5)
 
 
-def _bed_address_from_mac(address: str) -> int:
-    """Derive the BAM/MCR node address from the BLE MAC address."""
-    parts = address.upper().replace("-", ":").split(":")
-    return (int(parts[-2], 16) << 8) | int(parts[-1], 16)
+def _motor_command(side: str, axis: str, direction: str) -> MotorCommandCallable:
+    async def execute(controller: BedController) -> None:
+        bound = controller.bind_side(side)
+        if direction == "stop":
+            await bound.stop_all()
+        elif axis == "back":
+            await (bound.move_back_up() if direction == "up" else bound.move_back_down())
+        else:
+            await (bound.move_legs_up() if direction == "up" else bound.move_legs_down())
+
+    return execute
 
 
 class SleepNumberMcrController(BedController):
     """Controller for older Sleep Number BAM / MCR beds."""
 
-    def __init__(self, coordinator: AdjustableBedCoordinator) -> None:
+    def __init__(
+        self,
+        coordinator: AdjustableBedCoordinator,
+        *,
+        manufacturer_data: Mapping[int, bytes] | None = None,
+    ) -> None:
         """Initialize the controller."""
         super().__init__(coordinator)
-        self._bed_address = _bed_address_from_mac(coordinator.address)
+        self._bed_address = 0
+        self._client_address = 0
+        identifier = coordinator.entry.data.get(CONF_SLEEP_NUMBER_MCR_CLIENT_ID)
+        self._client_identifier: int = (
+            identifier
+            if isinstance(identifier, int) and 0 < identifier < 1 << 64
+            else (secrets.randbits(64) or 1)
+        )
+        self._foundation_features: FoundationFeatures | None = None
+        self._nodes: set[int] = set()
+        self._chambers: dict[str, int] = {}
+        self._pressure_sides: tuple[str, ...] = ()
+        self._massage_sides: tuple[str, ...] = ()
+        self._chambers_present: tuple[bool, bool] = (False, False)
+        self._pump_model = "unknown"
+        for company, data in (manufacturer_data or {}).items():
+            advertised = classify_smartpump(
+                company.to_bytes(2, "little") + data, coordinator.address
+            )
+            self._pump_model = str(advertised["model"])
+        self._state: dict[str, object] = {}
         self._notify_started = False
+        self._notify_callback: Callable[[str, float], None] | None = None
         self._initialized = False
         self._response_buffer = bytearray()
         self._response_frames: list[_McrFrame] = []
@@ -131,6 +225,7 @@ class SleepNumberMcrController(BedController):
         # ``(function_code, side)`` tuple matching the request that was
         # sent. ``None`` means no request is in flight.
         self._outstanding_request_key: tuple[int, int] | None = None
+        self._outstanding_node: int | None = None
         # During the connection-priming init handshake, accept ANY notification
         # from the bed as confirmation, bypassing the strict per-frame
         # correlation below. Older BAM/MCR firmware echoes the init frame
@@ -164,28 +259,28 @@ class SleepNumberMcrController(BedController):
 
     @property
     def supports_motor_control(self) -> bool:
-        """This initial implementation exposes presets, not live motor control."""
-        return False
+        """Expose motor controls after foundation discovery."""
+        return self._foundation_features is not None
 
     @property
     def supports_stop_all(self) -> bool:
-        """Do not expose a generic stop button until foundation stop is verified."""
-        return False
+        """The SE MFHR/MFHL commands stop foundation movement."""
+        return self._foundation_features is not None
 
     @property
     def supports_lights(self) -> bool:
-        """The BAM/MCR bed exposes discrete under-bed light control."""
-        return True
+        """Only expose lighting reported by foundation system status."""
+        return bool(self._foundation_features and self._foundation_features.light)
 
     @property
     def supports_discrete_light_control(self) -> bool:
         """The BAM/MCR bed has separate under-bed light on/off writes."""
-        return True
+        return self.supports_lights
 
     @property
     def supports_under_bed_lights(self) -> bool:
         """The BAM/MCR bed exposes a dedicated under-bed light outlet."""
-        return True
+        return self.supports_lights
 
     @property
     def supports_bed_presence(self) -> bool:
@@ -200,7 +295,7 @@ class SleepNumberMcrController(BedController):
     @property
     def sleep_number_setting_sides(self) -> tuple[str, ...]:
         """Return the sides that expose firmness controls."""
-        return ("left", "right")
+        return self._pressure_sides if self._pump_model != "genie" else ()
 
     @property
     def sleep_number_setting_min(self) -> int:
@@ -219,13 +314,13 @@ class SleepNumberMcrController(BedController):
 
     @property
     def foundation_preset_sides(self) -> tuple[str, ...]:
-        """Return the sides that can trigger foundation presets."""
-        return ("left", "right")
+        """Expose only discovered foundation sides."""
+        return self._foundation_features.sides if self._foundation_features else ()
 
     @property
     def foundation_preset_options(self) -> list[str]:
         """Return the supported foundation preset names."""
-        return list(_SLEEP_NUMBER_MCR_PRESETS)
+        return list(self._foundation_features.presets) if self._foundation_features else []
 
     @property
     def bed_presence_sides(self) -> tuple[str, ...]:
@@ -258,13 +353,15 @@ class SleepNumberMcrController(BedController):
     ) -> None:
         """Subscribe to the MCR response characteristic and run the init handshake.
 
-        The callback is unused; positions are pushed via the MCR frame parser.
+        Foundation reads publish position values through the supplied callback.
         """
+        self._notify_callback = callback
         client = self.client
         if client is None or not client.is_connected:
             raise ConnectionError("Not connected to bed")
 
         if not self._notify_started:
+            await asyncio.sleep(0.128)
             await client.start_notify(
                 SLEEP_NUMBER_MCR_TX_CHAR_UUID,
                 self._handle_mcr_notification,
@@ -288,27 +385,56 @@ class SleepNumberMcrController(BedController):
         self._quarantined_response_keys.clear()
 
     async def query_config(self) -> None:
-        """Read the current BAM/MCR state after connect.
-
-        Hydration steps are independent: a transient malformed reply to
-        the pump-status read must not abort the rest of init, otherwise
-        the under-bed light query never runs and the corresponding
-        entity stays silently disabled for the session.
-        Transport failures still propagate (those are retried at the
-        coordinator level).
-        """
+        """Discover nodes and hydrate only supported feature families."""
         await self._async_initialize_session()
-        try:
-            await self._async_read_pump_status()
-        except ValueError:
-            _LOGGER.debug(
-                "Sleep Number MCR pump-status read returned an unexpected"
-                " payload during query_config; firmness state left unknown",
-                exc_info=True,
+        nodes = await self._mcr_request(0x72, 0x12)
+        self._nodes = set(nodes)
+        chambers = await self._mcr_request(0x02, 0x61, 2, b"\x00\x00")
+        require_payload(chambers, 4)
+        self._chambers = {"right": chambers[1], "left": chambers[3]}
+        self._chambers_present = (bool(chambers[0]), bool(chambers[2]))
+        if self._pump_model != "360":
+            self._pump_model = (
+                "genie"
+                if 3 in self._chambers.values()
+                else "k2"
+                if 2 in self._chambers.values()
+                else "k1"
+                if 1 in self._chambers.values()
+                else "adult"
             )
-        await self._async_read_underbed_light_state()
+        self._publish(
+            {
+                "chamber_present_right": bool(chambers[0]),
+                "chamber_present_left": bool(chambers[2]),
+                "chamber_type_right": chambers[1],
+                "chamber_type_left": chambers[3],
+                "mcr_nodes": sorted(self._nodes),
+                "pump_model": self._pump_model,
+                "chamber_diagnostics_right": list(chambers[4:6]) if len(chambers) >= 8 else [0, 0],
+                "chamber_diagnostics_left": list(chambers[6:8]) if len(chambers) >= 8 else [0, 0],
+            }
+        )
+        await self._async_read_pump_status()
+        await self._read_favorites()
+        if 0x41 in self._nodes:
+            self._foundation_features, state = decode_system(await self._mcr_request(0x42, 0x25))
+            self._publish(state)
+            await self._read_foundation()
+            if self.supports_lights:
+                await self._async_read_underbed_light_state()
+            if self.supports_massage:
+                for side in ("left", "right"):
+                    await self._read_massage(side)
+            for side in self.footwarming_climate_sides:
+                await self._read_warming(side)
 
     async def set_sleep_number_setting_for_side(self, side: str, value: int) -> None:
+        if side not in self.sleep_number_setting_sides:
+            raise ValueError("Pressure side is not present")
+        await self._set_sleep_number_for_chamber(side, value)
+
+    async def _set_sleep_number_for_chamber(self, side: str, value: int) -> None:
         """Set firmness for one side."""
         normalized = _normalize_sleep_number_setting(value)
         side_value = self._side_value(side)
@@ -319,18 +445,22 @@ class SleepNumberMcrController(BedController):
             status=_MCR_STATUS_PUMP,
             function_code=_MCR_FUNC_FORCE_IDLE,
             side=0,
-            timeout=3.0,
-            require_response=False,
+            timeout=0.9,
+            require_response=True,
         )
-        await self._async_send_frame(
-            command_type=_MCR_CMD_PUMP,
-            status=_MCR_STATUS_PUMP,
-            function_code=_MCR_FUNC_SET,
-            side=side_value,
-            payload=bytes([0x00, normalized]),
-            timeout=5.0,
-            require_response=False,
-        )
+        try:
+            await self._async_send_frame(
+                command_type=_MCR_CMD_PUMP,
+                status=_MCR_STATUS_PUMP,
+                function_code=_MCR_FUNC_SET,
+                side=side_value,
+                payload=bytes([0x00, normalized]),
+                timeout=0.9,
+                require_response=True,
+            )
+        except BaseException:
+            await self._idle_pump_after_cancel()
+            raise
 
         self._sleep_numbers[side] = normalized
         self.forward_controller_state_updates({f"sleep_number_{side}": normalized})
@@ -341,6 +471,9 @@ class SleepNumberMcrController(BedController):
         if preset_value is None:
             raise ValueError(f"Unsupported Sleep Number MCR preset: {preset}")
 
+        self._require_foundation(side)
+        if preset not in self.foundation_preset_options:
+            raise ValueError("Preset is not supported by the foundation")
         await self._async_initialize_session()
         await self._async_send_frame(
             command_type=_MCR_CMD_FOUNDATION,
@@ -348,8 +481,8 @@ class SleepNumberMcrController(BedController):
             function_code=_MCR_FUNC_PRESET,
             side=self._side_value(side),
             payload=bytes([preset_value, 0x00]),
-            timeout=5.0,
-            require_response=False,
+            timeout=0.9,
+            require_response=True,
         )
 
         self._foundation_presets[side] = preset
@@ -372,60 +505,53 @@ class SleepNumberMcrController(BedController):
         return None
 
     async def move_head_up(self) -> None:
-        """Older BAM/MCR support is preset/firmness-only in this integration."""
-        raise NotImplementedError("Direct motor control is not implemented for Sleep Number MCR")
+        await self._move_axis("head", 100)
 
     async def move_head_down(self) -> None:
-        """Older BAM/MCR support is preset/firmness-only in this integration."""
-        raise NotImplementedError("Direct motor control is not implemented for Sleep Number MCR")
+        await self._move_axis("head", 0)
 
     async def move_head_stop(self) -> None:
-        """Older BAM/MCR support is preset/firmness-only in this integration."""
-        raise NotImplementedError("Direct motor control is not implemented for Sleep Number MCR")
+        await self.stop_all()
 
     async def move_back_up(self) -> None:
-        """Older BAM/MCR support is preset/firmness-only in this integration."""
-        raise NotImplementedError("Direct motor control is not implemented for Sleep Number MCR")
+        await self._move_axis("head", 100)
 
     async def move_back_down(self) -> None:
-        """Older BAM/MCR support is preset/firmness-only in this integration."""
-        raise NotImplementedError("Direct motor control is not implemented for Sleep Number MCR")
+        await self._move_axis("head", 0)
 
     async def move_back_stop(self) -> None:
-        """Older BAM/MCR support is preset/firmness-only in this integration."""
-        raise NotImplementedError("Direct motor control is not implemented for Sleep Number MCR")
+        await self.stop_all()
 
     async def move_legs_up(self) -> None:
-        """Older BAM/MCR support is preset/firmness-only in this integration."""
-        raise NotImplementedError("Direct motor control is not implemented for Sleep Number MCR")
+        await self._move_axis("foot", 100)
 
     async def move_legs_down(self) -> None:
-        """Older BAM/MCR support is preset/firmness-only in this integration."""
-        raise NotImplementedError("Direct motor control is not implemented for Sleep Number MCR")
+        await self._move_axis("foot", 0)
 
     async def move_legs_stop(self) -> None:
-        """Older BAM/MCR support is preset/firmness-only in this integration."""
-        raise NotImplementedError("Direct motor control is not implemented for Sleep Number MCR")
+        await self.stop_all()
 
     async def move_feet_up(self) -> None:
-        """Older BAM/MCR support is preset/firmness-only in this integration."""
-        raise NotImplementedError("Direct motor control is not implemented for Sleep Number MCR")
+        await self._move_axis("foot", 100)
 
     async def move_feet_down(self) -> None:
-        """Older BAM/MCR support is preset/firmness-only in this integration."""
-        raise NotImplementedError("Direct motor control is not implemented for Sleep Number MCR")
+        await self._move_axis("foot", 0)
 
     async def move_feet_stop(self) -> None:
-        """Older BAM/MCR support is preset/firmness-only in this integration."""
-        raise NotImplementedError("Direct motor control is not implemented for Sleep Number MCR")
+        await self.stop_all()
 
     async def stop_all(self) -> None:
-        """Generic stop is intentionally not exposed for this controller."""
-        raise NotImplementedError("Stop all is not implemented for Sleep Number MCR")
+        """Always release both available sides with a fresh cancellation token."""
+        sides = (self.command_side,) if self.command_side else self.foundation_preset_sides
+        try:
+            await self._stop_sides(sides)
+        finally:
+            await self._mcr_request(0x02, 0x02, cancel_event=asyncio.Event())
 
     async def preset_flat(self) -> None:
         """Move the left side to flat when called directly."""
-        await self.set_foundation_preset_for_side("left", "Flat")
+        for side in self.foundation_preset_sides:
+            await self.set_foundation_preset_for_side(side, "Flat")
 
     async def preset_memory(self, memory_num: int) -> None:
         """Older BAM/MCR favorite/read presets are exposed via side selects."""
@@ -438,68 +564,73 @@ class SleepNumberMcrController(BedController):
         )
 
     async def _async_initialize_session(self) -> None:
-        """Run the required MCR init handshake once per connection.
-
-        The handshake primes the bed for subsequent commands. Following the
-        behaviour of the reference implementation that works against this
-        hardware, ANY notification from the bed confirms the handshake — the
-        echo contents are not inspected. Older BAM/MCR firmware replies to the
-        init frame without the response bit set, or echoes a different side
-        nibble, so the strict ``(function_code, side, is_response)`` correlation
-        used for normal commands would reject the echo. That manifested as
-        "Timed out waiting for Sleep Number MCR response func=0" followed by a
-        permanent reconnect loop (issue #322).
-
-        If the firmware sends no echo at all but the BLE link stays up, proceed
-        anyway: the write itself primes the bed and the follow-up commands are
-        fire-and-forget. Only a missing *echo* is tolerated — a failed init
-        *write* (transport ``TimeoutError``/``BleakError``/``OSError`` from
-        ``_async_write_frame``) propagates so the coordinator reconnects rather
-        than priming the controller against a bed that never received the init.
-        """
+        """Negotiate peer/client addresses using the persisted random identifier."""
         if self._initialized:
             return
+        self._bed_address = self._client_address = 0
+        frames = await self._async_send_frame(
+            command_type=2,
+            status=2,
+            function_code=0,
+            side=0,
+            payload=self._client_identifier.to_bytes(8, "big"),
+            sub_address=0,
+            timeout=_INIT_HANDSHAKE_TIMEOUT_SECONDS,
+        )
+        for frame in frames:
+            if len(frame.payload) >= 10:
+                self._client_address = int.from_bytes(frame.payload[8:10], "big")
+                self._bed_address = frame.target
+                self._initialized = True
+                return
+        raise ValueError("MCR bind response omitted assigned addresses")
 
+    async def _idle_pump_after_cancel(self) -> None:
+        token = asyncio.Event()
+        deadline = asyncio.timeout(_PUMP_CLEANUP_TIMEOUT_SECONDS)
         try:
-            await self._async_send_frame(
-                command_type=_MCR_CMD_PUMP,
-                status=_MCR_STATUS_PUMP,
-                function_code=_MCR_FUNC_INIT,
-                side=0,
-                payload=b"\x00" * 8,
-                sub_address=0x0000,
-                timeout=_INIT_HANDSHAKE_TIMEOUT_SECONDS,
-                accept_any_response=True,
-            )
-        except _ResponseTimeout:
-            # The write reached the transport but the bed sent no echo. Some
-            # BAM/MCR firmware does not echo the init frame; the write itself
-            # primes the bed, so proceed as long as the link is still up.
-            client = self.client
-            if client is None or not client.is_connected:
+            async with deadline:
+                await self._mcr_request(2, 2, cancel_event=token)
+                while True:
+                    await asyncio.sleep(0.5)
+                    await self._async_read_pump_status(cancel_event=token)
+                    if not self._state.get("pump_adjusting", False):
+                        return
+        except TimeoutError as exc:
+            if not deadline.expired():
                 raise
-            _LOGGER.debug(
-                "Sleep Number MCR init handshake received no echo from %s; "
-                "proceeding (BLE link still up)",
-                self._coordinator.address,
-            )
+            raise TimeoutError(
+                "Could not confirm that the Sleep Number pump stopped before the cleanup "
+                "deadline; check the bed and its Bluetooth connection"
+            ) from exc
 
-        self._initialized = True
-
-    async def _async_read_pump_status(self) -> None:
+    async def _async_read_pump_status(self, *, cancel_event: asyncio.Event | None = None) -> None:
         """Read both side firmness values and publish them."""
         frames = await self._async_send_frame(
             command_type=_MCR_CMD_PUMP,
             status=_MCR_STATUS_PUMP,
             function_code=_MCR_FUNC_READ,
-            side=_MCR_SIDE_ALL,
-            timeout=5.0,
-            require_response=False,
+            side=0,
+            timeout=0.9,
+            require_response=True,
+            cancel_event=cancel_event,
         )
 
         for frame in frames:
-            if frame.function_code != _MCR_FUNC_READ or len(frame.payload) < 5:
+            if frame.function_code != _MCR_FUNC_READ or len(frame.payload) < 3:
                 continue
+            if frame.side not in (0, 1):
+                raise ValueError("Invalid pump chamber configuration")
+            self._pressure_sides = (
+                ("right", "left")
+                if frame.side == 1
+                and all(self._chambers_present)
+                and 1 not in self._chambers.values()
+                else ("right",)
+            )
+            self._publish(
+                {"pump_adjusting": frame.payload[0] != 0, "pump_dual_chamber": frame.side == 1}
+            )
             self._sleep_numbers["left"] = frame.payload[1]
             self._sleep_numbers["right"] = frame.payload[2]
             self.forward_controller_state_updates(
@@ -519,15 +650,12 @@ class SleepNumberMcrController(BedController):
             status=_MCR_STATUS_FOUNDATION,
             function_code=_MCR_FUNC_FOUNDATION_LIGHT_READ,
             side=_MCR_OUTLET_UNDERBED_LIGHT,
-            timeout=5.0,
-            require_response=False,
+            timeout=0.9,
+            require_response=True,
         )
 
         for frame in frames:
-            if (
-                frame.function_code == _MCR_FUNC_FOUNDATION_LIGHT_READ
-                and len(frame.payload) >= 1
-            ):
+            if frame.function_code == _MCR_FUNC_FOUNDATION_LIGHT_READ and len(frame.payload) >= 1:
                 self._under_bed_lights_on = bool(frame.payload[0])
                 self.forward_controller_state_updates(
                     {"under_bed_lights_on": self._under_bed_lights_on}
@@ -545,12 +673,636 @@ class SleepNumberMcrController(BedController):
             function_code=_MCR_FUNC_FOUNDATION_OUTLET,
             side=_MCR_OUTLET_UNDERBED_LIGHT,
             payload=bytes([1 if is_on else 0, 0, 0]),
-            timeout=5.0,
-            require_response=False,
+            timeout=0.9,
+            require_response=True,
         )
 
         self._under_bed_lights_on = is_on
         self.forward_controller_state_updates({"under_bed_lights_on": is_on})
+
+    @property
+    def supports_position_feedback(self) -> bool:
+        return self._foundation_features is not None
+
+    @property
+    def reports_percentage_position(self) -> bool:
+        return True
+
+    @property
+    def supports_direct_position_control(self) -> bool:
+        return self._foundation_features is not None
+
+    @property
+    def motor_control_specs(self) -> tuple[MotorControlSpec, ...]:
+        axes = (
+            ("back", "legs")
+            if self._foundation_features and self._foundation_features.foot
+            else ("back",)
+        )
+        return tuple(
+            MotorControlSpec(
+                key=f"{axis}_{side}",
+                translation_key=f"{axis}_{side}",
+                position_key=f"{side}_{axis}",
+                max_angle=100,
+                open_fn=_motor_command(side, axis, "up"),
+                close_fn=_motor_command(side, axis, "down"),
+                stop_fn=_motor_command(side, axis, "stop"),
+            )
+            for side in self.foundation_preset_sides
+            for axis in axes
+        )
+
+    @property
+    def position_number_specs(self) -> tuple[PositionNumberSpec, ...]:
+        return tuple(
+            PositionNumberSpec(
+                key=spec.key.replace("_", "_position_", 1),
+                translation_key=spec.key.replace("_", "_position_", 1),
+                position_key=spec.position_key or spec.key,
+                icon="mdi:bed",
+                native_max_value=100,
+                native_unit_of_measurement=POSITION_UNIT_PERCENT,
+                open_fn=spec.open_fn,
+                close_fn=spec.close_fn,
+                stop_fn=spec.stop_fn,
+            )
+            for spec in self.motor_control_specs
+        )
+
+    async def read_positions(self, motor_count: int = 2) -> None:
+        await self._read_foundation()
+
+    async def set_motor_position(self, motor: str, position: int) -> None:
+        if motor.startswith(("left_", "right_")):
+            side, motor = motor.split("_", 1)
+        else:
+            side = self.command_side or "right"
+        if motor not in ("head", "back", "legs", "feet"):
+            raise ValueError("Unknown motor")
+        if not 0 <= position <= 100:
+            raise ValueError("Position must be 0..100")
+        await self._set_position(side, "head" if motor in ("head", "back") else "foot", position)
+
+    def angle_to_native_position(self, motor: str, angle: float) -> int:
+        return max(0, min(100, round(angle)))
+
+    @property
+    def supports_footwarming_climate(self) -> bool:
+        return bool(self.footwarming_climate_sides)
+
+    async def turn_footwarming_on_for_side(self, side: str) -> None:
+        await self.set_footwarming_preset_for_side(side, "low")
+
+    async def turn_footwarming_off_for_side(self, side: str) -> None:
+        await self.set_footwarming_preset_for_side(side, "off")
+
+    async def set_footwarming_preset_for_side(self, side: str, preset: str) -> None:
+        levels = {"off": 0, "low": 1, "medium": 2, "high": 3}
+        if preset not in levels:
+            raise ValueError("Unknown foot warming preset")
+        timer = self._state.get(f"foot_warming_timer_{side}", 120)
+        duration = timer if isinstance(timer, int) and timer > 0 else 120
+        await self.set_footwarming_for_side(side, levels[preset], duration if levels[preset] else 0)
+
+    @property
+    def supports_massage(self) -> bool:
+        return bool(self._foundation_features and self._foundation_features.massage)
+
+    @property
+    def auto_enable_massage(self) -> bool:
+        return self.supports_massage
+
+    @property
+    def footwarming_climate_sides(self) -> tuple[str, ...]:
+        return (
+            (("right", "left") if len(self._pressure_sides) == 2 else ("left",))
+            if self._foundation_features and self._foundation_features.warming
+            else ()
+        )
+
+    def _publish(self, updates: dict[str, object]) -> None:
+        for side in set(self.foundation_preset_sides) | set(self.footwarming_climate_sides):
+            for axis, key in (("head", "back"), ("foot", "legs")):
+                value = updates.get(f"foundation_{axis}_{side}")
+                if isinstance(value, (int, float)) and self._notify_callback is not None:
+                    self._notify_callback(f"{side}_{key}", float(value))
+            level = updates.get(f"foot_warming_temperature_{side}")
+            if isinstance(level, int):
+                updates[f"footwarming_hvac_mode_{side}"] = "heat" if level else "off"
+                updates[f"footwarming_preset_{side}"] = ("off", "low", "medium", "high")[level]
+                updates[f"footwarming_level_{side}"] = level
+                duration = updates.get(f"foot_warming_timer_{side}")
+                if isinstance(duration, int):
+                    updates[f"footwarming_remaining_time_minutes_{side}"] = duration
+        self._state.update(updates)
+        self.forward_controller_state_updates(updates)
+
+    async def _mcr_request(
+        self,
+        node: int,
+        opcode: int,
+        sub: int = 0,
+        payload: bytes = b"",
+        *,
+        cancel_event: asyncio.Event | None = None,
+    ) -> bytes:
+        frames = await self._async_send_frame(
+            command_type=node,
+            status=node,
+            function_code=opcode,
+            side=sub,
+            payload=payload,
+            timeout=1.8 if opcode == 0x1D and sub in (9, 10, 11, 12, 13, 14) else 0.9,
+            cancel_event=cancel_event,
+        )
+        if not frames:
+            raise ValueError("MCR response is empty")
+        frame = frames[0]
+        if node == 0x52 and (
+            frame.side == 15 or opcode == 0x1D and sub in (1, 2) and frame.side == 14
+        ):
+            raise ValueError("Sleep Expert rejected the request")
+        return frame.payload
+
+    async def _se_read(self, key: str) -> bytes:
+        key_bytes = key.encode("ascii")
+        if key not in ("SREL", "SRFS"):
+            frames = await self._async_send_frame(
+                command_type=0x52, status=0x52, function_code=0x1C, side=0, payload=key_bytes
+            )
+            if not frames:
+                raise ValueError("Sleep Expert read returned no reply")
+            if frames[0].side == 15:
+                raise ValueError("Sleep Expert read rejected")
+            if frames[0].side != 14:
+                return frames[0].payload
+        header = await self._mcr_request(0x52, 0x1D, 2, key_bytes)
+        if len(header) != 8:
+            raise ValueError("Invalid Sleep Expert long read header")
+        crc, length = struct.unpack(">II", header)
+        if length > 1024 * 1024:
+            raise ValueError("Sleep Expert response exceeds safe allocation bound")
+        data = bytearray()
+        empty = 0
+        index = 0
+        while len(data) < length:
+            chunk = await self._mcr_request(0x52, 0x1D, 12 + index % 3)
+            empty = empty + 1 if not chunk else 0
+            if empty >= 3 or len(data) + len(chunk) > length:
+                raise ValueError("Invalid Sleep Expert long read chunk")
+            data.extend(chunk)
+            index += 1
+        if zlib.crc32(data) != crc:
+            raise ValueError("Sleep Expert CRC32 mismatch")
+        return bytes(data)
+
+    async def _se_write(
+        self, key: str, value: bytes, *, cancel_event: asyncio.Event | None = None
+    ) -> None:
+        """All exposed control values fit the artifact's safe short-write boundary."""
+        if len(key) != 4 or len(value) > 11:
+            raise ValueError("Sleep Expert short value must fit eleven bytes")
+        await self._mcr_request(
+            0x52, 0x1B, payload=key.encode("ascii") + value, cancel_event=cancel_event
+        )
+
+    async def _read_foundation(self) -> dict[str, object]:
+        state = decode_foundation(await self._mcr_request(0x42, 0x12))
+        self._publish(state)
+        return state
+
+    async def _read_favorites(self) -> dict[str, object]:
+        payload = await self._mcr_request(2, 0x14)
+        require_payload(payload, 2)
+        state: dict[str, object] = {
+            "sleep_number_favorite_right": payload[0],
+            "sleep_number_favorite_left": payload[1],
+        }
+        self._publish(state)
+        return state
+
+    async def _read_massage(self, side: str) -> dict[str, object]:
+        state = decode_massage(await self._mcr_request(0x42, 0x1A, self._side_value(side)), side)
+        self._publish(state)
+        if side not in self._massage_sides:
+            self._massage_sides = (*self._massage_sides, side)
+        return state
+
+    async def _read_warming(self, side: str) -> dict[str, object]:
+        payload = await self._mcr_request(0x42, 0x2A, self._side_value(side))
+        require_payload(payload, 3)
+        level = {31: 1, 57: 2, 72: 3}.get(payload[0], 0)
+        state: dict[str, object] = {
+            f"foot_warming_temperature_{side}": level,
+            f"foot_warming_timer_{side}": int.from_bytes(payload[1:3], "little", signed=True),
+        }
+        self._publish(state)
+        return state
+
+    async def _stop_side(self, side: str) -> None:
+        await self._se_write(
+            "MFHL" if side == "left" else "MFHR", b"110", cancel_event=asyncio.Event()
+        )
+
+    async def _stop_sides(self, sides: tuple[str, ...]) -> None:
+        failure: BaseException | None = None
+        for side in sides:
+            try:
+                await self._stop_side(side)
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
+
+    async def _set_position(self, side: str, axis: str, position: int) -> None:
+        self._require_foundation(side, axis)
+        key = ("MFU" if axis == "head" else "MFF") + ("L" if side == "left" else "R")
+        try:
+            await self._se_write(key, f"{position}_0".encode("ascii"))
+        except BaseException:
+            await self._stop_side(side)
+            raise
+
+    async def _move_axis(self, axis: str, target: int) -> None:
+        """One absolute microadjust, wait for the requested hold, always release."""
+        sides = (self.command_side,) if self.command_side else self.foundation_preset_sides
+        for side in sides:
+            self._require_foundation(side, axis)
+        try:
+            for side in sides:
+                payload = bytearray(b"\xff" * 12)
+                offset = 0 if axis == "head" else 2
+                payload[offset : offset + 2] = bytes((target, 0))
+                await self._mcr_request(0x42, 0x11, self._side_value(side), bytes(payload))
+            count, delay = self.motor_pulse_settings()
+            try:
+                await asyncio.wait_for(
+                    self._coordinator.cancel_command.wait(), count * delay / 1000
+                )
+            except TimeoutError:
+                pass
+        finally:
+            await self._stop_sides(sides)
+
+    def _require_foundation(self, side: str, axis: str | None = None) -> None:
+        if not self._foundation_features or side not in self._foundation_features.sides:
+            raise ValueError("Foundation side is not present")
+        if axis == "foot" and not self._foundation_features.foot:
+            raise ValueError("Foundation has no foot actuator")
+
+    async def _change_massage(
+        self, field: str, *, step: int | None = None, toggle: bool = False
+    ) -> None:
+        if not self.supports_massage:
+            raise ValueError("Massage unavailable")
+        sides = (self.command_side,) if self.command_side else self._massage_sides
+        for side in sides:
+            status = await self._read_massage(side)
+            current = status[f"massage_{field}_{side}"]
+            if not isinstance(current, int):
+                raise ValueError("Invalid massage state")
+            level = (0 if current else 1) if toggle else max(0, min(3, current + (step or 0)))
+            await self.async_execute_sleep_number_command("massage", {"side": side, field: level})
+            await self._read_massage(side)
+
+    async def massage_toggle(self) -> None:
+        await self._change_massage("head", toggle=True)
+        await self._change_massage("foot", toggle=True)
+
+    async def massage_head_toggle(self) -> None:
+        await self._change_massage("head", toggle=True)
+
+    async def massage_foot_toggle(self) -> None:
+        await self._change_massage("foot", toggle=True)
+
+    async def massage_head_up(self) -> None:
+        await self._change_massage("head", step=1)
+
+    async def massage_head_down(self) -> None:
+        await self._change_massage("head", step=-1)
+
+    async def massage_foot_up(self) -> None:
+        await self._change_massage("foot", step=1)
+
+    async def massage_foot_down(self) -> None:
+        await self._change_massage("foot", step=-1)
+
+    async def massage_intensity_up(self) -> None:
+        await self.massage_head_up()
+        await self.massage_foot_up()
+
+    async def massage_intensity_down(self) -> None:
+        await self.massage_head_down()
+        await self.massage_foot_down()
+
+    async def massage_mode_step(self) -> None:
+        if not self.supports_massage:
+            raise ValueError("Massage unavailable")
+        for side in (self.command_side,) if self.command_side else self._massage_sides:
+            status = await self._read_massage(side)
+            mode = status[f"massage_mode_{side}"]
+            if not isinstance(mode, int):
+                raise ValueError("Invalid massage mode")
+            await self.async_execute_sleep_number_command(
+                "massage", {"side": side, "mode": (mode + 1) % 4}
+            )
+
+    async def massage_off(self) -> None:
+        for side in (self.command_side,) if self.command_side else self._massage_sides:
+            await self.async_execute_sleep_number_command(
+                "massage", {"side": side, "head": 0, "foot": 0, "mode": 0}
+            )
+
+    async def set_footwarming_for_side(self, side: str, level: int, timer: int = 120) -> None:
+        await self.async_execute_sleep_number_command(
+            "foot_warming", {"side": side, "level": level, "duration": timer}
+        )
+
+    @property
+    def sleep_number_command_names(self) -> tuple[str, ...]:
+        return tuple(_COMMAND_FIELDS)
+
+    def validate_sleep_number_command(self, command: str, parameters: Mapping[str, object]) -> None:
+        fields = _COMMAND_FIELDS.get(command)
+        if fields is None:
+            raise ValueError(f"Unsupported Sleep Number MCR command: {command}")
+        required, optional = fields
+        if parameters.keys() - (required | optional) or required - parameters.keys():
+            raise ValueError(
+                f"Invalid parameters for {command}; required: {sorted(required)}, optional: {sorted(optional)}"
+            )
+        for name, value in parameters.items():
+            if name == "side":
+                if value not in ("left", "right"):
+                    raise ValueError("side must be left or right")
+            elif name == "axis":
+                if value not in ("head", "foot"):
+                    raise ValueError("axis must be head or foot")
+            elif name == "preset":
+                if not isinstance(value, str) or value not in _SLEEP_NUMBER_MCR_PRESETS:
+                    raise ValueError("Unknown foundation preset")
+            elif name in ("enabled", "outlet_on", "light_on"):
+                if not isinstance(value, bool):
+                    raise ValueError(f"{name} must be boolean")
+            elif name == "level":
+                if type(value) is not int or not 0 <= value <= 3:
+                    raise ValueError("level must be 0..3")
+            elif name in ("head", "foot", "mode"):
+                if type(value) is not int or not 0 <= value <= 3:
+                    raise ValueError(f"{name} must be 0..3")
+            elif name in ("position", "firmness"):
+                if type(value) is not int or not 0 <= value <= 100:
+                    raise ValueError(f"{name} must be 0..100")
+                if name == "firmness" and (value < 5 or value % 5):
+                    raise ValueError("firmness must be 5..100 in increments of 5")
+            elif name in ("duration", "timer"):
+                if type(value) is not int or not 0 <= value <= 32767:
+                    raise ValueError(f"{name} must be 0..32767")
+            elif name in ("outlet", "device"):
+                if type(value) is not int or not (1 if name == "outlet" else 0) <= value <= (
+                    4 if name == "outlet" else 15
+                ):
+                    raise ValueError(f"Invalid {name} selector")
+            elif name == "intensity":
+                if type(value) is not int or value not in (1, 30, 45, 75, 100):
+                    raise ValueError("Unsupported light intensity")
+        side = str(parameters.get("side", "right"))
+        if self.command_side is not None and "side" in parameters and side != self.command_side:
+            raise ValueError("Command side cannot override the selected bed side")
+        if (
+            command in ("firmness_favorite", "responsive_air")
+            and side not in self.sleep_number_setting_sides
+        ):
+            raise ValueError("Pressure side is not present")
+        if command in _FOUNDATION_COMMANDS and command not in (
+            "foot_warming",
+            "foot_warming_status",
+            "massage",
+            "massage_status",
+            "light_intensity",
+        ):
+            self._require_foundation(
+                side, str(parameters["axis"]) if "axis" in parameters else None
+            )
+        if command in ("massage", "massage_status") and (
+            not self.supports_massage or side not in self._massage_sides
+        ):
+            raise ValueError("Foundation does not support massage")
+        if (
+            command in ("foot_warming", "foot_warming_status")
+            and side not in self.footwarming_climate_sides
+        ):
+            raise ValueError("Foundation does not support foot warming")
+        if (
+            command in ("kid_outlet", "kid_outlet_status", "head_tilt")
+            and 2 not in self._chambers.values()
+        ):
+            raise ValueError("Bed does not have a head-tilt/K2 chamber")
+        if command in ("responsive_air", "responsive_air_status") and self._pump_model != "360":
+            raise ValueError("Responsive Air requires a discovered 360 pump")
+        if (
+            command
+            in (
+                "responsive_air",
+                "responsive_air_status",
+                "software_versions",
+                "underbed_auto",
+                "underbed_auto_status",
+            )
+            and 0x51 not in self._nodes
+        ):
+            raise ValueError("Sleep Expert node is absent")
+        if command in ("outlet", "outlet_status", "light_intensity"):
+            if not self._foundation_features:
+                raise ValueError("Foundation unavailable")
+            if command == "light_intensity":
+                allowed = ({1, 30, 100} if self._foundation_features.light else set()) | (
+                    {45, 75, 100} if self._foundation_features.massage else set()
+                )
+                if (
+                    not (self._foundation_features.light or self._foundation_features.massage)
+                    or parameters["intensity"] not in allowed
+                ):
+                    raise ValueError("Light intensity is not supported by this foundation")
+            elif parameters["outlet"] == 3 and self._foundation_features.light:
+                pass
+            elif not self._foundation_features.massage:
+                raise ValueError("Legacy lighting/outlets are not supported")
+        if command in ("underbed_auto", "underbed_auto_status") and not self.supports_lights:
+            raise ValueError("Under-bed lighting unavailable")
+        if command == "massage" and not (parameters.keys() & {"head", "foot", "mode", "timer"}):
+            raise ValueError("massage requires at least one setting")
+        if command == "kid_outlet" and not (parameters.keys() & {"outlet_on", "light_on"}):
+            raise ValueError("kid_outlet requires an outlet or light setting")
+        if (
+            command in ("preset_save", "preset_reset", "preset_timer")
+            and parameters["preset"] not in self.foundation_preset_options
+        ):
+            raise ValueError("Preset is not supported by the foundation")
+        if command == "sense_and_do" or command == "sense_and_do_status":
+            if 0x31 not in self._nodes:
+                raise ValueError("Sense-and-do node is absent")
+
+    async def async_execute_sleep_number_command(
+        self, command: str, parameters: Mapping[str, object]
+    ) -> dict[str, object]:
+        """Execute an allowlisted semantic operation inside coordinator locking."""
+        self.validate_sleep_number_command(command, parameters)
+        side = str(parameters.get("side", "right"))
+        sub = self._side_value(side)
+
+        # Schema validation above ensures these scalar conversions are safe.
+        def number(name: str, default: int = 0) -> int:
+            value = parameters.get(name, default)
+            if not isinstance(value, int):
+                raise ValueError(f"{name} must be an integer")
+            return value
+
+        if command == "mcr_status":
+            await self.query_config()
+            return dict(self._state)
+        if command == "foundation_status":
+            return await self._read_foundation()
+        if command == "position":
+            await self._set_position(side, str(parameters["axis"]), number("position"))
+        elif command == "stop":
+            await self._stop_side(side)
+        elif command == "preset_save":
+            await self._mcr_request(
+                0x42, 0x16, sub, bytes((_SLEEP_NUMBER_MCR_PRESETS[str(parameters["preset"])],))
+            )
+        elif command == "preset_reset":
+            await self._se_write(
+                "MFRL" if side == "left" else "MFRR",
+                str(_SLEEP_NUMBER_MCR_PRESETS[str(parameters["preset"])]).encode(),
+            )
+        elif command == "preset_timer":
+            payload = bytearray(b"\xff" * 12)
+            payload[7:9] = number("timer").to_bytes(2, "little")
+            payload[9] = _SLEEP_NUMBER_MCR_PRESETS[str(parameters["preset"])]
+            await self._mcr_request(0x42, 0x11, sub, bytes(payload))
+        elif command == "firmness_favorite":
+            await self._mcr_request(2, 0x13, sub, bytes((number("firmness"),)))
+        elif command == "firmness_favorites":
+            return await self._read_favorites()
+        elif command == "responsive_air":
+            await self._se_write(
+                "LRLE" if side == "left" else "LRRE",
+                int(bool(parameters["enabled"])).to_bytes(4, "big"),
+            )
+        elif command == "responsive_air_status":
+            reply = await self._se_read("LRSG")
+            require_payload(reply, 1)
+            result: dict[str, object] = {
+                "responsive_air_right": bool(reply[0] & 1),
+                "responsive_air_left": bool(reply[0] & 2),
+            }
+            self._publish(result)
+            return result
+        elif command == "massage":
+            payload = bytearray(b"\xff" * 12)
+            for name, offset in (("head", 4), ("foot", 5), ("mode", 6)):
+                if name in parameters:
+                    payload[offset] = number(name)
+            if "mode" not in parameters and parameters.keys() & {"head", "foot"}:
+                payload[6] = 0
+            if "timer" in parameters and number("timer") != 255:
+                payload[10:12] = number("timer").to_bytes(2, "little")
+            await self._mcr_request(0x42, 0x11, sub, bytes(payload))
+        elif command == "massage_status":
+            return await self._read_massage(side)
+        elif command == "foot_warming":
+            duration = number("duration", 120 if number("level") else 0)
+            warming_sides = (
+                (side, "right" if side == "left" else "left")
+                if self._pump_model == "360" and len(self._pressure_sides) == 1
+                else (side,)
+            )
+            for warming_side in warming_sides:
+                await self._mcr_request(
+                    0x42,
+                    0x29,
+                    self._side_value(warming_side),
+                    bytes(((0, 31, 57, 72)[number("level")],)) + duration.to_bytes(2, "little"),
+                )
+                self._publish(
+                    {
+                        f"foot_warming_temperature_{warming_side}": number("level"),
+                        f"foot_warming_timer_{warming_side}": duration,
+                    }
+                )
+        elif command == "foot_warming_status":
+            return await self._read_warming(side)
+        elif command == "outlet":
+            await self._mcr_request(
+                0x42,
+                0x13,
+                number("outlet"),
+                bytes((int(bool(parameters["enabled"])),))
+                + number("duration").to_bytes(2, "little"),
+            )
+        elif command == "outlet_status":
+            reply = await self._mcr_request(0x42, 0x14, number("outlet"))
+            require_payload(reply, 3)
+            return {
+                "enabled": bool(reply[0]),
+                "duration": int.from_bytes(reply[1:3], "little", signed=True),
+            }
+        elif command == "light_intensity":
+            payload = bytearray(b"\xff\xff\xff")
+            payload[1 if side == "right" else 2] = number("intensity")
+            await self._mcr_request(0x42, 0x24, payload=bytes(payload))
+        elif command == "underbed_auto":
+            await self._se_write("MUAS", bytes((int(bool(parameters["enabled"])),)))
+        elif command == "underbed_auto_status":
+            reply = await self._se_read("MUAG")
+            value = 0
+            for byte in reply[:4]:
+                value = (value << 8) + (byte if byte < 128 else byte - 256)
+            return {"enabled": value == 1}
+        elif command == "pinch_status":
+            return decode_pinch(await self._mcr_request(0x42, 0x28))
+        elif command == "sense_and_do":
+            await self._mcr_request(
+                0x32, 0x14, payload=bytes((1, 0 if parameters["enabled"] else 1))
+            )
+        elif command == "sense_and_do_status":
+            reply = await self._mcr_request(0x32, 0x12)
+            require_payload(reply, 2)
+            return {"enabled": reply[1] == 0}
+        elif command == "kid_outlet":
+            await self._mcr_request(
+                0x92,
+                0x13,
+                number("device"),
+                bytes(
+                    (
+                        int(bool(parameters["outlet_on"])) if "outlet_on" in parameters else 255,
+                        int(bool(parameters["light_on"])) if "light_on" in parameters else 255,
+                        0,
+                    )
+                ),
+            )
+        elif command == "kid_outlet_status":
+            reply = await self._mcr_request(0x92, 0x12)
+            require_payload(reply, number("device") + 1)
+            value = reply[number("device")]
+            return {
+                "light_on": bool(value & 2),
+                "outlet_on": bool(value & 1),
+                "status_update_requested": bool(value & 4),
+                "in_use": not bool(value & 16),
+            }
+        elif command == "head_tilt":
+            tilt_side = "left" if self._chambers.get("left") == 2 else "right"
+            await self._set_sleep_number_for_chamber(tilt_side, 100 if parameters["enabled"] else 5)
+        elif command == "software_versions":
+            bammit = (await self._se_read("SREL")).decode("utf-8", errors="replace")
+            rfs = (await self._se_read("SRFS")).decode("utf-8", errors="replace")
+            return {"bammit": bammit, "rfs": rfs, "software": bammit.split("_")[0].replace("Z", "")}
+        return {}
 
     async def _async_send_frame(
         self,
@@ -561,7 +1313,41 @@ class SleepNumberMcrController(BedController):
         side: int,
         payload: bytes = b"",
         sub_address: int | None = None,
-        timeout: float = 5.0,
+        timeout: float = 0.9,
+        cancel_event: asyncio.Event | None = None,
+        require_response: bool = True,
+        accept_any_response: bool = False,
+    ) -> list[_McrFrame]:
+        """Retry a missing response three times, as the MCR BlobCall does."""
+        for attempt in range(4):
+            try:
+                return await self._async_send_frame_once(
+                    command_type=command_type,
+                    status=status,
+                    function_code=function_code,
+                    side=side,
+                    payload=payload,
+                    sub_address=sub_address,
+                    timeout=timeout,
+                    cancel_event=cancel_event,
+                    require_response=require_response,
+                    accept_any_response=accept_any_response,
+                )
+            except _ResponseTimeout:
+                if attempt == 3:
+                    raise
+        raise AssertionError("Unreachable MCR retry state")
+
+    async def _async_send_frame_once(
+        self,
+        *,
+        command_type: int,
+        status: int,
+        function_code: int,
+        side: int,
+        payload: bytes = b"",
+        sub_address: int | None = None,
+        timeout: float = 0.9,
         cancel_event: asyncio.Event | None = None,
         require_response: bool = True,
         accept_any_response: bool = False,
@@ -591,6 +1377,7 @@ class SleepNumberMcrController(BedController):
             side=side,
             payload=payload,
             sub_address=self._bed_address if sub_address is None else sub_address,
+            client_address=self._client_address,
         )
         request_key = self._request_key(function_code, side)
         await self._async_wait_for_response_quarantine(
@@ -599,6 +1386,7 @@ class SleepNumberMcrController(BedController):
         # Set correlation BEFORE clearing state, so any in-flight notification
         # parsing on the event loop sees the new key.
         self._outstanding_request_key = request_key
+        self._outstanding_node = command_type
         self._accept_any_response = accept_any_response
         self._response_buffer.clear()
         self._response_frames.clear()
@@ -607,7 +1395,9 @@ class SleepNumberMcrController(BedController):
         try:
             await self._async_write_frame(frame, cancel_event=cancel_event)
 
-            coordinator_cancel = self._coordinator.cancel_command
+            coordinator_cancel = (
+                cancel_event if cancel_event is not None else self._coordinator.cancel_command
+            )
             response_task = asyncio.create_task(self._response_event.wait())
             cancel_tasks: list[asyncio.Task[bool]] = [
                 asyncio.create_task(coordinator_cancel.wait())
@@ -616,9 +1406,7 @@ class SleepNumberMcrController(BedController):
                 cancel_tasks.append(asyncio.create_task(cancel_event.wait()))
 
             response_timeout = (
-                timeout
-                if require_response
-                else min(timeout, _OPTIONAL_RESPONSE_GRACE_SECONDS)
+                timeout if require_response else min(timeout, _OPTIONAL_RESPONSE_GRACE_SECONDS)
             )
 
             try:
@@ -631,9 +1419,9 @@ class SleepNumberMcrController(BedController):
                 for task in (response_task, *cancel_tasks):
                     if not task.done():
                         task.cancel()
-                for task in (response_task, *cancel_tasks):
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await task
+                # Collect child cancellation without swallowing cancellation of
+                # this request (including the pump-cleanup deadline).
+                await asyncio.gather(response_task, *cancel_tasks, return_exceptions=True)
 
             if not done:
                 if not require_response:
@@ -661,40 +1449,29 @@ class SleepNumberMcrController(BedController):
             return list(self._response_frames)
         finally:
             self._outstanding_request_key = None
+            self._outstanding_node = None
             self._accept_any_response = False
 
     async def _async_write_frame(
         self, frame: bytes, *, cancel_event: asyncio.Event | None = None
     ) -> None:
-        """Write an MCR frame to the bed.
-
-        ESPHome BLE proxies silently drop write-without-response packets for
-        this characteristic, so we use write-with-response.  The characteristic
-        only advertises write-without-response in its GATT properties, but
-        ESPHome's ESP-IDF BLE stack requires the response handshake to
-        reliably forward the data to the physical device.
-
-        If write-with-response fails (e.g. direct local Bluetooth adapter
-        enforcing the GATT property), fall back to write-without-response.
-        """
-        try:
+        """Use advertised write properties and fragment at the negotiated ATT MTU."""
+        client = self.client
+        if client is None:
+            raise ConnectionError("Not connected to bed")
+        characteristic = client.services.get_characteristic(SLEEP_NUMBER_MCR_RX_CHAR_UUID)
+        properties = characteristic.properties if characteristic is not None else ()
+        response = "write" in properties
+        if not response and "write-without-response" not in properties:
+            raise ValueError("MCR characteristic has no writable property")
+        mtu = client.mtu_size
+        size = max(1, mtu - 3) if isinstance(mtu, int) else 20
+        for offset in range(0, len(frame), size):
             await self._write_gatt_with_retry(
                 SLEEP_NUMBER_MCR_RX_CHAR_UUID,
-                frame,
+                frame[offset : offset + size],
                 cancel_event=cancel_event,
-                response=True,
-            )
-        except (BleakError, TimeoutError, OSError) as exc:
-            _LOGGER.debug(
-                "Write-with-response failed for MCR frame (%s), "
-                "falling back to write-without-response",
-                exc,
-            )
-            await self._write_gatt_with_retry(
-                SLEEP_NUMBER_MCR_RX_CHAR_UUID,
-                frame,
-                cancel_event=cancel_event,
-                response=False,
+                response=response,
             )
 
     def _handle_mcr_notification(self, _sender: object, data: bytearray) -> None:
@@ -751,20 +1528,21 @@ class SleepNumberMcrController(BedController):
         frame: _McrFrame,
         request_key: tuple[int, int],
     ) -> bool:
-        """Return True when ``frame`` is the response to ``request_key``.
-
-        Correlates by **function code only**, mirroring the reference
-        implementation that works against this hardware (it parses responses by
-        ``hdr[8] & 0x7F`` and never checks the response bit or side nibble). The
-        bed is purely request/response with a single outstanding request at a
-        time, so the function code is enough to confirm a reply. Some BAM/MCR
-        firmware replies without the response bit set (``byte 8 & 0x80``) and
-        echoes a different side nibble than the request was sent with;
-        requiring either would discard otherwise-valid responses — the same
-        root cause that broke the init handshake (issue #322).
-        """
-        expected_func, _expected_side = request_key
-        return frame.function_code == expected_func
+        """Match negotiated addresses and opcode, plus SE chunk selectors."""
+        expected_func, expected_side = request_key
+        if self._outstanding_node is not None and (frame.command_type & 0xF0) != (
+            self._outstanding_node & 0xF0
+        ):
+            return False
+        if not frame.is_response or frame.sub_address != self._client_address:
+            return False
+        if frame.sub_address == 0:
+            return frame.function_code == expected_func
+        if frame.echo != self._bed_address or frame.function_code != expected_func:
+            return False
+        if expected_func == 0x1D and expected_side in (9, 10, 11, 12, 13, 14):
+            return frame.side == expected_side or frame.side == 15
+        return True
 
     @staticmethod
     def _request_key(function_code: int, side: int) -> tuple[int, int]:
@@ -788,9 +1566,7 @@ class SleepNumberMcrController(BedController):
         if current_deadline is None or deadline > current_deadline:
             self._quarantined_response_keys[request_key] = deadline
 
-    def _matching_quarantined_request_key(
-        self, frame: _McrFrame
-    ) -> tuple[int, int] | None:
+    def _matching_quarantined_request_key(self, frame: _McrFrame) -> tuple[int, int] | None:
         """Return the quarantined request key that ``frame`` matches, if any."""
         self._prune_response_quarantine()
         for request_key in self._quarantined_response_keys:
@@ -826,7 +1602,9 @@ class SleepNumberMcrController(BedController):
                 side,
             )
 
-            coordinator_cancel = self._coordinator.cancel_command
+            coordinator_cancel = (
+                cancel_event if cancel_event is not None else self._coordinator.cancel_command
+            )
             wait_task = asyncio.create_task(asyncio.sleep(remaining))
             cancel_tasks: list[asyncio.Task[bool]] = [
                 asyncio.create_task(coordinator_cancel.wait())
@@ -901,18 +1679,21 @@ class SleepNumberMcrController(BedController):
         side: int,
         payload: bytes,
         sub_address: int,
+        client_address: int = 0,
     ) -> bytes:
         """Build an MCR wire frame."""
+        if len(payload) > 15:
+            raise ValueError("MCR payload exceeds 15 bytes")
         header = bytes(
             [
                 command_type,
-                0x00,
-                0x00,
+                (client_address >> 8) & 0xFF,
+                client_address & 0xFF,
                 (sub_address >> 8) & 0xFF,
                 sub_address & 0xFF,
                 status,
-                0x00,
-                0x00,
+                (client_address >> 8) & 0xFF,
+                client_address & 0xFF,
                 function_code,
                 ((side & 0x0F) << 4) | (len(payload) & 0x0F),
             ]

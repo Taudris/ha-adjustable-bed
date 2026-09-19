@@ -146,6 +146,8 @@ export function bedEntitiesForDevice(
 
       case "number":
         if (key.endsWith("_position")) motor(key.slice(0, -9)).position = id;
+        else if (!selectedSide && split.side && split.key.endsWith("_position"))
+          motor(`${split.key.slice(0, -9)}_${split.side}`).position = id;
         else if (key.startsWith("massage_") && key.endsWith("_intensity"))
           bed.massage.numbers.push(id);
         else if (key === "light_level") bed.lights.level = id;

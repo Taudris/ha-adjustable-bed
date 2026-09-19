@@ -318,7 +318,6 @@ _SIMPLE_CONTROLLERS: Final[dict[str, _ControllerSpec]] = {
     BED_TYPE_NECTAR: _ControllerSpec("okin_7byte", "Okin7ByteController"),
     BED_TYPE_DIAGNOSTIC: _ControllerSpec("diagnostic", "DiagnosticBedController"),
     BED_TYPE_BEDTECH: _ControllerSpec("bedtech", "BedTechController"),
-    BED_TYPE_SLEEP_NUMBER_MCR: _ControllerSpec("sleep_number_mcr", "SleepNumberMcrController"),
     BED_TYPE_SLEEPYS_BOX15: _ControllerSpec("sleepys", "SleepysBox15Controller"),
     BED_TYPE_SLEEPYS_BOX24: _ControllerSpec("sleepys", "SleepysBox24Controller"),
     BED_TYPE_STAR_ELEVATE: _ControllerSpec("star_elevate", "StarElevateController"),
@@ -401,6 +400,11 @@ async def create_controller(
         ValueError: If bed_type is unknown
         ConnectionError: If auto-detection is needed but client is not connected
     """
+    if bed_type == BED_TYPE_SLEEP_NUMBER_MCR:
+        from .beds.sleep_number_mcr import SleepNumberMcrController
+
+        return SleepNumberMcrController(coordinator, manufacturer_data=manufacturer_data)
+
     # Protocol-based bed types (new naming convention)
     if bed_type == BED_TYPE_OKIN_HANDLE:
         if _is_dewertokin_rf_gateway(client, ble_model):

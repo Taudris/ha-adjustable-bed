@@ -227,6 +227,13 @@ These variants apply to newer Sleep Number Fuzion bases (`Smart bed *`). Older B
 | **Left** | Force the left side | Split bases when you want the left side only |
 | **Right** | Force the right side | Split bases when you want the right side only |
 
+When the Fuzion system configuration identifies a single chamber, its protocol
+uses the right-side channel regardless of the default side selection. Optional
+actuators, lighting and thermal controls follow the bed's reported capabilities.
+Older MCR beds likewise expose only the foundation/chamber features discovered
+on the connected hardware. Additional BLE settings, including temperature
+programs, use the [Sleep Number command action](beds/sleep-number-services.md).
+
 ### Okimat Variants
 
 Okimat beds use different remote codes that determine available features and command values.

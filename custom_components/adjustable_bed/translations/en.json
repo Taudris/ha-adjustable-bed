@@ -2606,6 +2606,27 @@
           "name": "Side"
         }
       }
+    },
+    "sleep_number_command": {
+      "name": "Sleep Number command",
+      "description": "Run a validated Sleep Number BLE control or query. Optional response data contains per-side results. See the service documentation for command parameters.",
+      "fields": {
+        "device_id": {
+          "name": "Device"
+        },
+        "side": {
+          "name": "Physical side",
+          "description": "For paired beds, select left, right or both. A child device defaults to its own side."
+        },
+        "command": {
+          "name": "Command",
+          "description": "Only commands supported by the selected bed can run."
+        },
+        "parameters": {
+          "name": "Parameters",
+          "description": "Command-specific fields. Unknown fields and values are rejected. Parameter side cannot override the selected physical side."
+        }
+      }
     }
   },
   "exceptions": {
