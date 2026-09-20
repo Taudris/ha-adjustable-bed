@@ -21,7 +21,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final
 
-from .const import POSITION_OVERSHOOT_TOLERANCE, POSITION_SEEK_TIMEOUT
+from homeassistant.exceptions import HomeAssistantError
+
+from .const import POSITION_FEEDBACK_TIMEOUT, POSITION_OVERSHOOT_TOLERANCE, POSITION_SEEK_TIMEOUT
 
 if TYPE_CHECKING:
     from .beds.base import BedController
@@ -109,6 +111,10 @@ class SeekTimeoutError(TimeoutError):
         self.result = result
 
 
+class PositionFeedbackError(HomeAssistantError):
+    """A seek cannot continue without trustworthy position feedback."""
+
+
 class PositionSeekPolicy:
     """Protocol movement policy for feedback-driven seeking.
 
@@ -143,8 +149,14 @@ class PositionSeekPolicy:
 
     @property
     def cached_position_feedback_max_age(self) -> float:
-        """Return the maximum age of notification feedback used by a seek."""
-        return 0.0
+        """Bound notification age by the same budget as an active read.
+
+        The default still attempts an active read, but notification-only
+        controllers must also be able to use reports received just before it.
+        The coordinator consumes fallback reports once per movement decision.
+        This is an integration freshness bound, not a device reporting cadence.
+        """
+        return POSITION_FEEDBACK_TIMEOUT
 
     @property
     def stall_count(self) -> int:
