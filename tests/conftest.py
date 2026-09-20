@@ -82,7 +82,9 @@ def make_controller_mock(**overrides: object) -> MagicMock:
     from custom_components.adjustable_bed.beds.base import BedController
     from custom_components.adjustable_bed.position_seek import PositionSeekPolicy
 
-    controller = MagicMock()
+    controller = MagicMock(
+        prepare_for_position_read=AsyncMock(), prepare_for_movement=AsyncMock()
+    )
     for name, member in vars(BedController).items():
         if not isinstance(member, property) or member.fget is None:
             continue

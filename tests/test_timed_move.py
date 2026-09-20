@@ -11,7 +11,7 @@ from custom_components.adjustable_bed.services import _timed_move_plan
 
 
 async def build_movement(move, stop, *, duration_ms=50):
-    controller = MagicMock()
+    controller = MagicMock(prepare_for_movement=AsyncMock())
     controller.motor_control_specs = (
         SimpleNamespace(
             key="back", position_key="back", scheduler_resource=None,
@@ -51,6 +51,70 @@ async def test_timed_move_bounds_slow_writes_and_waits_for_release():
     await movement(controller)
     assert 1 <= writes < 10
     assert released.is_set()
+
+
+async def test_timed_move_readiness_does_not_consume_movement_budget():
+    ready = False
+    moved = False
+
+    async def prepare():
+        nonlocal ready
+        await asyncio.sleep(.06)
+        ready = True
+
+    async def move(_controller):
+        nonlocal moved
+        if not ready:
+            await prepare()
+        await asyncio.sleep(.01)
+        moved = True
+
+    stop = AsyncMock()
+    movement, controller = await build_movement(move, stop, duration_ms=30)
+    controller.prepare_for_movement = AsyncMock(side_effect=prepare)
+    await movement(controller)
+    assert moved
+    controller.prepare_for_movement.assert_awaited_once()
+    stop.assert_awaited_once_with(controller)
+
+
+async def test_timed_move_cancel_during_readiness_does_not_start_movement():
+    started, finished = asyncio.Event(), asyncio.Event()
+
+    async def prepare():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            finished.set()
+
+    move, stop = AsyncMock(), AsyncMock()
+    movement, controller = await build_movement(move, stop)
+    controller.prepare_for_movement = AsyncMock(side_effect=prepare)
+    task = asyncio.create_task(movement(controller))
+    try:
+        async with asyncio.timeout(1):
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert finished.is_set()
+    move.assert_not_awaited()
+    stop.assert_awaited_once_with(controller)
+
+
+async def test_timed_move_readiness_failure_is_not_a_successful_deadline():
+    move, stop = AsyncMock(), AsyncMock()
+    movement, controller = await build_movement(move, stop)
+    controller.prepare_for_movement = AsyncMock(side_effect=TimeoutError("readiness failed"))
+    with pytest.raises(TimeoutError, match="readiness failed"):
+        await movement(controller)
+    move.assert_not_awaited()
+    stop.assert_awaited_once_with(controller)
 
 
 @pytest.mark.parametrize("failure", [TimeoutError("transport"), BleakError("write failed")])

@@ -32,8 +32,13 @@ notification requirements, or preset semantics of other beds.
   movements can replace one another, unrelated resources queue, and STOP invalidates
   accepted movement. Non-idempotent operations are not automatically replayed after
   a transport error.
-- A timed service starts its movement budget after coordinator connection
-  preparation. Any controller-local setup inside that movement consumes the budget.
+- A seek completes the controller's position-read preparation before starting
+  its initial feedback timeout. Preparation remains preemptible by STOP and
+  replacement; stale feedback is never substituted for a failed read.
+- A timed service starts its movement budget after connection and the controller's
+  movement preparation. Linak uses its existing readiness handshake here so a
+  cold connection cannot consume the entire movement allowance without moving.
+  Other setup inside a controller's movement still consumes the budget.
   STOP and controller cleanup can extend the total service time. Reaching the
   ceiling is normal; a real transport or cleanup timeout is an error.
 - Linak's readiness window, acknowledged readiness probe, deferred capability

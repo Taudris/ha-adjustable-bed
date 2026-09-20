@@ -5654,10 +5654,17 @@ class AdjustableBedCoordinator:
                 supports_direct_position_control = controller.supports_direct_position_control
 
                 policy = controller.position_seek_policy
+
+                async def read_initial_position() -> float | None:
+                    # Readiness has its own controller-owned budget. Do not
+                    # spend the position-read timeout waiting for cold setup.
+                    await controller.prepare_for_position_read()
+                    return await self._async_read_seek_position(position_key, policy)
+
                 # Session membership alone does not establish freshness, even
                 # before the first movement or an already-at-target decision.
                 current_angle = await self._async_wait_for_controller_operation(
-                    asyncio.create_task(self._async_read_seek_position(position_key, policy)),
+                    asyncio.create_task(read_initial_position()),
                     cancel_event=cancel_event,
                     operation_name="initial position read",
                     raise_on_cancel=False,

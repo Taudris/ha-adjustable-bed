@@ -43,6 +43,7 @@ from custom_components.adjustable_bed.position_seek import (
     SeekResult,
     SeekSample,
 )
+from custom_components.adjustable_bed.services import _timed_move_plan
 
 
 def _written_commands(mock_bleak_client: MagicMock) -> list[bytes]:
@@ -1328,6 +1329,32 @@ class TestLinakMovement:
         mock_bleak_client.write_gatt_char.assert_called_with(
             LINAK_CONTROL_CHAR_UUID, LinakCommands.MOVE_STOP, response=True
         )
+
+
+async def test_timed_move_waits_for_linak_readiness_before_duration(
+    hass, mock_config_entry, mock_coordinator_connected, mock_bleak_client,
+):
+    """A cold start longer than the requested duration must still send movement."""
+    coordinator = AdjustableBedCoordinator(hass, mock_config_entry)
+    await coordinator.async_connect()
+    controller = coordinator.controller
+    ready = False
+
+    async def readiness(*_args, **_kwargs):
+        nonlocal ready
+        if not ready:
+            await asyncio.sleep(.04)
+            ready = True
+
+    with patch.object(controller, "_await_control_ready", side_effect=readiness):
+        movement, _, _, _ = await _timed_move_plan(
+            coordinator, coordinator, [], "back", "up", 20,
+        )
+        await movement(controller)
+
+    commands = _written_commands(mock_bleak_client)
+    assert LinakCommands.MOVE_BACK_UP in commands
+    assert commands[-1] == LinakCommands.MOVE_STOP
 
 
 class TestLinakPresets:

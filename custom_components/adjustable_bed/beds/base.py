@@ -841,7 +841,10 @@ class BedController(ABC):
         raise ValueError(f"Unsupported position key for seek step: {position_key}")
 
     async def prepare_for_position_read(self) -> None:  # noqa: B027 - optional hook, not abstract
-        """Do any controller-specific setup before passive position reads."""
+        """Do controller-specific setup before an initial or passive position read."""
+
+    async def prepare_for_movement(self) -> None:  # noqa: B027 - optional hook, not abstract
+        """Complete controller setup before an externally timed movement starts."""
 
     # Direct position control (optional)
     # Beds that can command motors to specific positions should override these

@@ -1075,9 +1075,10 @@ async def _timed_move_plan(
             _stop_fn: Callable[..., Coroutine[Any, Any, None]] = stop_fn,
         ) -> None:
             """Execute movement for specified duration, always sending stop."""
-            deadline = asyncio.timeout(duration_ms / 1000)
             controller_timed_out = False
             try:
+                await ctrl.prepare_for_movement()
+                deadline = asyncio.timeout(duration_ms / 1000)
                 try:
                     async with deadline:
                         try:

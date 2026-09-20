@@ -1667,7 +1667,11 @@ class LinakController(BedController):
             )
 
     async def prepare_for_position_read(self) -> None:
-        """Wait for Linak's post-connect auth window before passive reads."""
+        """Wait for Linak's post-connect auth window before position reads."""
+        await self._await_control_ready()
+
+    async def prepare_for_movement(self) -> None:
+        """Keep cold readiness outside an external movement duration."""
         await self._await_control_ready()
 
     # Motor control methods

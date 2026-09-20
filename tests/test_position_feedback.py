@@ -110,6 +110,70 @@ async def test_cancel_interrupts_initial_read_without_starting_movement(coordina
     assert coordinator._seek_outcomes["back"]["outcome"] == "cancelled"
 
 
+async def test_seek_prepares_before_starting_position_read_budget(coordinator):
+    ready = False
+
+    async def prepare():
+        nonlocal ready
+        await asyncio.sleep(0.03)
+        ready = True
+
+    async def read(_count):
+        if ready:
+            coordinator._handle_position_update("back", 40)
+
+    coordinator.controller.prepare_for_position_read = AsyncMock(side_effect=prepare)
+    coordinator.controller.read_positions = AsyncMock(side_effect=read)
+    move = AsyncMock()
+    with patch("custom_components.adjustable_bed.coordinator.POSITION_FEEDBACK_TIMEOUT", 0.01):
+        await coordinator.async_seek_position("back", 40, move, move, move)
+    coordinator.controller.prepare_for_position_read.assert_awaited_once()
+    coordinator.controller.read_positions.assert_awaited_once()
+    move.assert_not_awaited()
+    assert coordinator._seek_outcomes["back"]["outcome"] == "already_at_target"
+
+
+async def test_seek_cancel_interrupts_position_read_preparation(coordinator):
+    started, finished = asyncio.Event(), asyncio.Event()
+
+    async def prepare():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            finished.set()
+
+    coordinator.controller.prepare_for_position_read = AsyncMock(side_effect=prepare)
+    coordinator.controller.read_positions = AsyncMock()
+    move = AsyncMock()
+    seek = asyncio.create_task(coordinator.async_seek_position("back", 40, move, move, move))
+    try:
+        async with asyncio.timeout(1):
+            await started.wait()
+            coordinator.request_command_cancel()
+            await seek
+    finally:
+        if not seek.done():
+            seek.cancel()
+        await asyncio.gather(seek, return_exceptions=True)
+    assert finished.is_set()
+    coordinator.controller.read_positions.assert_not_awaited()
+    move.assert_not_awaited()
+    assert coordinator._seek_outcomes["back"]["outcome"] == "cancelled"
+
+
+async def test_seek_preparation_failure_prevents_read_and_movement(coordinator):
+    coordinator.controller.prepare_for_position_read = AsyncMock(
+        side_effect=ConnectionError("readiness failed")
+    )
+    coordinator.controller.read_positions = AsyncMock()
+    move = AsyncMock()
+    with pytest.raises(ConnectionError, match="readiness failed"):
+        await coordinator.async_seek_position("back", 40, move, move, move)
+    coordinator.controller.read_positions.assert_not_awaited()
+    move.assert_not_awaited()
+
+
 @pytest.mark.parametrize("axis, expected", [("legs", None), ("back", 20.0)])
 async def test_read_must_refresh_requested_axis_even_if_unchanged(coordinator, axis, expected):
     coordinator._handle_position_update("back", 20.0)
