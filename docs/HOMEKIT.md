@@ -179,13 +179,3 @@ cover command; use the bounded timed action for an explicit duration.
 The scripts use existing HA services and do not require a BLE implementation
 change. Actual Siri recognition and Apple Home presentation depend on the
 Apple device and language and need validation on that setup.
-
-### About `bed_homekit`
-
-[`bed_homekit`](https://github.com/VladLikov/bed_homekit) groups two covers and
-three actions into one HomeKit accessory. Its inspected version, 0.2.3, still
-uses window-covering services and requires `cover.set_cover_position` for
-movement. Adjustable Bed's current covers expose open, close, and stop, so it
-is not a drop-in replacement for this setup. The standard bridge and the
-scripts above work with those existing capabilities. See [issue #610](https://github.com/kristofferR/ha-adjustable-bed/issues/610)
-for the original request.
