@@ -1,5 +1,5 @@
 <!--
-Canonical Phase 4 clean-room analyst prompt (issue #443).
+Canonical APK Protocol Audit clean-room analyst prompt (issue #443).
 
 Copy this file into a run's input/ directory unchanged and fill only the <<...>> placeholders.
 Do not hand-edit a workspace copy: this tracked file is the source of truth, and

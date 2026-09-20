@@ -1,1 +1,1 @@
-"""Protocol-neutral tooling for the Phase 4 v2 analysis pipeline."""
+"""Protocol-neutral tooling for the APK Protocol Audit v2 analysis pipeline."""

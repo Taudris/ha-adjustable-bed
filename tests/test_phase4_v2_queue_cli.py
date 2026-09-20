@@ -1,4 +1,4 @@
-"""Tests for the bounded Phase 4 v2 queue CLI and tracker renderers."""
+"""Tests for the bounded APK Protocol Audit v2 queue CLI and tracker renderers."""
 
 from __future__ import annotations
 

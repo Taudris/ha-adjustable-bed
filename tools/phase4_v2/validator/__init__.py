@@ -1,4 +1,4 @@
-"""Deterministic integrity validation for frozen Phase 4 report bundles."""
+"""Deterministic integrity validation for frozen APK Protocol Audit report bundles."""
 
 from .binding import (
     CONTRACT_REVISION,

@@ -24,7 +24,7 @@ def render_markdown(
     counts = Counter(unit.status for unit in snapshot.units)
     lines = [
         f"{_START} generation={snapshot.generation_id} -->",
-        "## Phase 4 v2 queue",
+        "## APK Protocol Audit v2 queue",
         "",
         f"Generation: `{snapshot.generation_id}`  ",
         f"Event watermark: `{snapshot.event_watermark}`",
@@ -105,7 +105,7 @@ def render_html(snapshot: QueueSnapshot) -> str:
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Phase 4 v2 queue</title>
+<title>APK Protocol Audit v2 queue</title>
 <style>
 :root {{ color-scheme: dark; font-family: ui-monospace, SFMono-Regular, monospace; }}
 body {{ margin: 24px; background: #000; color: #fff; }}
@@ -115,7 +115,7 @@ table {{ border-collapse: collapse; width: 100%; margin: 20px 0 36px; }}
 th, td {{ border-bottom: 1px solid #333; padding: 8px 10px; text-align: left; }}
 td:first-child, td:nth-last-child(2) {{ text-align: right; }}
 </style>
-<h1>Phase 4 v2 queue</h1>
+<h1>APK Protocol Audit v2 queue</h1>
 <p>Generation <code>{snapshot.generation_id}</code>, event watermark {snapshot.event_watermark}, scheduler state <code>{snapshot.scheduler_state_digest}</code></p>
 <table><thead><tr><th>Status</th><th>Count</th></tr></thead><tbody>{summary}</tbody></table>
 <table><thead><tr><th>#</th><th>Unit</th><th>Cluster</th><th>Kind</th><th>Status</th><th>Attempts</th><th>Latest outcome</th></tr></thead><tbody>{units}</tbody></table>

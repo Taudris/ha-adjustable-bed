@@ -1,4 +1,4 @@
-"""Canonical protocol intermediate representation for Phase 4 v2."""
+"""Canonical protocol intermediate representation for APK Protocol Audit v2."""
 
 from .model import (
     BOUND_VALIDATION_PROFILE,

@@ -1,4 +1,4 @@
-"""Artifact-vector tests for the frozen Phase 4 cluster 011 CST reports."""
+"""Artifact-vector tests for the frozen APK Protocol Audit cluster 011 CST reports."""
 
 from __future__ import annotations
 

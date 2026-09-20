@@ -1,6 +1,6 @@
-# Phase 4B odd-cluster handoff (2026-08-28)
+# APK Protocol Audit bulk analysis odd-cluster handoff (2026-08-28)
 
-This is the repository accounting note for the interrupted odd-cluster Phase 4B run. It records
+This is the repository accounting note for the interrupted odd-cluster APK Protocol Audit bulk analysis run. It records
 the completed cluster-007 result for later issue #436/#443 bookkeeping. Raw artifacts,
 decompilation output, reports, audit history, and reproducer logs remain machine-local under the
 ignored `disassembly/output/phase4-early/` tree.

@@ -1,8 +1,15 @@
-# Phase 4 v2 tooling
+# APK Protocol Audit tooling
+
+The process is called **APK Protocol Audit**. Its stages are **Acquire → Analyze → Review → Reconcile → Implement**.
+
+Existing `phase4*` module names, paths, schema revisions, hash domains, and tracker markers
+remain stable compatibility identifiers. Frozen evidence and its checksums are never renamed
+or rewritten for a terminology change. Workflow revision labels such as v2 and v3 remain
+where they distinguish historical implementations.
 
 ## Legacy preservation inventory
 
-`legacy_inventory` creates a deterministic, protocol-neutral index of an existing Phase 4 tree:
+`legacy_inventory` creates a deterministic, protocol-neutral index of an existing APK Protocol Audit tree:
 
 ```bash
 uv run python -m tools.phase4_v2.legacy_inventory \
@@ -31,7 +38,7 @@ The output directory is fully covered only when `INVENTORY.COMPLETE` is present 
 opaque. The manifest hashes every generated payload, and the marker hashes that manifest.
 `entries.ndjson`, `reports.ndjson`, `workspaces.ndjson`,
 `declared_hashes.ndjson`, `duplicate_reports.ndjson` and `diagnostics.ndjson` are streaming,
-machine-readable inputs for later Phase 4 v2 stages. `SUMMARY.md` is the human overview.
+machine-readable inputs for later APK Protocol Audit v2 stages. `SUMMARY.md` is the human overview.
 
 An inaccessible historical path is recorded as opaque in the diagnostics and coverage summary.
 The scanner never changes permissions to inspect it.

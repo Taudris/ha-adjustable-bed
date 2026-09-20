@@ -1,4 +1,4 @@
-"""Hostile contract tests for exact-byte Phase 4 v2 equivalence."""
+"""Hostile contract tests for exact-byte APK Protocol Audit v2 equivalence."""
 
 from __future__ import annotations
 

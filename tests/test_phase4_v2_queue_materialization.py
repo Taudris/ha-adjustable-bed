@@ -1,4 +1,4 @@
-"""Atomic work-definition materialization tests for the Phase 4 v2 queue."""
+"""Atomic work-definition materialization tests for the APK Protocol Audit v2 queue."""
 
 from __future__ import annotations
 

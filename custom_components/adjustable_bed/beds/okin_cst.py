@@ -10,7 +10,7 @@ Most command values are identical to existing OKIN UUID values, but the MFirm
 app routes remote actions across both CST fields. Do not infer field placement
 from the feature type alone.
 
-Protocol and fixed product profiles come from the nine accepted Phase 4 cluster
+Protocol and fixed product profiles come from the nine accepted APK Protocol Audit cluster
 011 reports. Known devices include Rize Sanctuary, Resident, Aviada, Bob,
 Contempo, Carefree, Clarity II, MF900, and Support.
 

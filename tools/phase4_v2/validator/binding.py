@@ -1,4 +1,4 @@
-"""Typed dependency and evidence binding checks for Phase 4 v2 reports."""
+"""Typed dependency and evidence binding checks for APK Protocol Audit v2 reports."""
 
 from __future__ import annotations
 

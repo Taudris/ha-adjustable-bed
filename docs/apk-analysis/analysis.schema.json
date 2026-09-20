@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://local.invalid/schemas/phase4-analysis-v1.12-2026-07-26.json",
-  "title": "Phase 4 APK protocol analysis",
+  "title": "APK Protocol Audit report",
   "type": "object",
   "required": [
     "schema_revision",

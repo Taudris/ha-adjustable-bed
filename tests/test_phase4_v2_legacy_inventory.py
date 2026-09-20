@@ -1,4 +1,4 @@
-"""Tests for the non-destructive Phase 4 legacy inventory."""
+"""Tests for the non-destructive APK Protocol Audit legacy inventory."""
 
 from __future__ import annotations
 

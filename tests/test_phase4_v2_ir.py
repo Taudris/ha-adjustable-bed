@@ -1,4 +1,4 @@
-"""Focused tests for the compact Phase 4 v2 protocol IR core."""
+"""Focused tests for the compact APK Protocol Audit v2 protocol IR core."""
 
 from __future__ import annotations
 
@@ -602,7 +602,7 @@ def test_schema_document_is_pinned_strict_and_defensively_copied() -> None:
     assert first["additionalProperties"] is False
     assert first["properties"] != {}
     first["title"] = "changed"
-    assert second["title"] == "Phase 4 protocol intermediate representation"
+    assert second["title"] == "APK Protocol Audit protocol intermediate representation"
 
 
 def test_provenance_builders_bind_validator_receipt_and_round_trip() -> None:

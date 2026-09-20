@@ -1,7 +1,7 @@
 # Okin CST (CSTProtocol)
 
 **Status:** Static analysis complete; hardware validation pending
-**Ref:** Nine frozen Phase 4 cluster 011 clean-room reports and accepted
+**Ref:** Nine frozen APK Protocol Audit cluster 011 clean-room reports and accepted
 cluster reconciliation
 
 ## Known Brands
@@ -201,7 +201,7 @@ and in which 32-bit field carries each remote action.
 ## Source
 
 The command table, product profiles, and timing come from nine COMPLETE, frozen
-Phase 4 cluster 011 reports. Their accepted artifact-set SHA-256 identities are:
+APK Protocol Audit cluster 011 reports. Their accepted artifact-set SHA-256 identities are:
 
 | Package | Version | Artifact-set SHA-256 |
 |---|---|---|

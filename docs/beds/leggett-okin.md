@@ -172,7 +172,7 @@ the app's raw `01 02` initialization write.
 ## Provenance
 
 Command values, framing, timing, notification parsing and release semantics
-come from the accepted Phase 4 clean-room analysis of `com.leggett.prodigy4`
+come from the accepted APK Protocol Audit clean-room analysis of `com.leggett.prodigy4`
 1.2.0 (versionCode 18, artifact SHA-256 `45922c518c9e8070…`), traced from layout
 binding to the GATT boundary and independently audited. The report is COMPLETE;
 the missing light-bit meaning is explicitly deferred physical validation, not

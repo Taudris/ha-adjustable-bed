@@ -1,4 +1,4 @@
-# Phase 4 v2 preflight
+# APK Protocol Audit v2 preflight
 
 This package inventories APK deliveries without extracting into or modifying the source tree.
 It produces two identities:

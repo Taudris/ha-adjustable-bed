@@ -1,4 +1,4 @@
-"""Bounded JSON CLI for Phase 4 v2 queue workers and tracker rendering."""
+"""Bounded JSON CLI for APK Protocol Audit v2 queue workers and tracker rendering."""
 
 from __future__ import annotations
 

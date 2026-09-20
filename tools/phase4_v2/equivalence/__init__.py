@@ -1,4 +1,4 @@
-"""Exact-byte implementation-root equivalence for Phase 4 v2."""
+"""Exact-byte implementation-root equivalence for APK Protocol Audit v2."""
 
 from .core import (
     EQUIVALENCE_SCHEMA_REVISION,

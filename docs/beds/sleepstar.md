@@ -9,7 +9,7 @@ control-box route. It must not be configured as Sleepy's BOX25 or Okin CB35.
 
 ## Evidence
 
-The implementation comes from a clean-room Phase 4 analysis of:
+The implementation comes from a clean-room APK Protocol Audit analysis of:
 
 - App: SleepSpa 1.3.7 (build 37)
 - Package: `com.dot.bedding.sleepspa.sleep_spa`

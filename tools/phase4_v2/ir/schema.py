@@ -1,4 +1,4 @@
-"""Pinned JSON Schema for the first strict Phase 4 v2 IR slice."""
+"""Pinned JSON Schema for the first strict APK Protocol Audit v2 IR slice."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ _PACKAGE_ID_PATTERN = "^[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)+$"
 _SCHEMA: dict[str, object] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$id": f"https://local.invalid/schemas/{SCHEMA_REVISION}.json",
-    "title": "Phase 4 protocol intermediate representation",
+    "title": "APK Protocol Audit protocol intermediate representation",
     "type": "object",
     "required": [
         "schema_revision",
