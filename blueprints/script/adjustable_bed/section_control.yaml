@@ -1,0 +1,39 @@
+blueprint:
+  name: Adjustable Bed section control
+  description: >-
+    Create one Raise, Lower, or Stop script for an adjustable bed section.
+    Create three scripts per section and expose them through HomeKit Bridge
+    or Siri Shortcuts. For a split bed, select the intended side's cover.
+    Raise and Lower perform one finite movement, just like the cover controls.
+    Run the separate Stop script to stop; turning a HomeKit script switch off
+    does not stop the bed.
+  domain: script
+  source_url: https://github.com/kristofferR/ha-adjustable-bed/blob/master/blueprints/script/adjustable_bed/section_control.yaml
+  homeassistant:
+    min_version: "2026.9.0"
+  input:
+    section:
+      name: Bed section
+      description: Select one section, on the intended side for a split bed.
+      selector:
+        entity:
+          filter:
+            - integration: adjustable_bed
+              domain: cover
+    bed_action:
+      name: Action
+      selector:
+        select:
+          options:
+            - label: Raise
+              value: cover.open_cover
+            - label: Lower
+              value: cover.close_cover
+            - label: Stop
+              value: cover.stop_cover
+
+mode: single
+sequence:
+  - action: !input bed_action
+    target:
+      entity_id: !input section

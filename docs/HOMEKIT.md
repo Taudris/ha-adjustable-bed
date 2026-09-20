@@ -22,33 +22,48 @@ finishes for another adjustment.
 
 ## 1. Create the controls in Home Assistant
 
-Find the section entities under **Settings → Devices & services → Adjustable
-Bed → your device**. Copy their entity IDs, for example `cover.bed_back` and
-`cover.bed_legs`; actual names depend on your installation.
+### Recommended: import the script blueprint
 
-Merge [the six example scripts](examples/homekit_scripts.yaml) into your
-existing `scripts.yaml`, replacing those two entity IDs throughout. Keep the
-existing `script: !include scripts.yaml` entry in `configuration.yaml`. If you
-use another script layout, merge these entries into that layout rather than
-adding a second `script:` key. Reload scripts after checking the configuration.
+[Import Adjustable Bed section control](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2FkristofferR%2Fha-adjustable-bed%2Fblob%2Fmaster%2Fblueprints%2Fscript%2Fadjustable_bed%2Fsection_control.yaml)
+into your Home Assistant instance. You can also open **Settings → Automations &
+scenes → Blueprints → Import blueprint** and paste the
+[blueprint's GitHub URL](https://github.com/kristofferR/ha-adjustable-bed/blob/master/blueprints/script/adjustable_bed/section_control.yaml).
 
-Alternatively, create each script under **Settings → Automations & scenes →
-Scripts → Create script**. Add a **Perform action** step using this table and
-select the actual cover entity. Use **Single** mode.
+1. Open **Adjustable Bed section control** in the Blueprints list to create a script.
+2. Select the **Bed section**, for example your back section cover. The picker
+   shows Adjustable Bed covers; for a split bed, choose the intended side.
+3. Choose **Raise**, **Lower**, or **Stop** and save with a clear name from the
+   table below.
+4. Repeat for the other actions and sections you want to control.
 
-| Script name | Action | Target |
+The blueprint creates **one script per use**, so back and legs need six scripts.
+It requires HA 2026.9.0+ and an already configured Adjustable Bed integration.
+Importing it does not move the bed. Running a saved script performs its action.
+
+| Script name | Blueprint action | Bed section |
 |-------------|--------|--------|
-| Bed back up | `cover.open_cover` | Back section cover |
-| Bed back down | `cover.close_cover` | Back section cover |
-| Bed back stop | `cover.stop_cover` | Back section cover |
-| Bed legs up | `cover.open_cover` | Legs section cover |
-| Bed legs down | `cover.close_cover` | Legs section cover |
-| Bed legs stop | `cover.stop_cover` | Legs section cover |
+| Bed back up | Raise | Back section cover |
+| Bed back down | Lower | Back section cover |
+| Bed back stop | Stop | Back section cover |
+| Bed legs up | Raise | Legs section cover |
+| Bed legs down | Lower | Legs section cover |
+| Bed legs stop | Stop | Legs section cover |
 
 Create equivalent scripts for any additional section you use. Single mode
 ignores a duplicate invocation while that script is running instead of queuing
 extra movements. Stop has its own script, so it can run while a movement script
 is active. Do not put stop behind movement in a shared queued script.
+
+### Alternative: YAML scripts
+
+Merge [the six example scripts](examples/homekit_scripts.yaml) into your
+existing `scripts.yaml`, replacing `cover.bed_back` and `cover.bed_legs` with
+your actual entity IDs throughout. Find them under **Settings → Devices &
+services → Adjustable Bed → your device**. Keep the existing
+`script: !include scripts.yaml` entry in `configuration.yaml`. If you use
+another script layout, merge into that layout rather than adding a second
+`script:` key. Reload scripts after checking the configuration. Choose either
+the blueprint or YAML approach for each control; you do not need both.
 
 ### Split beds and stopping
 
@@ -77,7 +92,9 @@ that side. This action takes a **device ID**, not an entity ID. See
 
 In your existing **HomeKit Bridge** integration's configuration, include the
 new script entities. If using an include filter, retain all existing selections
-and add these six. UI-created script entity IDs may differ from the YAML IDs:
+and add the scripts you created. Select them by name in the UI. For YAML-managed
+bridges, use their actual entity IDs: blueprint-created scripts get IDs from
+their names, which can differ from the example YAML IDs below:
 
 ```yaml
 include_entities:
@@ -154,8 +171,9 @@ They become action switches; use a scene to turn on the desired preset. Include
 only buttons your bed actually provides, and use recall rather than save-memory
 buttons for voice presets.
 
-For an adjustment with an explicit duration, replace a raise/lower script's
-sequence with an [`adjustable_bed.timed_move` action](SERVICES.md#examples).
+For an adjustment with an explicit duration, create a separate custom script
+using an [`adjustable_bed.timed_move` action](SERVICES.md#examples). The blueprint
+intentionally offers the existing cover actions only; leave its shared file intact.
 Choose the actual motor and device/side and start with the documented one-second
 example. Duration is a ceiling, not a guaranteed amount of travel. Keep a
 separate stop script. Do not build an unbounded repeat loop that depends on a
