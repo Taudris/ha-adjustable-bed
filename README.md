@@ -16,11 +16,11 @@
 
 ## Quick Start
 
-This is the **v4 beta development branch** for **Home Assistant 2026.9.0+**.
+v4 requires **Home Assistant 2026.9.0+**.
 Back up Home Assistant before upgrading from v3;
 see [compatibility and rollback](docs/HA_2026_9.md).
 
-1. **Install** via [HACS](https://hacs.xyz): Search for "Adjustable Bed" and select the v4 beta when testing this branch
+1. **Install** via [HACS](https://hacs.xyz): Search for "Adjustable Bed" and install
 2. **Discover** your bed automatically, or add manually via Settings → Integrations
 3. **Control** your bed from Home Assistant dashboards, automations, and voice assistants!
 
@@ -68,9 +68,15 @@ See the [documentation index](docs/README.md) for migration and developer guides
 
 </details>
 
-## Donate
+## ❤️ Support the project
 
-If you love this integration, please consider [sending a thanks my way](https://github.com/sponsors/kristofferR).
+Enjoying Adjustable Bed? Sponsoring its development is a lovely way to say thanks and help keep the project growing.
+
+[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor_on_GitHub-%E2%99%A1-ec6cb9?style=for-the-badge)](https://github.com/sponsors/kristofferR)
+
+<p align="center">
+  <img src="https://files.kristofferr.com/artifacts/adjustable-bed-v4-dual-controls.png?k=HdLGHefHqT2P" alt="Adjustable Bed v4 dashboard with independent left and right positions" width="432">
+</p>
 
 ## Supported Beds
 
@@ -157,7 +163,7 @@ configuration; reinstalling v3 alone cannot undo it. Follow the
 
 1. Open HACS in Home Assistant
 2. Search for "Adjustable Bed"
-3. Select the v4 beta from the available versions (enable beta versions in HACS if needed), then install/download it
+3. Install/download the latest stable version
 4. Restart Home Assistant
 
 ### Manual
