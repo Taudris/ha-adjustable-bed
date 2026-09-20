@@ -59,9 +59,11 @@ lovelace:
       type: module
 ```
 
-After updating the integration and restarting Home Assistant, reload the page
-or fully close and reopen the Companion app. A page already running JavaScript
-from an older version cannot replace its registered custom element in place.
+After updating the integration and restarting Home Assistant, a dashboard left
+open reloads itself once its websocket reconnects. If it does not, reload the
+page or fully close and reopen the Companion app. A page already running
+JavaScript from an older version cannot replace its registered custom element
+in place.
 
 If the problem persists:
 

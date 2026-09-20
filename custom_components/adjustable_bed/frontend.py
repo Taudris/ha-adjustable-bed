@@ -7,6 +7,11 @@ each on its own content-versioned static path, point the permanent card URL at
 the entry, and add a Lovelace module resource, so
 ``custom:adjustable-bed-card`` is available with zero user setup. YAML resource
 mode retains Home Assistant's frontend module fallback.
+
+None of that reaches a page that is already open, which is what the
+``adjustable_bed/card_freshness`` websocket command is for: the loaded card
+asks for this run's cache key and reloads its own page when the answer is not
+the key it loaded.
 """
 
 from __future__ import annotations
@@ -16,9 +21,11 @@ import json
 import logging
 from functools import partial
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 from aiohttp import web
+from homeassistant.components import websocket_api
 from homeassistant.components.frontend import DOMAIN as FRONTEND_DOMAIN
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.http.server import StaticPathConfig
@@ -29,7 +36,7 @@ from homeassistant.components.lovelace.const import (
 from homeassistant.components.lovelace.const import DOMAIN as LOVELACE_DOMAIN
 from homeassistant.components.lovelace.resources import ResourceStorageCollection
 from homeassistant.const import CONF_ID, CONF_TYPE, CONF_URL
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.http import HomeAssistantView
 from homeassistant.setup import async_when_setup
 
@@ -44,6 +51,7 @@ URL_BASE = "/adjustable_bed_frontend"
 CARD_FILENAME = "adjustable-bed-card.js"
 CHUNK_FILENAME = "adjustable-bed-card-chunk.js"
 CARD_URL = f"{URL_BASE}/{CARD_FILENAME}"
+CARD_FRESHNESS_COMMAND = f"{DOMAIN}/card_freshness"
 
 
 class CardLoaderView(HomeAssistantView):
@@ -131,6 +139,27 @@ def _is_card_resource(url: object) -> bool:
     return path == CARD_URL or (
         path.startswith(f"{URL_BASE}/") and path.endswith(f"/{CARD_FILENAME}")
     )
+
+
+def _register_freshness_command(hass: HomeAssistant, cache_key: str) -> None:
+    """Register the command an open page asks for the current cache key.
+
+    A page that stays open across a rebuild has no other way to learn its card
+    changed. The handler answers with the key this run serves rather than
+    reading the file again, so every page asking gets one consistent answer.
+    """
+
+    @callback
+    @websocket_api.websocket_command({"type": CARD_FRESHNESS_COMMAND})
+    def handle_card_freshness(
+        hass: HomeAssistant,
+        connection: websocket_api.ActiveConnection,
+        msg: dict[str, Any],
+    ) -> None:
+        """Answer with the bundle cache key this run serves."""
+        connection.send_result(msg["id"], {"cache_key": cache_key})
+
+    websocket_api.async_register_command(hass, handle_card_freshness)
 
 
 async def _async_register_lovelace_resource(
@@ -272,10 +301,13 @@ async def async_register_frontend(hass: HomeAssistant) -> None:
 
     data[DATA_FRONTEND_REGISTERED] = True
 
-    # Keep both loading paths. The frontend hook injects the card into new pages
-    # and notifies open pages, while the storage resource is durable. Waiting on
-    # the component lifecycle prevents a startup-order miss from becoming
-    # permanent for the rest of the Home Assistant process.
+    _register_freshness_command(hass, cache_key)
+
+    # Keep both loading paths. The frontend hook injects the card into pages
+    # rendered from now on, while the storage resource is durable and is what a
+    # Cast receiver reads. Waiting on the component lifecycle prevents a
+    # startup-order miss from becoming permanent for the rest of the Home
+    # Assistant process.
     async_when_setup(
         hass,
         FRONTEND_DOMAIN,

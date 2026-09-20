@@ -23,6 +23,7 @@ function hassWith(entries: EntityRegistryDisplayEntry[]): HomeAssistant {
   const entities: Record<string, EntityRegistryDisplayEntry> = {};
   for (const e of entries) entities[e.entity_id] = e;
   return {
+    connection: { sendMessagePromise: async () => ({}), addEventListener: () => {} },
     entities,
     states: {},
     devices: {},

@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from homeassistant.components import websocket_api
 from homeassistant.components.lovelace import LovelaceData
 from homeassistant.components.lovelace.const import LOVELACE_DATA
 from homeassistant.components.lovelace.dashboard import LovelaceStorage
@@ -30,6 +31,7 @@ from pytest_homeassistant_custom_component.typing import ClientSessionGenerator
 from custom_components.adjustable_bed.const import DOMAIN
 from custom_components.adjustable_bed.frontend import (
     CARD_FILENAME,
+    CARD_FRESHNESS_COMMAND,
     CARD_URL,
     CHUNK_FILENAME,
     DATA_FRONTEND_REGISTERED,
@@ -322,6 +324,9 @@ async def test_register_frontend_uses_resource_and_module_hook(
         patch(
             "custom_components.adjustable_bed.frontend.add_extra_js_url"
         ) as add_extra_js_url,
+        patch(
+            "custom_components.adjustable_bed.frontend.websocket_api.async_register_command"
+        ) as register_command,
     ):
         await async_register_frontend(hass)
         await async_register_frontend(hass)
@@ -329,10 +334,39 @@ async def test_register_frontend_uses_resource_and_module_hook(
 
     register_resource.assert_awaited_once_with(hass, CARD_URL)
     add_extra_js_url.assert_called_once_with(hass, CARD_URL)
+    register_command.assert_called_once()
     hass.http.async_register_static_paths.assert_awaited_once()
     assert _registered_static_paths(hass) == _expected_static_paths("3.3.0-abc123")
     hass.http.register_view.assert_called_once()
     assert hass.data[DOMAIN][DATA_FRONTEND_REGISTERED] is True
+
+
+async def test_register_frontend_answers_the_freshness_command(
+    hass: HomeAssistant,
+) -> None:
+    """An open page can ask which cache key this run serves.
+
+    Covers `freshness-checked-on-connect`.
+    """
+    hass.http = MagicMock()
+    hass.http.async_register_static_paths = AsyncMock()
+    connection = MagicMock(spec=websocket_api.ActiveConnection)
+    connection.user = MagicMock(is_admin=False)
+
+    with patch(
+        "custom_components.adjustable_bed.frontend._gather",
+        return_value=(True, "3.3.0", "3.3.0-abc123"),
+    ):
+        await async_register_frontend(hass)
+        await hass.async_block_till_done()
+
+    handler, schema = hass.data[websocket_api.DOMAIN][CARD_FRESHNESS_COMMAND]
+    handler(hass, connection, {"id": 7, "type": CARD_FRESHNESS_COMMAND})
+
+    # A falsy schema is websocket_api's "no fields beyond the base message".
+    assert not schema
+    # Answered for a non-admin connection: the card runs as whoever is looking.
+    connection.send_result.assert_called_once_with(7, {"cache_key": "3.3.0-abc123"})
 
 
 @pytest.mark.parametrize(

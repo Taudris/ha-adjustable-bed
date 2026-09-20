@@ -28,6 +28,7 @@ import {
   pairedChildDeviceIds,
   resolvePairedParentId,
 } from "./discovery";
+import { watchCardFreshness } from "./freshness";
 import { MotorHold } from "./hold";
 import { cardNavigationPath, compactActions, compactStopEntities } from "./compact";
 import { localize } from "./localize";
@@ -161,6 +162,14 @@ export class AdjustableBedCard extends LitElement {
     // repeat loop running forever and a cover-backed motor moving with nothing
     // left to stop it.
     this._hold.abandon();
+  }
+
+  protected override willUpdate(changed: PropertyValues): void {
+    // The first hass is the earliest the freshness watch can reach the
+    // websocket connection; it starts once per document, not once per card.
+    if (changed.has("hass") && this.hass) {
+      watchCardFreshness(this.hass.connection);
+    }
   }
 
   protected override shouldUpdate(changed: PropertyValues): boolean {
