@@ -10,6 +10,9 @@ an action does not mean that every bed supports it. For ordinary controls you
 can also use the bed's `cover`, `button`, `number`, `light`, or other entities in
 Home Assistant automations.
 
+For named raise/lower/stop voice commands and Apple Home controls, see
+[Apple Home and Siri](HOMEKIT.md), including ready-to-copy scripts and side targeting.
+
 ## Targeting a Bed or Side
 
 | Target | Default behavior |

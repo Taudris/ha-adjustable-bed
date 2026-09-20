@@ -1,0 +1,51 @@
+# Merge into scripts.yaml, without a surrounding script: key.
+# Replace both cover entity IDs with your actual section entities.
+# For a split bed, use one side's entities and give each side unique script IDs/names.
+
+bed_raise_back:
+  alias: Bed back up
+  mode: single
+  sequence:
+    - action: cover.open_cover
+      target:
+        entity_id: cover.bed_back
+
+bed_lower_back:
+  alias: Bed back down
+  mode: single
+  sequence:
+    - action: cover.close_cover
+      target:
+        entity_id: cover.bed_back
+
+bed_stop_back:
+  alias: Bed back stop
+  mode: single
+  sequence:
+    - action: cover.stop_cover
+      target:
+        entity_id: cover.bed_back
+
+bed_raise_legs:
+  alias: Bed legs up
+  mode: single
+  sequence:
+    - action: cover.open_cover
+      target:
+        entity_id: cover.bed_legs
+
+bed_lower_legs:
+  alias: Bed legs down
+  mode: single
+  sequence:
+    - action: cover.close_cover
+      target:
+        entity_id: cover.bed_legs
+
+bed_stop_legs:
+  alias: Bed legs stop
+  mode: single
+  sequence:
+    - action: cover.stop_cover
+      target:
+        entity_id: cover.bed_legs

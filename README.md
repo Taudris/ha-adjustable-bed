@@ -48,6 +48,7 @@ see [compatibility and rollback](docs/HA_2026_9.md).
 | **[Connection Guide](docs/CONNECTION_GUIDE.md)** | ESPHome proxy setup, finding your bed's address |
 | **[Configuration](docs/CONFIGURATION.md)** | Settings, app profiles, combining and splitting beds |
 | **[Actions and Automations](docs/SERVICES.md)** | Movement, memory, side targeting, and bed-specific actions |
+| **[Apple Home and Siri](docs/HOMEKIT.md)** | Raise, lower, and stop commands through HomeKit scenes or Siri Shortcuts |
 | **[Supported Actuators](docs/SUPPORTED_ACTUATORS.md)** | Protocol details, bed brand lookup |
 
 See the [documentation index](docs/README.md) for migration and developer guides.
