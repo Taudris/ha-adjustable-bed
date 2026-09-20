@@ -115,6 +115,11 @@ class _FakeLoopClock:
             await asyncio.sleep(0)
 
 
+async def _never_completes(*args, **kwargs) -> None:
+    """Stand in for a write the box accepts and then never answers."""
+    await asyncio.Event().wait()
+
+
 class TestLeggettGen2Controller:
     """Test Leggett & Platt Gen2 controller."""
 
@@ -188,6 +193,7 @@ class TestLeggettOkinController:
                     characteristics=[SimpleNamespace(uuid=uuid) for uuid in uuids],
                 )
             ],
+            write_gatt_char=AsyncMock(),
         )
         coordinator.cancel_command = asyncio.Event()
         coordinator.address = "AA:BB:CC:DD:EE:FF"
@@ -212,6 +218,32 @@ class TestLeggettOkinController:
                 controller
             )
         )
+
+    @staticmethod
+    def _assert_released_once(controller: LeggettOkinController, frame: str = "040200000000"):
+        """Assert the command ended with one zero frame, written as a request."""
+        controller.client.write_gatt_char.assert_awaited_once_with(
+            LEGGETT_OKIN_CHAR_UUID, bytes.fromhex(frame), response=True
+        )
+
+    @staticmethod
+    def _wire_trace(controller: LeggettOkinController) -> list[tuple[str, bytes]]:
+        """Record streamed frames and the release in the order they reach the wire.
+
+        The two go through different mocks, so neither mock's own call list can
+        show that the command preceded the release that ends it.
+        """
+        trace: list[tuple[str, bytes]] = []
+
+        async def stream(packet: bytes, **kwargs) -> None:
+            trace.append(("stream", packet))
+
+        async def release(uuid: str, packet: bytes, **kwargs) -> None:
+            trace.append(("release", packet))
+
+        controller.write_command = AsyncMock(side_effect=stream)
+        controller.client.write_gatt_char = AsyncMock(side_effect=release)
+        return trace
 
     def test_revision_zero_framing_selected_when_selector_is_absent(self):
         """The write characteristic without 1721 selects the checksummed R0 frame."""
@@ -287,11 +319,8 @@ class TestLeggettOkinController:
 
         await controller.massage_mode_step()
 
-        wave, release = controller.write_command.await_args_list
-        assert wave.args == (bytes.fromhex("040210000000"),)
-        assert release.args == (bytes.fromhex("040200000000"),)
-        assert release.kwargs["repeat_count"] == 4
-        assert release.kwargs["cancel_event"].is_set() is False
+        controller.write_command.assert_awaited_once_with(bytes.fromhex("040210000000"))
+        self._assert_released_once(controller)
 
     async def test_write_stream_is_unconfirmed_and_wall_clock_paced(self):
         """CU170 streams must not add a confirmed-write RTT to every gap."""
@@ -330,12 +359,13 @@ class TestLeggettOkinController:
             {"back", "legs", "tilt", "pillow", "lumbar"}
         )
 
-    async def test_motor_streams_then_sends_four_release_frames(self):
-        """Held keycodes stream at the configured cadence, then release with four zeros.
+    async def test_motor_streams_then_sends_one_confirmed_release(self):
+        """Held keycodes stream at the cadence, then release with one zero after them.
 
-        The app's output thread writes the held keycode every 100ms and emits
-        exactly four keycode-0 frames on release (MaxZeroCount = 3). There is no
-        distinct stop opcode; the release frame is an ordinary frame carrying 0.
+        There is no distinct stop opcode; the release frame is an ordinary frame
+        carrying 0. Unlike the stream it is a Write Request, so its completion
+        reports non-delivery of the frame that stops the motor. The stream and
+        the release use different mocks, so their order is asserted across both.
         """
         coordinator = MagicMock()
         coordinator.motor_pulse_count = 10
@@ -343,19 +373,19 @@ class TestLeggettOkinController:
         coordinator.client = self._controller_with_characteristics().client
         coordinator.cancel_command = asyncio.Event()
         controller = LeggettOkinController(coordinator)
-        controller.write_command = AsyncMock()
+        trace = self._wire_trace(controller)
 
         await controller.move_head_up()
 
-        move_call, release_call = controller.write_command.await_args_list
-        assert move_call.args == (bytes.fromhex("040200000001"),)
-        assert move_call.kwargs == {
+        assert trace == [
+            ("stream", bytes.fromhex("040200000001")),
+            ("release", bytes.fromhex("040200000000")),
+        ]
+        assert controller.write_command.await_args.kwargs == {
             "repeat_count": 10,
             "repeat_delay_ms": 100,
         }
-        assert release_call.args == (bytes.fromhex("040200000000"),)
-        assert release_call.kwargs["repeat_count"] == 4
-        assert release_call.kwargs["cancel_event"].is_set() is False
+        assert controller.client.write_gatt_char.await_args.kwargs == {"response": True}
 
     @pytest.mark.parametrize("stored_delay", [0, 1, 100, 300])
     async def test_motor_stream_uses_the_proven_pulse_delay(self, stored_delay: int):
@@ -435,6 +465,22 @@ class TestLeggettOkinController:
         assert release_write.kwargs["repeat_count"] == 1
         assert release_write.kwargs["cancel_event"].is_set() is False
 
+    async def test_prodigy_ce_control_mode_releases_once_after_its_attempts(self):
+        """The CE release is one confirmed frame, and it still follows the mode command.
+
+        The two frames go through different mocks, so the order is asserted
+        across both rather than by their position in one call list.
+        """
+        controller = self._controller_with_characteristics()
+        trace = self._wire_trace(controller)
+
+        await controller.set_control_mode_press_and_release()
+
+        assert trace == [
+            ("stream", bytes.fromhex("040201800000")),
+            ("release", bytes.fromhex("040200000000")),
+        ]
+
     @pytest.mark.parametrize(
         ("payload", "expected"),
         [
@@ -469,7 +515,6 @@ class TestLeggettOkinController:
         assert client is not None
         client.start_notify = AsyncMock()
         client.stop_notify = AsyncMock()
-        client.write_gatt_char = AsyncMock()
 
         await controller.start_notify()
 
@@ -500,45 +545,80 @@ class TestLeggettOkinController:
 
         await controller.program_memory(2)
 
-        arm, slot, slot_release = controller.write_command.await_args_list
+        arm, slot = controller.write_command.await_args_list
         # ~5s of the store keycode...
         assert arm.args == (bytes.fromhex("040200010000"),)
         assert {key: value for key, value in arm.kwargs.items() if key != "deadline"} == {"repeat_count": 50, "repeat_delay_ms": 100}
         # ...directly followed by ~2s of the slot keycode, then a release.
         assert slot.args == (bytes.fromhex("040200002000"),)
         assert {key: value for key, value in slot.kwargs.items() if key != "deadline"} == {"repeat_count": 20, "repeat_delay_ms": 100}
-        assert slot_release.args == (bytes.fromhex("040200000000"),)
+        self._assert_released_once(controller)
+
+    async def test_stop_all_sends_its_stop_frame_before_the_release(self):
+        """The CE stop keycode has to reach the box ahead of the zero that ends it.
+
+        Reversing them would release the held key first and then assert the stop
+        keycode, which is the state this command exists to leave behind. The two
+        frames go through different mocks, so the order is asserted across both.
+        """
+        controller = self._controller_with_characteristics()
+        trace = self._wire_trace(controller)
+
+        await controller.stop_all()
+
+        assert trace == [
+            ("stream", bytes.fromhex("040200040000")),
+            ("release", bytes.fromhex("040200000000")),
+        ]
 
     async def test_stop_all_propagates_write_failures(self):
         """An explicit stop must not report success when it never reached the bed.
 
-        The release burst is this protocol's only stop, and the shared helper
+        The release frame is this protocol's only stop, and the shared helper
         logs and swallows BleakError for cleanup callers. stop_all opts out, or
         async_stop_command would log "Stop command sent" while the bed kept
-        moving.
+        moving. The confirmed write is what makes non-delivery visible at all.
         """
         controller = self._controller_with_characteristics()
-        controller.write_command = AsyncMock(side_effect=BleakError("write failed"))
+        controller.write_command = AsyncMock()
+        controller.client.write_gatt_char.side_effect = BleakError("release failed")
 
-        with pytest.raises(BleakError):
+        with pytest.raises(BleakError, match="release failed"):
+            await controller.stop_all()
+
+    async def test_a_release_that_never_completes_is_bounded(self):
+        """A Write Request the box never answers must not hold the command lock.
+
+        Waiting forever would strand every later command behind this one, so the
+        bound expires and the caller sees an ordinary failed release.
+        """
+        controller = self._controller_with_characteristics()
+        controller.write_command = AsyncMock()
+        controller.client.write_gatt_char = AsyncMock(side_effect=_never_completes)
+
+        with (
+            patch(
+                "custom_components.adjustable_bed.beds.leggett_okin.RELEASE_WRITE_TIMEOUT_S", 0.01
+            ),
+            pytest.raises(TimeoutError),
+        ):
             await controller.stop_all()
 
     async def test_cleanup_release_failures_do_not_mask_the_real_error(self):
-        """A failed release burst during cleanup stays logged, not raised.
+        """A failed release during cleanup stays logged, not raised.
 
         The two writes raise distinct errors so the assertion actually proves
         which one propagated: with a shared message it would pass even if the
         cleanup failure replaced the movement failure.
         """
         controller = self._controller_with_characteristics()
-        controller.write_command = AsyncMock(
-            side_effect=[BleakError("movement failed"), BleakError("release failed")]
-        )
+        controller.write_command = AsyncMock(side_effect=BleakError("movement failed"))
+        controller.client.write_gatt_char.side_effect = BleakError("release failed")
 
         with pytest.raises(BleakError, match="movement failed"):
             await controller.move_head_up()
 
-        assert controller.write_command.await_count == 2
+        controller.client.write_gatt_char.assert_awaited_once()
 
     async def test_preset_flat_floors_an_unsafe_pulse_delay(self):
         """Flat is a fixed-duration hold, so the cadence has a floor.
@@ -575,11 +655,12 @@ class TestLeggettOkinController:
         await controller.program_memory(2)
 
         sent = [item.args[0] for item in controller.write_command.await_args_list]
-        assert sent == [bytes.fromhex("040200010000"), bytes.fromhex("040200000000")]
-        release = controller.write_command.await_args_list[-1]
-        assert not release.kwargs["cancel_event"].is_set()
+        assert sent == [bytes.fromhex("040200010000")]
+        # The release carries its own cancel event, so the stop that ended the
+        # arm cannot suppress it.
+        self._assert_released_once(controller)
 
-    async def test_light_and_massage_taps_end_with_a_release_burst(self):
+    async def test_light_and_massage_taps_end_with_a_release_frame(self):
         """Lights and massage are held keycodes, so a tap must release the key.
 
         Sending the frame alone can leave the key asserted, and the receiver may
@@ -590,17 +671,34 @@ class TestLeggettOkinController:
 
         await controller.lights_toggle()
 
-        press, release = controller.write_command.await_args_list
-        assert press.args == (bytes.fromhex("040200020000"),)
-        assert release.args == (bytes.fromhex("040200000000"),)
-        assert release.kwargs["repeat_count"] == 4
+        controller.write_command.assert_awaited_once_with(bytes.fromhex("040200020000"))
+        self._assert_released_once(controller)
 
         controller.write_command.reset_mock()
+        controller.client.write_gatt_char.reset_mock()
+        await controller.massage_toggle()
+
+        controller.write_command.assert_awaited_once_with(bytes.fromhex("040200000100"))
+        self._assert_released_once(controller)
+
+    async def test_another_profile_still_releases_with_four_unconfirmed_frames(self):
+        """Only the CU170 release was measured, so the app's shape stands elsewhere.
+
+        Those profiles have no hardware run behind a single frame, and the four
+        unconfirmed frames are what their accepted app reports establish.
+        """
+        controller = self._controller_with_characteristics(app_profile="prodigy2")
+        controller.write_command = AsyncMock()
+
         await controller.massage_toggle()
 
         press, release = controller.write_command.await_args_list
         assert press.args == (bytes.fromhex("040200000100"),)
         assert release.args == (bytes.fromhex("040200000000"),)
+        assert release.kwargs["repeat_count"] == 4
+        assert release.kwargs["repeat_delay_ms"] == 100
+        assert release.kwargs["cancel_event"].is_set() is False
+        controller.client.write_gatt_char.assert_not_awaited()
 
     def test_a_cu170_status_frame_records_the_box_receipt(self):
         """The real 20-byte status frame is what marks the press as received.
@@ -664,8 +762,7 @@ class TestLeggettOkinController:
         assert released_at - written_at <= CU170_PRESS_RECEIPT_BACKSTOP_S
         assert "No status frame acknowledged the massage_toggle press" in caplog.text
         controller._wait_hold_deadline.assert_not_awaited()
-        release = controller.write_command.await_args_list[-1]
-        assert release.args == (bytes.fromhex("040200000000"),)
+        self._assert_released_once(controller)
 
     async def test_a_stop_during_the_receipt_wait_releases_without_the_backstop(self):
         """A stop asked for mid-tap releases the key instead of sitting out the backstop.
@@ -693,8 +790,7 @@ class TestLeggettOkinController:
 
         assert clock.now == written_at
         controller._wait_hold_deadline.assert_not_awaited()
-        release = controller.write_command.await_args_list[-1]
-        assert release.args == (bytes.fromhex("040200000000"),)
+        self._assert_released_once(controller)
 
     async def test_a_profile_without_measured_timing_taps_on_the_app_interval(self):
         """Only the CU170 was measured, so the other profiles keep the app's wait.
@@ -731,9 +827,7 @@ class TestLeggettOkinController:
         with pytest.raises(BleakError, match="press failed"):
             await controller.massage_toggle()
 
-        release = controller.write_command.await_args_list[-1]
-        assert release.args == (bytes.fromhex("040200000000"),)
-        assert release.kwargs["cancel_event"].is_set() is False
+        self._assert_released_once(controller)
         controller._wait_hold_deadline.assert_not_awaited()
 
     async def test_program_memory_surfaces_a_failed_final_release(self):
@@ -744,9 +838,8 @@ class TestLeggettOkinController:
         """
         controller = self._controller_with_characteristics()
         # arm and slot holds succeed; the final release fails.
-        controller.write_command = AsyncMock(
-            side_effect=[None, None, BleakError("final release failed")]
-        )
+        controller.write_command = AsyncMock()
+        controller.client.write_gatt_char.side_effect = BleakError("final release failed")
 
         with pytest.raises(BleakError, match="final release failed"):
             await controller.program_memory(2)
@@ -765,7 +858,7 @@ class TestLeggettOkinController:
     ):
         """A lost release after a successful command must not report success.
 
-        The release burst is this protocol's stop, so losing it can leave the
+        The release frame is this protocol's stop, so losing it can leave the
         bed moving or a keycode asserted. Every command family that ends in one
         has to surface that, not just log it.
         """
@@ -773,16 +866,9 @@ class TestLeggettOkinController:
         coordinator.motor_pulse_count = 10
         coordinator.motor_pulse_delay_ms = 100
         coordinator.client = self._controller_with_characteristics().client
+        coordinator.client.write_gatt_char.side_effect = BleakError("release failed")
         controller = LeggettOkinController(coordinator)
-        outcomes = [None, BleakError("release failed")]
-
-        async def write(*args, **kwargs):
-            self._report_status_frame(controller)
-            outcome = outcomes.pop(0)
-            if outcome is not None:
-                raise outcome
-
-        controller.write_command = AsyncMock(side_effect=write)
+        controller.write_command = self._receipt_on_write(controller)
         coordinator.cancel_command = asyncio.Event()
 
         with pytest.raises(BleakError, match="release failed"):

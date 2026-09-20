@@ -8,7 +8,8 @@ Protocol details:
     Service UUID: 62741523-52f9-8864-b1ab-3b3a8d65950b (shared with Okimat/Nectar)
     Write characteristic: 62741525-52f9-8864-b1ab-3b3a8d65950b
     Command format: runtime-selected 6-byte R1 or checksummed 8-byte R0 frame
-    Motor timing: held keycodes stream every 100ms, released with four zero frames
+    Motor timing: held keycodes stream every 100ms; Prodigy CE releases with one
+        confirmed zero frame, the other profiles with four unconfirmed ones
     Position feedback: Not supported
     Pairing: Required before first use; handled by coordinator
 
@@ -116,11 +117,30 @@ class LeggettOkinCommands:
 # The app streams a held keycode until release, then emits exactly four
 # keycode-0 frames (OutputThread.runNormal, MaxZeroCount = 3). There is no
 # distinct stop opcode: the release frame is an ordinary frame carrying 0.
+# Prodigy CE / CU170 sends that frame once as a Write Request instead, so these
+# counts are what the other profiles release with.
 RELEASE_FRAME_COUNT = 4
 # Same 100ms as the recall cadence today, but deliberately a separate constant:
 # these are independent findings about different command families, and retuning
 # one must not silently retune the other.
 RELEASE_FRAME_DELAY_MS = 100
+# Prodigy CE / CU170 only: a liveness bound on that confirmed release, so a
+# Write Request the box accepts but never answers cannot hold the command lock
+# for the rest of the connection. The owner's proxy measured a confirmed
+# write's completion at p50 128-174 ms and p99 259-412 ms (2026-08), so five
+# seconds sits an order of magnitude clear of the slowest round trip observed.
+# It matches DEVICE_INFO_READ_TIMEOUT, the bound this integration already puts
+# on a GATT operation this hardware can accept and silently drop, and stays a
+# separate constant because the two answer different questions.
+RELEASE_WRITE_TIMEOUT_S = 5.0
+
+# The connect-time status query. Keycode 0 toggles nothing, so the frame only
+# asks the box for its live status, and one frame draws one receipt. The notify
+# channel loses 2.5-4.5% of receipts (2026-08) and this query's gate fires once
+# per connection, so the other three frames are its retry. Same 100ms as the
+# release cadence, and again deliberately separate constants.
+STATUS_QUERY_ZERO_FRAME_COUNT = 4
+STATUS_QUERY_ZERO_FRAME_DELAY_MS = 100
 
 # A memory recall is a fixed 10-frame burst with no terminator at all. The
 # control box drives the move to completion by itself, so appending a release
@@ -142,7 +162,7 @@ FLAT_HOLD_S = 30.0
 
 # The settings dialog schedules 55 attempts at the normal cadence and then one
 # explicit zero frame. This is a distinct lifecycle from an ordinary held key,
-# whose release is four zero frames.
+# whose release on the profiles that reach this dialog is four.
 CONTROL_MODE_FRAME_COUNT = 55
 CONTROL_MODE_FRAME_DELAY_MS = 100
 
@@ -713,8 +733,8 @@ class LeggettOkinController(BedController):
             # so subscribe first and use zero, which does not toggle the light.
             await self.write_command(
                 self._build_command(0),
-                repeat_count=RELEASE_FRAME_COUNT,
-                repeat_delay_ms=RELEASE_FRAME_DELAY_MS,
+                repeat_count=STATUS_QUERY_ZERO_FRAME_COUNT,
+                repeat_delay_ms=STATUS_QUERY_ZERO_FRAME_DELAY_MS,
             )
 
         await self._read_device_information(characteristic_uuids)
@@ -885,7 +905,7 @@ class LeggettOkinController(BedController):
             completed = True
         finally:
             self._motor_state = {}
-            # The release burst is this protocol's stop. If the movement itself
+            # The release is this protocol's stop. If the movement itself
             # succeeded, losing the release can leave the bed running, so it has
             # to surface. If we are already unwinding it is cleanup and must not
             # mask the original error.
@@ -898,42 +918,60 @@ class LeggettOkinController(BedController):
         raise_on_error: bool = False,
         repeat_count: int = RELEASE_FRAME_COUNT,
     ) -> None:
-        """Send the release burst that ends a held keycode.
+        """Send the release that ends a held keycode.
 
-        Ordinary button release emits exactly four keycode-0 frames. Callers
-        with a protocol-specific lifecycle can select another proven count. The
-        release gets a fresh cancel event so a stop request cannot suppress it.
+        There is no distinct stop opcode: the release is an ordinary frame
+        carrying keycode 0. Prodigy CE / CU170 always sends exactly one, as a
+        Write Request whose completion reports non-delivery, which stop_all's
+        contract promises and an unconfirmed write cannot keep; ``repeat_count``
+        does not reach that path. The other profiles keep the app's four
+        keycode-0 frames, and there ``repeat_count`` selects another proven
+        count for a caller with a protocol-specific lifecycle. The release gets
+        a fresh cancel event so a stop request cannot suppress it.
 
-        ``raise_on_error`` is for callers where the burst *is* the operation, so
-        a failure must reach the user. Cleanup callers leave it False: they are
-        already unwinding and have their own error to report.
+        ``raise_on_error`` is for callers where the release *is* the operation,
+        so a failure must reach the user. Cleanup callers leave it False: they
+        are already unwinding and have their own error to report.
         """
 
         async def send_release() -> None:
-            await self.write_command(
-                self._build_command(0),
-                repeat_count=repeat_count,
-                repeat_delay_ms=RELEASE_FRAME_DELAY_MS,
-                cancel_event=asyncio.Event(),
-            )
+            if self._app_profile != "prodigy4":
+                await self.write_command(
+                    self._build_command(0),
+                    repeat_count=repeat_count,
+                    repeat_delay_ms=RELEASE_FRAME_DELAY_MS,
+                    cancel_event=asyncio.Event(),
+                )
+                return
+            async with asyncio.timeout(RELEASE_WRITE_TIMEOUT_S):
+                await self._write_gatt_with_retry(
+                    self.control_characteristic_uuid,
+                    self._build_command(0),
+                    cancel_event=asyncio.Event(),
+                    response=True,
+                )
 
         release = asyncio.ensure_future(send_release())
         try:
             await asyncio.shield(release)
         except asyncio.CancelledError:
-            # Returning here would hand the command lock back mid-burst: the
-            # coordinator would start the replacement command while the shielded
-            # task was still emitting zero frames, and those frames would stop
-            # the movement it had just started. The burst is bounded (~300ms),
-            # so wait it out before propagating.
+            # Returning here would hand the command lock back with the release
+            # still in flight: the coordinator would start the replacement
+            # command while the shielded task was still writing, and that frame
+            # would stop the movement it had just started. Both shapes are
+            # bounded, the burst by its own length and the request by
+            # RELEASE_WRITE_TIMEOUT_S, so wait it out before propagating.
             while not release.done():
-                with contextlib.suppress(asyncio.CancelledError, BleakError, ConnectionError):
+                with contextlib.suppress(
+                    asyncio.CancelledError, BleakError, ConnectionError, TimeoutError
+                ):
                     await asyncio.shield(release)
             raise
-        except BleakError, ConnectionError:
-            # Losing release can leave a held command active.
+        except BleakError, ConnectionError, TimeoutError:
+            # Losing release can leave a held command active, and a request the
+            # box never answers is lost in exactly that sense.
             _LOGGER.warning(
-                "Failed to send release frames after %s; the bed may still be moving",
+                "Failed to send the release after %s; the bed may still be moving",
                 context,
                 exc_info=True,
             )
@@ -1020,8 +1058,8 @@ class LeggettOkinController(BedController):
 
         Recall is 10 frames at 100ms and then silence: the control box drives
         the move to completion on its own. This is the one command family the
-        app deliberately leaves unterminated, so no release frames follow -
-        they could cancel the motion the recall just started.
+        app deliberately leaves unterminated, so no release follows it - that
+        could cancel the motion the recall just started.
         """
         await self._send_special(self._build_command(command))
 
@@ -1082,8 +1120,8 @@ class LeggettOkinController(BedController):
 
         There is no program opcode. The box is armed by holding MEMORY_STORE
         for ~5s, then records whichever slot keycode is held for the following
-        ~2s. The final reset produces the normal release burst; the intermediate
-        reset and slot assignment are consecutive app calls.
+        ~2s. The final reset produces the profile's normal release; the
+        intermediate reset and slot assignment are consecutive app calls.
         """
         if not self.is_memory_slot_programmable(memory_num):
             _LOGGER.warning("Memory slot %d is fixed and cannot be programmed", memory_num)
