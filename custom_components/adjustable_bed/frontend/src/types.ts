@@ -38,7 +38,16 @@ export interface DeviceRegistryEntry {
   via_device_id?: string | null;
 }
 
+// The websocket connection `hass` carries. The card asks the integration for
+// the bundle's current cache key over it, and hears the reconnect a restarted
+// server produces.
+export interface HassConnection {
+  sendMessagePromise: (message: { type: string }) => Promise<unknown>;
+  addEventListener: (event: "ready", handler: () => void) => void;
+}
+
 export interface HomeAssistant {
+  connection: HassConnection;
   states: Record<string, HassEntity>;
   entities: Record<string, EntityRegistryDisplayEntry>;
   devices: Record<string, DeviceRegistryEntry>;
