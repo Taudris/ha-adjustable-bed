@@ -4,6 +4,7 @@ This guide covers common issues and their solutions when using the Adjustable Be
 
 ## Table of Contents
 
+- [Upgrade and Migration](#upgrade-and-migration)
 - [Connection Issues](#connection-issues)
 - [Dashboard Card Missing or Configuration Error](#dashboard-card-missing-or-configuration-error)
 - [Commands Not Working](#commands-not-working)
@@ -14,9 +15,23 @@ This guide covers common issues and their solutions when using the Adjustable Be
 - [Classic Bluetooth Beds (Not Supported)](#classic-bluetooth-beds-not-supported)
 - [Quick Reference: Service UUIDs](#quick-reference-service-uuids)
 - [Debugging Tools](#debugging-tools)
+- [Support Bundle Download Links](#support-bundle-download-links)
+- [Position Commands and Reported State](#position-commands-and-reported-state)
 - [Still Need Help?](#still-need-help)
 
 ---
+
+## Upgrade and Migration
+
+v4 requires **Home Assistant 2026.9.0+**. If setup fails after upgrading, check
+the HA version before changing Bluetooth settings. Restore a pre-v4 backup to
+return to v3; reinstalling the older integration files alone cannot reverse the
+config-entry migration. See [compatibility and rollback](HA_2026_9.md).
+
+After an integration update, restart Home Assistant and reload the dashboard
+page so it loads the matching card version. For paired-bed conversion, existing
+side entity IDs should survive. Report missing entities with diagnostics before
+deleting and recreating entries.
 
 ## Dashboard Card Missing or Configuration Error
 
@@ -196,14 +211,14 @@ and failed cleanup are still reported.
 ### Position sensors show "Unknown" or don't update
 
 **Possible Causes:**
-1. Angle sensing is disabled (recommended setting)
+1. Angle sensing is disabled
 2. Bed doesn't support position feedback
 3. Notification subscription failed
 
 **Solutions:**
-1. **Check settings:** Position feedback is disabled by default to prevent remote conflicts
+1. **Check settings:** The initial "Disable angle sensing" value depends on bed type and setup route. Check the saved value rather than assuming feedback is enabled or disabled.
 2. **Enable angle sensing:** If you want position data, disable "Disable angle sensing" in options
-3. **Note:** Only Linak, Okimat, Reverie, and some Keeson/Ergomotion variants support position feedback
+3. **Check the controller:** Feedback is available on supported Linak, Okimat, Reverie, Keeson/Ergomotion, Jensen, Limoss, Vibradorm, Sleep Number, BOX25, and SleepSpa profiles. Availability and units depend on the actual controller; see its [protocol guide](SUPPORTED_ACTUATORS.md).
 
 ### Position values seem incorrect
 
@@ -224,17 +239,18 @@ and failed cleanup are still reported.
 **This is expected behavior.** Most BLE beds only support one connection at a time.
 
 **Solutions:**
-1. **Enable "Disable angle sensing":** This is the default and recommended setting
-2. **Use HA controls:** Use Home Assistant instead of the physical remote
+1. **Enable "Disconnect after each command" where supported:** The connection is released one second after operations finish; rapid commands reuse that window
+2. **Disable position monitoring if necessary:** Enable "Disable angle sensing"; Linak's "Refresh positions while idle" can also be turned off
 3. **Press "Disconnect" button:** Manually disconnect HA to use the physical remote
-4. **Idle timeout:** HA automatically disconnects after 40 seconds of inactivity
+4. **Idle timeout:** When quick handoff is off, the configured idle timeout applies (default 40 seconds). Controllers requiring persistent connections are exceptions.
 
 ### BLE connection shows "Disconnected" shortly after adding the bed
 
-**This is normal.** For most beds the integration deliberately drops the BLE
-link after about 40 seconds of inactivity (the `idle_disconnect_seconds`
-option) so the physical remote can take over. It reconnects automatically on
-the next command from Home Assistant — no action is needed.
+**This is normal for beds that release their connection while idle.** With
+Disconnect After Command enabled, the link is released one second after the
+last operation finishes. Otherwise the configured idle timeout applies (default
+40 seconds), except for controllers requiring a persistent connection. The next
+Home Assistant command reconnects automatically.
 
 - The connection sensor reports `state_detail: idle` (and a `disconnect_reason`
   attribute) while it's intentionally disconnected, and the Lovelace card shows
@@ -263,8 +279,9 @@ the next command from Home Assistant — no action is needed.
 2. OEM bed using different manufacturer's controller
 
 **Solutions:**
-1. **Manual configuration:** Remove and re-add the bed, choosing the bed type yourself via **"Select by actuator brand"** or **"Show all BLE devices"** instead of accepting the auto-detected type
-2. **Try different types:** If one type doesn't work, try related types (e.g., Okimat ↔ Leggett Okin)
+1. **Change settings:** Open **Configure → Change settings** and correct **Bed type** and **Protocol variant** using the matching protocol guide. Keep the existing entry and its entity history.
+2. **Capture evidence if uncertain:** Generate a support bundle. A retail brand or a shared service UUID alone may not distinguish the protocols.
+3. **Paired entries:** Some profile changes require splitting the pair and configuring each side separately before combining again.
 
 ### Keeson Variant Selection
 

@@ -48,6 +48,10 @@ If you've found a bug, please file a [Bug Report](https://github.com/kristofferR
 
 **Start by generating a support bundle** — it contains everything we need to investigate. Then fill in the issue template with a description of the problem, steps to reproduce, and any other context.
 
+For v4, include the exact beta version, Home Assistant version, whether this was
+a v3 upgrade, and whether the bed is standalone or combined. For a combined bed,
+name the affected side and whether the action targeted the parent or a child.
+
 ### Generating a Support Bundle
 
 The support bundle includes everything we need in one file:
@@ -60,17 +64,27 @@ The support bundle includes everything we need in one file:
 6. A notification will appear with a **download link** — click it to save the file.
 7. Attach the JSON file to your GitHub issue. Check its `evidence.warnings` section for anything that could not be captured.
 
+For a **two-address combined bed**, select the affected Left or Right child
+device; the parent alone is ambiguous for a support capture. Generate one bundle
+per side when both are involved. A single-address parent resolves to its shared
+physical controller. The support action has no `side` field.
+
 The support bundle includes:
 - System info (HA version, Python version, platform)
 - Integration configuration and detected bed type
 - Connection status, BLE adapter/proxy health, and connection attempt details
 - ESPHome proxy firmware, API version, pairing capability, availability, and free BLE connection slots when Home Assistant exposes them
 - BLE advertisements by source, detection reasoning, and GATT/descriptor details
+- Up to 30 ranked nearby BLE devices, including their names and addresses
 - A structured pairing assessment that detects stale saved bond state and adapter mismatches
 - Captured notifications and buffered command trace
 - Recent error logs plus evidence warnings when logs or a command reproduction are missing
 
 **Privacy note:** PINs are redacted. MAC addresses, device names, and other BLE identifiers are preserved since they are essential for debugging.
+
+Review the bundle before posting it publicly. The download link is usable for up
+to one hour and expires on restart; the JSON file remains in the HA configuration
+directory. See [download-link details](TROUBLESHOOTING.md#support-bundle-download-links).
 
 ### Alternative: Download Diagnostics
 
@@ -136,7 +150,7 @@ Let us know if you can:
 | Troubleshooting a configured bed | Support bundle or diagnostics download |
 | Finding your bed's MAC address | **"Browse unsupported BLE devices"** in the add-integration wizard |
 | Identifying bed type/service UUIDs | `generate_support_bundle` with `target_address` |
-| New bed support - capture what app sends | nRF Connect logging (see below) |
+| New bed support - capture what app sends | Android Bluetooth HCI snoop log (see below) |
 | Device not visible to HA at all | nRF Connect to verify it exists |
 
 ---
@@ -173,28 +187,23 @@ This captures:
 
 When requesting support for a new bed, capturing what the official app sends to your bed is valuable. This data helps reverse-engineer the command protocol.
 
-### Using nRF Connect (Recommended)
+### Using Android Bluetooth HCI Snoop
 
-[nRF Connect](https://www.nordicsemi.com/Products/Development-tools/nRF-Connect-for-mobile) can log all BLE traffic while you use the official app:
+Capture on the Android phone running the official bed app:
 
-1. Install nRF Connect on your phone
-2. Enable **Log** in nRF Connect settings
-3. Connect to your bed in nRF Connect
-4. Open the official bed app on another device (or disconnect from nRF Connect first)
-5. Use the app to control the bed - move motors, activate presets, etc.
-6. Export the log and attach it to your GitHub issue
+1. Enable **Developer options** and **Bluetooth HCI snoop log**.
+2. Restart Bluetooth so logging takes effect, then connect with the official app.
+3. Reproduce a short sequence and note the time and button used for each action.
+4. Export the Bluetooth snoop log or extract it from an Android bug report. Availability and location vary by device; follow [Android's Bluetooth debugging instructions](https://source.android.com/docs/core/connect/bluetooth/verifying_debugging).
+5. Disable snoop logging afterward. Share the relevant Bluetooth capture and action notes, rather than publishing the entire phone bug report.
 
-The log shows the exact bytes the app sends for each command, which is essential for implementing new protocols.
+### Using nRF Connect for Device Inspection
 
-### Using Android BLE HCI Snoop (Advanced)
-
-For more detailed captures:
-
-1. Enable **Developer options** on your Android device
-2. Enable **Bluetooth HCI snoop log**
-3. Use the official app to control the bed
-4. Extract the log file (location varies by Android version)
-5. Open in Wireshark and filter by your bed's MAC address
+[nRF Connect](https://www.nordicsemi.com/Products/Development-tools/nRF-Connect-for-mobile)
+scans advertisements, discovers services and characteristics, and logs its own
+reads, writes, and received notifications. It does **not** capture another app's
+outgoing commands. Its logs are useful for GATT inspection and notifications;
+disconnect it before using the official app on a bed that accepts one BLE link.
 
 ---
 

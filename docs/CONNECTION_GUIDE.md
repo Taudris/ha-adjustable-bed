@@ -1,6 +1,8 @@
 # Adjustable Bed Connection Guide
 
-This guide explains how to connect your adjustable bed to Home Assistant.
+This guide explains how to connect your adjustable bed with v4, which requires
+Home Assistant 2026.9.0 or newer. See the [migration notes](HA_2026_9.md) when
+upgrading from v3.
 
 ## Understanding Bluetooth Connectivity
 
@@ -165,14 +167,15 @@ If your Home Assistant host has a Bluetooth adapter (built-in or USB dongle).
 
 3. **Discovery or Manual Entry**
    - **Automatic:** Select your bed from the discovered list
-   - **Manual:** Enter the Bluetooth MAC address (format: `AA:BB:CC:DD:EE:FF`) and select bed type
+   - **Scan again for beds:** Request a fresh active scan from Home Assistant, then return to the discovered list
+   - **Manual:** Choose **Select by actuator brand** or **Show all BLE devices**, then select the bed or enter its Bluetooth MAC address (format: `AA:BB:CC:DD:EE:FF`)
 
 4. **Configure Settings**
    - **Name**: Friendly name for your bed
    - **Motor Count**: See below
    - **Has Massage**: Enable if your bed has massage
    - **Protocol Variant** (if available): Usually leave as "auto"
-   - **Command Protocol** (Richmat only): Try different protocols if bed doesn't respond
+   - **App/product profile** (where offered): Match the actual app or remote; see [profile settings](CONFIGURATION.md#app-and-product-profiles)
 
    The setup form also shows which Bluetooth path Home Assistant is likely to
    use — a direct adapter on the Home Assistant host, or a Bluetooth proxy —
@@ -186,9 +189,17 @@ If your Home Assistant host has a Bluetooth adapter (built-in or USB dongle).
    Setup then checks the bed while showing what it is doing rather than
    freezing the form. If the bed has not advertised recently it is reported as
    **not advertising** and nothing is attempted, because connecting to a stale
-   record just burns the timeout and produces a failure that looks like a
-   pairing problem. Wake the bed and select **Check again**, or finish setup
-   anyway — a failed check never blocks setup.
+   record can produce a misleading connection failure. Wake the bed and select
+   **Check again**. The ordinary capability check also allows finishing setup
+   without a successful probe.
+
+   **Standard Octo is different:** its PIN check must report **accepted** or
+   **not required** before the entry is saved. A required, rejected, or
+   inconclusive PIN check offers a retry. This check does not move the bed.
+   Star2 keeps its separate setup behavior. See [Octo setup](beds/octo.md#pin-verification-during-setup-v4).
+
+For a split bed with independent controllers, add and verify each side first,
+then use [Combine two beds into one](CONFIGURATION.md#two-independent-frames-in-v4).
 
 ---
 
@@ -219,7 +230,7 @@ If your bed isn't auto-discovered:
 
 **Using the Integration (Recommended):**
 1. Go to Settings → Integrations → Add Integration → Adjustable Bed
-2. Choose "Manual entry"
+2. Choose **Show all BLE devices** (or **Browse unsupported BLE devices** for inspection only)
 3. The integration displays all discovered Bluetooth devices with their MAC addresses
 4. Find your bed in the list (look for names like "Desk XXXXX", "HHC...", your bed brand, etc.)
 
@@ -239,11 +250,15 @@ If your bed doesn't appear in Home Assistant at all (not visible to any adapter 
 
 | Motors | Sections |
 |--------|----------|
+| 1 (Standard OCTO lift only) | TV/bed lift; `RTV` is detected automatically |
 | 2 (most common) | Back + Legs |
 | 3 | Head + Back + Legs |
 | 4 | Head + Back + Legs + Feet |
 
 **How to determine:** Count the distinct moving sections when using your remote, or check your bed's manual.
+
+Controller-specific layouts can expose additional axes. Malouf/Lucid and the
+explicit app profiles use their own layout settings; see [Configuration](CONFIGURATION.md).
 
 ---
 

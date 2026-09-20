@@ -64,30 +64,30 @@ Home Assistant follows the same bootstrap flow as the OEM apps:
 
 ## Command Families
 
-The OEM APKs expose six control families that are now supported by one shared
-`kaidi` bed type.
+The v4 integration exposes four variants under the shared `kaidi` bed type.
+The current implementation uses the OEM apps' Seat commands; the old `bed_1`,
+`bed_2`, and `bed_12` choices are not current variants.
 
 | Variant | Use |
-|--------|-----|
-| `seat_1` | Single-seat / lane 1 commands |
-| `seat_2` | Single-seat / lane 2 commands |
-| `seat_3` | Single-seat / lane 3 commands |
-| `bed_1` | Split-bed lane 1 commands |
-| `bed_2` | Split-bed lane 2 commands |
-| `bed_12` | Split-bed combined commands |
+|---------|-----|
+| `seat_1` | Single-base / lane 1 commands |
+| `seat_2` | Lane 2 commands |
+| `seat_3` | Lane 3 commands |
+| `seat_1_2` | Dual base, sends the matching Seat 1 and Seat 2 commands |
 
 ### APK-backed product IDs
 
-The OEM `MainActivity.getProductId()` logic only treats the following IDs as
-explicit Kaidi bed products:
+The v4 resolver recognizes these product IDs from Rize 1.3.0, ISleep 1.6.3,
+and Floyd 1.0.7:
 
 | Product IDs | Auto family |
-|------------|-------------|
-| `129`, `131`, `132`, `142` | `seat_1` |
-| `130`, `133`, `134`, `143` | `bed_12` |
+|-------------|-------------|
+| `129`, `131`, `132`, `135`, `136`, `137`, `138`, `139`, `142` | `seat_1` |
+| `130`, `133`, `134`, `143` | `seat_1_2` |
 
-For other advertised `sofaType` values, the integration does not guess from the
-number alone.
+IDs `140` and `141` are not in those app versions and are not inferred from
+neighboring values. Other IDs use the narrow fallback below or require an
+explicit variant.
 
 ### `sofa_acu_no` heuristic
 
@@ -96,25 +96,40 @@ uses `sofa_acu_no` only for the narrow case the APK data supports cleanly:
 
 - exactly one populated seat bar resolves to `seat_1`, `seat_2`, or `seat_3`
 
-This is how issue `#247` style beds advertising `sofaType=136` are handled:
-`136` is not in the OEM `BED_TYPE` list, but `sofa_acu_no=0x2004` resolves to a
-single populated seat-1 profile, so the integration auto-selects `seat_1`.
+Product `136` (Remedy 4, including the issue #247 report) now resolves directly
+from its recognized product ID, rather than relying on this fallback.
 
 If Kaidi metadata is present but does not map cleanly, `auto` refuses to guess
 and a manual Kaidi variant override is required.
 
 ## Features By Family
 
-| Feature | `seat_1` | `seat_2` | `seat_3` | `bed_1` | `bed_2` | `bed_12` |
-|--------|----------|----------|----------|---------|---------|----------|
-| Head/back + leg/foot movement | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Dedicated stop-all command | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Memory recall/programming | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
-| Flat / Zero-G / Anti-Snore presets | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Massage / lights | Not exposed yet | Not exposed yet | Not exposed yet | Not exposed yet | Not exposed yet | Not exposed yet |
+- All current variants expose core movement and four memory recall/save slots.
+- Seat 1, Seat 2, and Seat 1+2 expose Flat, Zero G, Anti-Snore, direct back/legs
+  percentage targets, and massage start/stop and 15/30/45-minute timers. Massage
+  entities also require **Has massage** in configuration.
+- Product metadata gates extra axes, lights, and Book/Leisure presets. Unknown
+  products retain the basic layout rather than gaining every optional feature.
+- Seat 3 has a more limited command set, including lumbar movement, without
+  direct position targets or the Seat 1/2 named presets and massage controls.
+- Direct targets are commands, not measured position feedback; an accepted target
+  must not be interpreted as confirmation that the bed reached it.
+
+The current mappings and capability gates are in
+[`kaidi_variants.py`](../../custom_components/adjustable_bed/kaidi_variants.py) and
+[`beds/kaidi.py`](../../custom_components/adjustable_bed/beds/kaidi.py), with
+[focused tests](../../tests/test_kaidi.py). This documents the shipped
+implementation, not new physical validation.
+
+### Single-address paired controls
+
+Only `seat_1_2` can opt into **Enable Left / Right / Both controls** in the entry's
+options. Left binds Seat 1, Right binds Seat 2, and Both retains the dual-command
+behavior over the same Bluetooth connection. Other Kaidi variants remain
+standalone. See [paired-side configuration](../CONFIGURATION.md#single-address-left--right-controls).
 
 ## Notes
 
 1. The bed must already be provisioned in the official app. Home Assistant does not implement the add-device/reset workflow.
 2. Kaidi devices named `Mouselet` are valid beds when the manufacturer payload matches Kaidi; the generic `"mouse"` exclusion no longer applies in that case.
-3. If `auto` reports unresolved Kaidi metadata, switch the integration option to one of `seat_1`, `seat_2`, `seat_3`, `bed_1`, `bed_2`, or `bed_12`.
+3. If `auto` reports unresolved Kaidi metadata, switch the integration option to the verified layout: `seat_1`, `seat_2`, `seat_3`, or `seat_1_2`.

@@ -1,18 +1,25 @@
 # Dual Bed 4.0 — Implementation Plan (issue #329)
 
+> **Historical design plan.** Paired-bed support is implemented on `release/4.0`.
+> The proposal, pseudocode, phases, and file:line references below describe the
+> original planning state, not a current completion checklist. For current
+> behavior, use [Configuration](../CONFIGURATION.md),
+> [HA migration and native child devices](../HA_2026_9.md),
+> [runtime and registry architecture](paired-runtime-and-registry.md), and the
+> [validation matrix](../V4_VALIDATION.md).
+
 > First-class paired-bed handling: one logical HA device exposing **left**, **right**,
 > and **both** controls. The common case — two independent BLE devices (Linak and most
 > split-kings) — is the pathfinder; Octo's active-connection switching is a harder profile
 > layered on top (it's the direct fix for issue #327).
 >
-> **Target release: v4.0.** (v3.0 ships today *without* this.) Issue #329 is titled "Dual
+> **Original target release: v4.0.** (v3 shipped without this.) Issue #329 is titled "Dual
 > Bed 3.0" for historical reasons; the feature is retargeted to 4.0. Happy alignment: the
 > v4.0 *feature* also bumps the *config-entry schema* to VERSION 4 (§3) — two different "4"s
 > that land together.
 >
-> Status: **plan / not started**. This document is the implementation reference for the
-> 4.0 epic. File:line references are accurate as of the planning commit and should be
-> re-checked while implementing.
+> Original status: **plan / not started**. Retained as design history for the
+> 4.0 epic; see the current references above for implementation status.
 
 ---
 

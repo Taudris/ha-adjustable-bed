@@ -1,8 +1,8 @@
 # RMControl product profiles
 
 **Status:** Source-verified against RMControl 21.3.7
-(`com.richmat.rmcontrol2`), hardware unverified. The independent evidence
-reconciliation is accepted; this document does not claim the PR is merged.
+(`com.richmat.rmcontrol2`), implemented on `release/4.0`, hardware unverified.
+The independent evidence reconciliation is accepted.
 
 These opt-in profiles preserve the app's exact product choices and individual
 button commands. They are separate from the existing [Richmat profiles](richmat.md).

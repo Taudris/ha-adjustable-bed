@@ -1,12 +1,16 @@
 # AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance for agents working with code in this repository.
 
 ## Project Overview
 
 This is a Home Assistant custom integration for controlling smart adjustable beds via Bluetooth Low Energy (BLE). It replaces the broken `smartbed-mqtt` addon with a native HA integration that uses Home Assistant's Bluetooth stack directly.
 
 **Current status:** Dozens of bed protocols implemented. The README's "Supported Beds" table is the single source of truth for which protocols exist and which are confirmed working — don't duplicate that list here.
+
+**v4 baseline:** Work from `release/4.0`. It requires Home Assistant 2026.9.0+
+and Python 3.14.2+. Start with the [documentation index](docs/README.md),
+[migration notes](docs/HA_2026_9.md), and [validation matrix](docs/V4_VALIDATION.md).
 
 ## GitHub Comment Approval
 
@@ -45,13 +49,18 @@ Key modules (not an exhaustive listing — check the folder for the rest):
 
 ```text
 custom_components/adjustable_bed/
-├── __init__.py           # Integration setup, platform loading, service registration
+├── __init__.py           # Integration setup, migration and platform loading
+├── services.py           # Action schemas, handlers and registration
 ├── config_flow.py        # Device discovery and setup wizard
 ├── coordinator.py        # BLE connection management (central hub)
 ├── const.py              # Constants, UUIDs, bed type definitions, feature flags
 ├── detection.py          # Bed type auto-detection from BLE services/names
 ├── controller_factory.py # Factory for creating bed controller instances
 ├── entity.py             # Base entity class
+├── entity_runtime.py     # Typed standalone and paired entity runtime interfaces
+├── paired_coordinator.py # Parent/side routing and combined operation cleanup
+├── paired_registry.py    # Device/entity ownership transfer and rollback
+├── paired_devices.py     # Native parent/child devices and service targeting
 ├── beds/                 # Bed controllers — one module per protocol
 │   ├── base.py           # Abstract base class (BedController)
 │   ├── diagnostic.py     # Debug controller for unsupported beds
@@ -72,8 +81,8 @@ custom_components/adjustable_bed/
 
 **AdjustableBedCoordinator** (`coordinator.py`): Central BLE connection manager
 - Handles device discovery via HA's Bluetooth integration
-- Connection retry with progressive backoff (3 attempts, 5-7.5s delays)
-- Auto-disconnect after configurable idle time (default 40s)
+- Profile-based connection timeouts/backoff; multiple usable paths receive a bounded extra retry budget
+- One-second handoff when Disconnect After Command is enabled; otherwise configurable idle timeout (default 40s), except persistent-connection controllers
 - Registers conservative BLE connection parameters (30-50ms intervals)
 - Supports preferred adapter selection for multi-proxy setups
 - Command serialization via `_command_lock` prevents concurrent BLE writes
@@ -90,12 +99,22 @@ custom_components/adjustable_bed/
 - Preset methods: `preset_memory()`, `program_memory()`
 - Optional features: `lights_on()`, `massage_toggle()`, etc.
 
+**Paired beds** (`paired_coordinator.py`, `paired_registry.py`, `paired_devices.py`):
+- Config-entry schema version 4 supports standalone and paired entries
+- One parent device with native Left/Right children, for both one-address and two-address pairs
+- Conversion and unpair preserve side entity/device identities through registry ownership transactions
+- Child service targets retain their side; conflicting explicit side requests are rejected
+- See [runtime boundaries](docs/design/paired-runtime-and-registry.md) and [migration](docs/HA_2026_9.md)
+
 **Config Flow** (`config_flow.py`):
 - Automatic discovery via BLE service UUIDs and device name patterns
 - Manual entry with bed type selection
 - Per-device Bluetooth adapter/proxy selection
 - Protocol variant selection where applicable
 - Options flow for reconfiguration
+- Active rescan and progress-backed setup, authentication, and bond removal
+- Explicit app/product profiles when advertisement data cannot identify the layout
+- Reversible combination of compatible entries and opt-in single-address side controls
 
 **BLE Connection Binary Sensor** (`binary_sensor.py`):
 - Shows real-time BLE connection state (device class: connectivity)
@@ -188,13 +207,14 @@ The supported-protocol list lives in the README's "Supported Beds" table — tha
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `motor_count` | 2, 3, or 4 motors | 2 |
+| `motor_count` | 2, 3, or 4 motors; 1 only for supported single-actuator lifts | 2 |
 | `malouf_layout` | Malouf/Lucid physical actuator layout, independent of protocol | auto |
 | `malouf_memory_slots` | Malouf/Lucid remote memory capacity (auto, 1, or 2) | auto |
 | `has_massage` | Enable massage entities | false |
 | `protocol_variant` | Protocol variant (bed-specific) | auto |
-| `disable_angle_sensing` | Disable position feedback | true |
-| `preferred_adapter` | Lock to specific BLE adapter | auto |
+| `disable_angle_sensing` | Disable position feedback | depends on bed type and setup route |
+| `passive_position_reconciliation` | Refresh positions while idle, when supported and quick handoff is off | bed-specific |
+| `preferred_adapter` | Preferred BLE adapter; HA may reroute at connection time | auto |
 | `connection_profile` | BLE connection profile | balanced |
 | `motor_pulse_count` | Command repeat count | 10 |
 | `motor_pulse_delay_ms` | Delay between repeats | 100 |
@@ -204,21 +224,24 @@ The supported-protocol list lives in the README's "Supported Beds" table — tha
 | `position_mode` | Speed vs accuracy tradeoff | speed |
 | `octo_pin` | PIN for Octo beds | "" |
 | `jensen_pin` | PIN for Jensen beds | "" |
-| `cb24_bed_selection` | Bed A/B selection for CB24 split beds | default (neither side) |
+| `cb24_bed_selection` | Bed A/B selection for CB24 split beds | both sides |
 | `richmat_remote` | Remote code for Richmat beds | auto |
 | `back_max_angle` | Max angle for back motor (degrees) | 68.0 |
 | `legs_max_angle` | Max angle for legs motor (degrees) | 45.0 |
 
+App/product-specific fields and their capability gates are documented in
+[Configuration](docs/CONFIGURATION.md#app-and-product-profiles). Do not infer an
+app profile from a shared transport or propagate side-specific settings across
+a two-address pair.
+
 ## Services
 
-| Service | Description |
-|---------|-------------|
-| `adjustable_bed.goto_preset` | Move bed to memory position 1-4 |
-| `adjustable_bed.save_preset` | Save current position to memory 1-4 |
-| `adjustable_bed.stop_all` | Immediately stop all motors |
-| `adjustable_bed.set_position` | Move motor to a specific position |
-| `adjustable_bed.timed_move` | Move motor for a specified duration |
-| `adjustable_bed.generate_support_bundle` | Capture the full JSON support bundle (BLE diagnostics, GATT details, pairing evidence, command trace, logs). Params: `device_id` or `target_address` (exactly one), `capture_duration`, `include_logs` |
+The complete public action index is [Actions and Automations](docs/SERVICES.md).
+`services.yaml` defines the UI fields; `services.py` registers and validates them,
+with dedicated RMControl and Sleep Number handlers. Memory actions accept slots
+1–6 subject to controller capabilities. `set_positions` validates all requested
+targets before executing the ordered movement. Control actions support paired
+side routing; support capture requires one physical target.
 
 ## Critical Implementation Details
 
@@ -267,36 +290,47 @@ under `custom_components/adjustable_bed/frontend/`.
   - `adjustable-bed-card.ts` — the card element (renders only sections that have
     entities; all colour comes from HA theme CSS variables).
   - `editor.ts` — visual editor (`ha-form` + device picker + section toggles).
+  - `hold.ts` — movement pulse repetition and side-scoped release/STOP handling.
   - `bed-graphic.ts` — theme-aware angle SVG. `localize.ts` + `translations/`
-    hold the card's own strings (section headers / editor labels) in `en`/`nb`;
+    hold the card's own strings (section headers / editor labels);
     entity names come from HA's localized `friendly_name`.
 - **Build** (requires [bun](https://bun.sh)):
   ```bash
   cd custom_components/adjustable_bed/frontend
-  bun install
+  bun install --frozen-lockfile
   bun run check   # tsc (TypeScript 7) typecheck + esbuild bundle
-  bun test        # discovery unit tests
+  bun test        # discovery, paired-state and hold behavior
   ```
   The bundle is written to `frontend/dist/adjustable-bed-card.js` and is
   **committed** (it ships with the integration). Rebuild and commit it whenever
   you change `frontend/src`.
-- **Registration**: `frontend.py` serves `frontend/dist` as a static path and
-  calls `add_extra_js_url`, so the card auto-loads with no manual Lovelace
-  resource. `frontend` is listed in `manifest.json` `after_dependencies` for
-  setup ordering; registration is best-effort and never blocks integration
-  setup.
+- **Registration**: `frontend.py` serves the committed bundle and a stable,
+  uncached module loader at `/adjustable_bed_frontend/adjustable-bed-card.js`.
+  It registers a Lovelace resource and an extra frontend module automatically,
+  consolidating old storage-mode resources. `frontend` and `lovelace` are in
+  `after_dependencies`; registration is best-effort and does not block setup.
 
 ## Development
 
 ### Running tests
 
-Run the Python test suite with `uv run pytest`. Automatic worker selection
+Install dependencies and HA's managed Bluetooth stack before running tests:
+
+```sh
+uv sync --extra dev
+uv run --no-sync python scripts/ha_bluetooth_test_requirements.py > /tmp/ha-bluetooth-requirements.txt
+uv pip install -r /tmp/ha-bluetooth-requirements.txt
+uv run --no-sync pytest
+```
+
+Use `--no-sync` after installing the HA-managed pins so resolution does not
+replace them. Automatic worker selection
 detects the available CPUs but is capped at four workers; explicit numeric
 overrides remain available.
-Use `uv run pytest -n 0 <test-path>` for focused or debug runs. Agents must not
+Use `uv run --no-sync pytest -n 0 <test-path>` for focused or debug runs. Agents must not
 run multiple full suites concurrently, since the worker cap applies to each
 pytest process. On a suitably powerful desktop, one full-suite run may override
-the automatic selection explicitly, for example: `uv run pytest -n 8`.
+the automatic selection explicitly, for example: `uv run --no-sync pytest -n 8`.
 
 ### Testing in Home Assistant
 
@@ -323,10 +357,15 @@ The `generate_support_bundle` service captures protocol data for debugging and a
 
 | File | Content |
 |------|---------|
+| `docs/README.md` | Documentation index and developer entry points |
 | `docs/SUPPORTED_ACTUATORS.md` | Which beds use which actuators, brand lookup |
 | `docs/CONFIGURATION.md` | All configuration options explained |
 | `docs/CONNECTION_GUIDE.md` | Bluetooth setup, ESPHome proxy configuration |
 | `docs/TROUBLESHOOTING.md` | Common issues and solutions |
+| `docs/SERVICES.md` | All public actions, paired side routing and automation examples |
+| `docs/HA_2026_9.md` | v4 baseline, migration, backup and rollback |
+| `docs/V4_VALIDATION.md` | Automated validation and final release-candidate gates |
+| `docs/COMMAND_LIFECYCLE.md` | Scheduling, cancellation and connection ownership |
 | `docs/beds/*.md` | Per-actuator protocol documentation |
 
 ## Reference Materials

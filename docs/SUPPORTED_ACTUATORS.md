@@ -1,45 +1,55 @@
 # Supported Actuators
 
-This document provides an overview of supported bed brands. Click on a brand name for detailed protocol information and command references.
+This guide maps actuator families and app profiles to detailed protocol references.
+The [README Supported Beds table](../README.md#supported-beds) is the canonical
+support index. Each linked guide records model-specific evidence and hardware
+validation limits; the feature summaries below depend on the selected controller.
 
-| Brand | Status | Key Features |
-|-------|--------|--------------|
-| [Linak](beds/linak.md) | ✅ Supported | Auto-detected models, up to 5 axes, 0/4 memories, speed/status/errors, massage, alarms, lights |
-| [Keeson](beds/keeson.md) | ✅ Supported | Position feedback (Ergomotion), 4 presets, massage, lights |
-| [Richmat](beds/richmat.md) | ✅ Supported | 1-5 memory presets, massage (discrete), RGB lights + timer, sync mode, motors 5-7 |
-| [MotoSleep](beds/motosleep.md) | ✅ Supported | 2 memory presets, massage, lights, Zero-G |
-| [Octo](beds/octo.md) | ✅ Supported | Two protocol variants, optional PIN auth, RGBW lights. Sold as bett1.de, Dunlopillo, Hüsler Nest, Swiss Sense, Velda, Werkmeister, sleepling and more ([known brand list](beds/octo.md#bed-brands-that-ship-octo-actuators)) |
-| [Solace](beds/solace.md) | ✅ Supported | Name-based profiles, 2 memories, named presets, optional massage/lights, exact S4-Y lift/tilt |
-| [Leggett & Platt](beds/leggett-platt.md) | ✅ Supported | Gen2: motor control + RGB lighting; Okin: tilt/lumbar, massage |
-| [Reverie](beds/reverie.md) | ✅ Supported | Position control (0-100%), 4 presets, wave massage |
-| [Okimat/Okin](beds/okimat.md) | ✅ Supported | 4 memory presets, massage, lights (requires pairing) |
-| [Okin 64-Bit](beds/okin-64bit.md) | 🧪 Needs Testing | 10-byte Nordic/custom OKIN protocol, lumbar, lights, massage |
-| [Jiecang](beds/jiecang.md) | ✅ Supported | Motor control, 3 memory slots, massage, split bed support |
-| [Kaidi](beds/kaidi.md) | 🧪 Needs Testing | Mouselet-based beds, Flat/Zero-G/Anti-Snore, 4 memory slots |
-| [Jensen](beds/jensen.md) | ✅ Supported | Go-to-position, variable massage (0-10), dynamic feature detection |
-| [DewertOkin](beds/dewertokin.md) | ✅ Supported | 79 brands (many older Rize/Simmons models), multiple protocols |
-| [Serta](beds/serta.md) | ✅ Supported | Massage intensity control, Zero-G/TV/Lounge |
-| [Mattress Firm 900](beds/mattressfirm.md) | ✅ Supported | Older iFlex/Nordic UART bases, lumbar control, built-in presets |
-| [Nectar](beds/nectar.md) | ✅ Supported | Lumbar control, massage, lights, Zero-G/Anti-Snore/Lounge |
-| [Malouf/Lucid](beds/malouf.md) | ✅ Supported | Configurable 2/3/4-motor or Hi-Lo layout, 1-2 memory positions, massage, lights |
-| [BedTech](beds/bedtech.md) | ✅ Supported | 5 presets, 4 massage modes, dual-base support |
-| [Sleep Number](beds/sleep_number.md) | 🧪 Needs Testing | Newer Fuzion: direct position, side selection, presence, climate. Older BAM/MCR: split firmness, foundation presets, under-bed lights |
-| [Sleepy's Elite](beds/sleepys.md) | ✅ Supported | Lumbar (BOX15), Zero-G, Flat presets |
-| [SleepSpa S9000AI](beds/sleepstar.md) | 🧪 Needs Testing | CB37 sleep monitor, five app-addressable actuators, position feedback, sonic massage, RGB lighting |
-| [Svane](beds/svane.md) | ✅ Supported | LinonPI protocol, multi-service |
-| [Vibradorm](beds/vibradorm.md) | ✅ Supported | Position feedback, 4 memory presets, lights |
-| [SUTA Smart Home](beds/suta.md) | 🧪 Needs Testing | AT command protocol, 4 memory slots, discrete lights |
-| [TiMOTION AHF](beds/timotion-ahf.md) | 🧪 Needs Testing | 5-motor bitmask protocol, toggle lights, AHF name detection |
-| [Limoss](beds/limoss.md) | 🧪 Needs Testing | TEA-encrypted packets, position feedback, dynamic capability query |
-| [Cool Base](beds/coolbase.md) | 🧪 Needs Testing | Keeson BaseI5 with fan control |
-| [Scott Living](beds/scott-living.md) | 🧪 Needs Testing | 9-byte protocol |
-| [SBI/Q-Plus](beds/sbi.md) | 🧪 Needs Testing | Position feedback via pulse lookup |
-| [Rondure](beds/rondure.md) | 🧪 Needs Testing | 4 motors, split-king, massage, lights |
-| [Remacro](beds/remacro.md) | ✅ Supported | 4 motors, 8 presets, RGB lights, heat |
-| [Logicdata](beds/logicdata.md) | 🧪 Needs Testing | XXTEA encrypted, 2 memory slots, lights, massage |
-| [Okin CB35](beds/okin-cb35.md) | 🧪 Needs Testing | 7-byte Nordic UART (Sealy Posturematic), 6 motors, massage, lights |
-| [Okin CST](beds/okin-cst.md) | 🧪 Needs Testing | 14-byte dual-field protocol (Rize Sanctuary, Resident, Aviada, Bob, Contempo, II Carefree, II Clarity, MF900; Support; Mattress Firm 900-O / MFirm 900-O; Nectar Motion) |
-| [OKIN Smart Remote / RF ECO BT](beds/okin-rf-eco-bt.md) | 🧪 Needs Testing | Single stair actuator for Elda BTH / MEGAMAT |
+| Brand | Key Features |
+|-------|--------------|
+| [Linak](beds/linak.md) | Auto-detected models, up to 5 axes, 0/4 memories, speed/status/errors, massage, alarms, lights |
+| [Keeson](beds/keeson.md) | Position feedback (Ergomotion), 4 presets, massage, lights |
+| [Richmat](beds/richmat.md) | 1-5 memory presets, massage (discrete), RGB lights + timer, Controller Sync, motors 5-7 |
+| [RMControl products](beds/rmcontrol.md) | Explicit product catalogs, reported state, alarms and snore intervention |
+| [MotoSleep](beds/motosleep.md) | Model-dependent HHC/MOTO controls, memory, massage and lighting |
+| [Octo](beds/octo.md) | Two protocol variants, optional PIN auth, RGBW lights. Sold as bett1.de, Dunlopillo, Hüsler Nest, Swiss Sense, Velda, Werkmeister, sleepling and more ([known brand list](beds/octo.md#bed-brands-that-ship-octo-actuators)) |
+| [Solace](beds/solace.md) | Name-based profiles, 2 memories, named presets, optional massage/lights, exact S4-Y lift/tilt |
+| [Leggett & Platt](beds/leggett-platt.md) | Gen2: motor control + RGB lighting; Okin: tilt/lumbar, massage |
+| [Prodigy / U Series app profiles](beds/leggett-okin.md) | Explicit layout, held controls, sleep/alarm timers |
+| [L&P legacy app](beds/lp-legacy.md) | Explicit model, protocol mode and confirmed GATT characteristics |
+| [Reverie](beds/reverie.md) | Position control (0-100%), 4 presets, wave massage |
+| [Okimat/Okin](beds/okimat.md) | 4 memory presets, massage, lights (requires pairing) |
+| [Okin 64-Bit](beds/okin-64bit.md) | 10-byte Nordic/custom OKIN protocol, lumbar, lights, massage |
+| [Jiecang](beds/jiecang.md) | Motor control, 3 memory slots, massage, split bed support |
+| [Jiecang app profiles](beds/jiecang-app.md) | ERGOBALANCE / Dream Motion layouts, alarms, wake routines, renaming |
+| [Kaidi](beds/kaidi.md) | Mouselet-based beds, Flat/Zero-G/Anti-Snore, 4 memory slots |
+| [Jensen](beds/jensen.md) | Go-to-position, variable massage (0-10), dynamic feature detection |
+| [DewertOkin](beds/dewertokin.md) | 79 brands (many older Rize/Simmons models), multiple protocols |
+| [Serta](beds/serta.md) | Massage intensity control, Zero-G/TV/Lounge |
+| [Mattress Firm 900](beds/mattressfirm.md) | Older iFlex/Nordic UART bases, lumbar control, built-in presets |
+| [Nectar](beds/nectar.md) | Lumbar control, massage, lights, Zero-G/Anti-Snore/Lounge |
+| [Malouf/Lucid](beds/malouf.md) | Configurable 2/3/4-motor or Hi-Lo layout, 1-2 memory positions, massage, lights |
+| [BedTech](beds/bedtech.md) | 5 presets, 4 massage modes, dual-base support |
+| [Sleep Number](beds/sleep_number.md) | Fuzion and BAM/MCR: capability-dependent position, firmness, presets, lighting and thermal controls |
+| [Sleepy's Elite](beds/sleepys.md) | BOX15/24/25 variants, presets, BOX25 position sliders including lumbar |
+| [SleepSpa S9000AI](beds/sleepstar.md) | CB37 sleep monitor, five app-addressable actuators, position feedback, sonic massage, RGB lighting |
+| [Svane](beds/svane.md) | LinonPI protocol, multi-service |
+| [Vibradorm](beds/vibradorm.md) | Position feedback, 4 memory presets, lights |
+| [SUTA Smart Home](beds/suta.md) | AT command protocol, 4 memory slots, discrete lights |
+| [TiMOTION AHF](beds/timotion-ahf.md) | 5-motor bitmask protocol, toggle lights, AHF name detection |
+| [Limoss](beds/limoss.md) | TEA-encrypted packets, position feedback, dynamic capability query |
+| [Cool Base](beds/coolbase.md) | Keeson BaseI5 with fan control |
+| [Scott Living](beds/scott-living.md) | 9-byte protocol |
+| [SBI/Q-Plus](beds/sbi.md) | Position feedback via pulse lookup |
+| [Rondure](beds/rondure.md) | 4 motors, split-king, massage, lights |
+| [Remacro](beds/remacro.md) | 4 motors, 8 presets, RGB lights, heat |
+| [Logicdata](beds/logicdata.md) | XXTEA encrypted, 2 memory slots, lights, massage |
+| [LOGICDATA app profiles](beds/logicdata-app.md) | Phone/tablet layouts, standard/middle-motor controls, alarms and renaming |
+| [Okin CB35](beds/okin-cb35.md) | 7-byte Nordic UART (Sealy Posturematic), 6 motors, massage, lights |
+| [Okin CST](beds/okin-cst.md) | 14-byte dual-field protocol (Rize Sanctuary, Resident, Aviada, Bob, Contempo, II Carefree, II Clarity, MF900; Support; Mattress Firm 900-O / MFirm 900-O; Nectar Motion) |
+| [OKIN Smart Remote / RF ECO BT](beds/okin-rf-eco-bt.md) | Single stair actuator for Elda BTH / MEGAMAT |
+| [Okin DOT](beds/okin-dot.md) | Handset-specific motor, memory and light controls |
+| [DewertOkin ELEVATE](beds/star-elevate.md) | Two-actuator lift accessory |
 
 ---
 
@@ -66,14 +76,14 @@ Several bed brands use Okin-based BLE controllers. While they share common roots
 | [Nectar](beds/nectar.md) | 7-byte (32-bit cmd) | UUID `62741525-...` without response | ❌ No | Name contains "nectar" or generic `OKIN-*` disambiguation |
 | [DewertOkin](beds/dewertokin.md) | 6-byte (32-bit cmd) | UUID `62741525-...` | ❌ No | Name patterns |
 | [Mattress Firm 900](beds/mattressfirm.md) | 7-byte (32-bit cmd) | Nordic UART | ❌ No | Name starts with "iflex" |
-| [Malouf](beds/malouf.md) | 8-byte (32-bit cmd) | Nordic UART or FFE5 | ❌ No | Service UUID detection |
+| [Malouf](beds/malouf.md) | 8-byte New OKIN / 9-byte Legacy OKIN | Nordic UART or FFE5 | ❌ No | Service UUID detection |
 | [Keeson/Ergomotion](beds/keeson.md) | 8-byte (32-bit cmd) | Nordic UART | ❌ No | Name patterns |
 | [Okin CB35](beds/okin-cb35.md) | 7-byte (1-byte cmd) | Nordic UART | ❌ No | Name starts with "Star35" |
 | [Okin CST](beds/okin-cst.md) | 14-byte (dual 32-bit) | UUID `62741525-...` | ✅ Yes | Rize Sanctuary, Resident, Aviada, Bob, Contempo, II Carefree, II Clarity, MF900; Support; Mattress Firm 900-O / MFirm 900-O; Nectar Motion; some `OKIN-*` bases |
 | [OKIN Smart Remote / RF ECO BT](beds/okin-rf-eco-bt.md) | 6-byte (32-bit cmd) | UUID `62741525-...` | Unknown | Manual selection; diagnostics can match CSS GATT signature |
 
 **Key differences:**
-- **6-byte vs 7-byte vs 8-byte vs 10-byte vs 14-byte**: Different command structures - not interchangeable
+- **6-byte vs 7-byte vs 8-byte vs 9-byte vs 10-byte vs 14-byte**: Different command structures - not interchangeable
 - **32-bit vs 64-bit commands**: Okin 64-bit uses 8-byte command values instead of 4-byte
 - **Characteristic handles vary**: Okin-family beds share stable UUIDs, but numeric
   handles differ by device/firmware and must not be hardcoded
@@ -81,19 +91,14 @@ Several bed brands use Okin-based BLE controllers. While they share common roots
 
 **If auto-detection picks the wrong type:** Go to Settings → Devices & Services → Adjustable Bed → Configure and change the bed type.
 
-**Detection priority** (for beds with Okin service UUID):
-1. Name contains "nectar" → Nectar
-2. Name begins `LP BED` or contains "leggett" / "l&p" → Leggett & Platt Okin
-3. Name contains "okimat", "okin rf", or "okin ble" → Okimat
-4. Name starts with `OKIN-` → prompt for Okin-family protocol (confirmed Nectar bases can advertise this way)
-5. Name is `OKIN-Receiver` / `OKIN - Receiver` → prompt for Okin-family protocol
-6. Connected GATT has `62741525-...` plus CSS `90311625-...` → Okin CST or
-   OKIN Smart Remote / RF ECO BT. Nordic DFU is an initial CST hint, not a safe
-   discriminator. Device Information model `MEGAMAT MBZ` identifies RF ECO BT,
-   an `OKIMAT` model identifies a full bed, and an already configured CST or RF
-   ECO BT profile is otherwise preserved. A name beginning `LP BED` identifies
-   LP Control's proven 6-byte Okin path.
-7. Fallback → Okimat (with warning logged)
+**Shared identifiers:** Generic `OKIN-*` and receiver names can require a
+protocol-selection prompt. An `OKIN-BLE` name alone does not distinguish
+Malouf/Lucid from other OKIN controllers; service and manufacturer data matter.
+Connected GATT and Device Information can further refine the result. For example,
+the shared CSS endpoint can belong to a full bed or the single-actuator RF ECO BT
+profile. Nordic DFU is only a hint, while model information can distinguish
+`MEGAMAT MBZ` from `OKIMAT` hardware. See [Okimat detection](beds/okimat.md#detection)
+for the current family-specific rules.
 
 ---
 
@@ -108,7 +113,7 @@ Beds that won't be supported:
 - **Logicdata eLift / desk controllers** — Uses local UDP/HTTP, not Bluetooth
 - **ErgoWifi** — Uses Xlink cloud platform
 
-Note: LOGICDATA MOTIONrelax BLE beds are supported under [Jiecang](beds/jiecang.md) (Lierda protocol).
+LOGICDATA MOTIONrelax BLE app layouts have an explicit [LOGICDATA app profile](beds/logicdata-app.md). Existing legacy [Jiecang](beds/jiecang.md) entries retain their original protocol.
 
 If you have one of these beds, consider running [smartbed-mqtt](https://github.com/richardhopton/smartbed-mqtt) as an add-on or make a separate integration for WiFi/Cloud adjustable beds.
 
@@ -131,7 +136,7 @@ These beds have their own dedicated integrations:
    - `DPG*` or `Desk*` → Linak
    - `Mouselet*` → Kaidi
    - `Nectar*` → Nectar
-   - `Okimat*`, `Okin RF*`, `Okin BLE*` → Okimat/Okin UUID
+   - `Okimat*`, `Okin RF*` → Okimat/Okin candidates; verify the advertised services
    - `OKIN-Receiver`, `OKIN - Receiver` → prompted Okin-family protocol selection
    - `Leggett*`, `L&P*`, `Adjustable Base*` → Leggett & Platt
    - `Ergomotion*` or `Ergo*` → Keeson/Ergomotion
@@ -151,7 +156,7 @@ These beds have their own dedicated integrations:
    - `SUTA-*` → SUTA Smart Home (bed-frame variants)
    - `AHF*` → TiMOTION AHF
    - `Limoss*`, `Stawett*` → Limoss
-   - `OKIN-BLE*` → Keeson (Sino variant, BetterLiving/Dynasty/INNOVA)
+   - `OKIN-BLE*` → requires service/manufacturer data to distinguish [Malouf/Lucid](beds/malouf.md) from other OKIN-family profiles
    - `CheersSleep*`, `Jeromes*`, `Slumberland*`, `The Brick*` → Remacro
    - `Rize*` → Often [DewertOkin](beds/dewertokin.md), but `Mouselet*` devices are [Kaidi](beds/kaidi.md)
    - `Simmons*`, `Glory*`, `Symphony*` → See [DewertOkin](beds/dewertokin.md)
@@ -179,7 +184,7 @@ These beds have their own dedicated integrations:
 
 5. **Fallback**: If the device isn't visible to Home Assistant at all, use [nRF Connect](https://www.nordicsemi.com/Products/Development-tools/nRF-Connect-for-mobile) on your phone to verify it exists and check the service UUIDs.
 
-If your bed isn't auto-detected, use manual configuration and try different bed types.
+If your bed isn't auto-detected, use manual configuration with the matching protocol guide. Capture a support bundle when the controller is ambiguous.
 
 ---
 

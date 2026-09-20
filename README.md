@@ -16,21 +16,27 @@
 
 ## Quick Start
 
-1. **Install** via [HACS](https://hacs.xyz): Search for "Adjustable Bed" and install
+This is the **v4 beta development branch** for **Home Assistant 2026.9.0+**.
+Back up Home Assistant before upgrading from v3;
+see [compatibility and rollback](docs/HA_2026_9.md).
+
+1. **Install** via [HACS](https://hacs.xyz): Search for "Adjustable Bed" and select the v4 beta when testing this branch
 2. **Discover** your bed automatically, or add manually via Settings → Integrations
 3. **Control** your bed from Home Assistant dashboards, automations, and voice assistants!
 
 ## Features
 
 - **Native Dashboard Card** - Auto-loading Lovelace card that adapts to your bed ([details](#dashboard-card))
+- **Paired Beds** - Left, Right, and Both controls for compatible split beds, with reversible conversion of existing entries
 - **Motor Control** - Raise/lower head, back, legs, and feet
-- **Direct Position Control** - Native 0-100 target controls on supported beds
+- **Position Control** - Position sliders in degrees or percentages, according to the controller
 - **Memory Presets** - Jump to saved positions with one tap
 - **Under-bed Lights** - RGB color control on supported beds, toggle on/off on others
 - **Climate Controls** - Cooling, heating, and footwarming on supported beds
 - **Massage Control** - Adjust massage intensity and patterns
 - **Position Feedback** - See current angles on supported beds
 - **Presence Sensors** - Occupancy sensors on supported beds
+- **Firmness Controls** - Sleep Number settings on supported beds
 - **Automations** - "Flat when leaving", "TV mode at 8pm", etc.
 
 ## Need Help?
@@ -40,7 +46,11 @@
 | **[Troubleshooting](docs/TROUBLESHOOTING.md)** | Connection issues, commands not working |
 | **[Getting Help](docs/GETTING_HELP.md)** | Bug reports, support requests, diagnostics |
 | **[Connection Guide](docs/CONNECTION_GUIDE.md)** | ESPHome proxy setup, finding your bed's address |
+| **[Configuration](docs/CONFIGURATION.md)** | Settings, app profiles, combining and splitting beds |
+| **[Actions and Automations](docs/SERVICES.md)** | Movement, memory, side targeting, and bed-specific actions |
 | **[Supported Actuators](docs/SUPPORTED_ACTUATORS.md)** | Protocol details, bed brand lookup |
+
+See the [documentation index](docs/README.md) for migration and developer guides.
 
 | | |
 |---|---|
@@ -71,6 +81,7 @@ The entries below identify motor/actuator manufacturers or supported app profile
 | ✅ [Linak](docs/beds/linak.md) | Tempur-Pedic, Bedre Nætter, Jensen |
 | ✅ [Keeson](docs/beds/keeson.md) | Ergomotion, Tempur, Beautyrest, King Koil, Member's Mark, Purple, GhostBed, ErgoSportive |
 | ✅ [Richmat](docs/beds/richmat.md) | Casper, MLILY, Sven & Son, Avocado, Luuna, Jerome's |
+| 🧪 [RMControl product profiles](docs/beds/rmcontrol.md) | Explicit Richmat RMControl 21.3.7 product catalogs; hardware unverified |
 | ✅ [MotoSleep](docs/beds/motosleep.md) | HHC, Power Bob, binary MOTO models |
 | ✅ [Octo](docs/beds/octo.md) | Octo |
 | ✅ [Solace](docs/beds/solace.md) | Solace, Sealy, Woosa Sleep, QMS |
@@ -78,7 +89,7 @@ The entries below identify motor/actuator manufacturers or supported app profile
 | 🧪 [Prodigy / U Series app profiles](docs/beds/leggett-okin.md) | Prodigy 2L, Prodigy 2, Prodigy 4 and U / Ultra Series (BLE profiles and timers) |
 | 🧪 [L&P Adjustable Base, legacy app](docs/beds/lp-legacy.md) | Explicit app remote layouts from `com.richmat.lp` 2.2.1; hardware unverified |
 | ✅ [Reverie](docs/beds/reverie.md) | Reverie |
-| ✅ [Okimat/Okin](docs/beds/okimat.md) | Lucid (including some Smartbed/L600 bases), CVB, Smartbed, RF ECO BT 88802 bed receivers |
+| ✅ [Okimat/Okin](docs/beds/okimat.md) | Lucid, CVB, Smartbed, RF ECO BT bed receivers |
 | ✅ [Okin 64-Bit](docs/beds/okin-64bit.md) | NORA_CON / NORACON Mattress Firm controllers |
 | ✅ [Jiecang](docs/beds/jiecang.md) | Glideaway, Dream Motion, LOGICDATA |
 | 🧪 [Jiecang app profiles](docs/beds/jiecang-app.md) | ERGOBALANCE 1.0.8 and Dream Motion 1.0.5, explicit layouts; hardware unverified |
@@ -90,7 +101,7 @@ The entries below identify motor/actuator manufacturers or supported app profile
 | ✅ [Serta](docs/beds/serta.md) | Serta Motion Perfect |
 | ✅ [Mattress Firm 900](docs/beds/mattressfirm.md) | iFlex / older Nordic UART bases |
 | ✅ [Nectar](docs/beds/nectar.md) | Nectar |
-| ✅ [Malouf/Lucid](docs/beds/malouf.md) | Malouf, Lucid (including some L600 bases), Structures |
+| ✅ [Malouf/Lucid](docs/beds/malouf.md) | Malouf, Lucid, Structures |
 | ✅ [BedTech](docs/beds/bedtech.md) | BedTech |
 | ✅ [Sleep Number](docs/beds/sleep_number.md) | Climate 360, FlexFit, FlexFit Smart, i8 / 360 FlexFit 2 |
 | ✅ [Sleepy's Elite](docs/beds/sleepys.md) | Sleepy's |
@@ -111,15 +122,16 @@ The entries below identify motor/actuator manufacturers or supported app profile
 | ✅ [OKIN Smart Remote / RF ECO BT](docs/beds/okin-rf-eco-bt.md) | Elda BTH / MEGAMAT staircase actuator |
 | ✅ [Okin DOT](docs/beds/okin-dot.md) | DewertOkin RF1058/RF34/RF6707 handset beds |
 
-Retail model names do not identify a BLE protocol. In particular, **Lucid
-L600 is not one protocol**: confirmed L600 units include both 7-byte OKIN CB24
-(`Smartbed237...`) and 9-byte legacy Malouf/OKIN (`OKIN-BLE...` with `BTCB`)
-controllers. Auto-detection uses advertising data and connected GATT services,
-not the L600 label.
+✅ marks supported families; 🧪 marks explicitly selected app profiles whose
+hardware validation is pending. Support for a family does not establish that
+every model or feature has been physically tested. Each protocol guide records
+its evidence and remaining hardware limitations.
 
 **Have one of these?** [Let us know](https://github.com/kristofferR/ha-adjustable-bed/issues) how well it works!
 
-Some brands span multiple controller families. For example, many older Rize beds are DewertOkin, while newer `Mouselet`-advertising Rize beds use [Kaidi](docs/beds/kaidi.md).
+Some brands use more than one controller family. Let auto-detection identify
+the controller, or consult the [brand and protocol guide](docs/SUPPORTED_ACTUATORS.md)
+when choosing manually.
 
 ## Will This Work With My Bed?
 
@@ -145,12 +157,15 @@ configuration; reinstalling v3 alone cannot undo it. Follow the
 
 1. Open HACS in Home Assistant
 2. Search for "Adjustable Bed"
-3. Click Install
+3. Select the v4 beta from the available versions (enable beta versions in HACS if needed), then install/download it
 4. Restart Home Assistant
 
 ### Manual
 
-Copy `custom_components/adjustable_bed` to your `config/custom_components/` directory and restart.
+Use a v4 release archive, or check out `release/4.0` for the current development
+code. Copy `custom_components/adjustable_bed` to your
+`config/custom_components/` directory and restart. The committed frontend bundle
+is included; an end-user installation does not require Bun or a frontend build.
 
 ## Configuration
 
@@ -160,7 +175,8 @@ Your bed should auto-discover via Bluetooth. If not:
 2. Search for "Adjustable Bed"
 3. Enter your bed's Bluetooth address or select from discovered devices
 
-To adjust settings after setup, click the **gear icon** on your device in Settings → Devices & Services.
+To adjust settings after setup, click **Configure** (the gear icon) for the
+integration entry in Settings → Devices & Services, then **Change settings**.
 
 <details>
 <summary><b>Quick reference</b></summary>
@@ -171,7 +187,8 @@ To adjust settings after setup, click the **gear icon** on your device in Settin
 | Has Massage | Enable if your bed has massage |
 | Protocol Variant | Usually auto-detected, override if needed |
 | Motor Pulse Settings | Fine-tune movement timing |
-| Disable Angle Sensing | Keep on to allow physical remote to work |
+| Disable Angle Sensing | Turn off for supported position feedback; turn on if monitoring conflicts with the remote |
+| Disconnect After Command | Release the connection one second after operations finish, where supported |
 | Jensen PIN | 4-digit PIN for Jensen beds (default: 3060) |
 | Octo PIN | 4-digit PIN for Octo beds that require authentication |
 | Richmat Remote | Remote model code for Richmat beds |
@@ -206,12 +223,28 @@ The card adapts to your bed — it only shows the sections your bed actually
 exposes (e.g. massage and climate appear only on beds that support them), so the
 same card works for every supported bed.
 
+### Movement and paired beds
+
+Hold an Up/Down control to repeat movement; release it to send STOP. Each repeat
+is a finite controller operation, so a hold can have short pauses between pulses.
+Position sliders appear only when the selected controller exposes them.
+
+For a combined bed, the card offers **Left / Both sides / Right**. Selecting
+either the parent device or a side's child device opens the paired card. Both-side
+controls expose shared capabilities; select a side for its additional features.
+The **Match both to** controls copy the selected side's reported positions to the
+other side when both provide the required feedback. This is a one-time move.
+
+See [paired-bed configuration](docs/CONFIGURATION.md#two-independent-frames-in-v4)
+and [action targeting](docs/SERVICES.md#targeting-a-bed-or-side) for setup and
+automation behavior.
+
 ### Customizing the card
 
 Everything is configurable from the card's **visual editor** (no YAML needed):
 
 - **Show/hide sections** — toggle Position, Firmness, Presets, Memory, Lighting,
-  Massage, Climate, Connection, and the bed-angle graphic on or off. Only the
+  Massage, Utility, Climate, Connection, and the bed-angle graphic on or off. Only the
   sections your bed has are listed.
 - **Reorder sections** — use the up/down arrows next to each section to change
   the order they appear on the card.
@@ -245,10 +278,12 @@ memory_slots: [1, 2, 3]        # optional, which memory positions to show (defau
 # Each section defaults to shown; set to false to hide:
 show_graphic: true
 show_motors: true
+show_firmness: true
 show_presets: true
 show_memory: true
 show_lighting: true
 show_massage: true
+show_utility: true
 show_climate: true
 show_connection: true
 ```
@@ -271,6 +306,8 @@ See the [Connection Guide](docs/CONNECTION_GUIDE.md) for setup help.
 - **Bug reports** - Found something wrong? [Open an issue](https://github.com/kristofferR/ha-adjustable-bed/issues)
 - **Code contributions** - PRs welcome!
 
+For v4 changes, work from `release/4.0`. See the [developer documentation](docs/README.md#development-and-validation)
+for environment setup, validation, architecture, and the APK Protocol Audit workflow.
 
 ## Credits
 

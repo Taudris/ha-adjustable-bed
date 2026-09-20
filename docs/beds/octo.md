@@ -447,9 +447,10 @@ and not BCD), four digits, as `[0x20, 0x43]` + the four bytes.
 The app re-authenticates on an event, not on a timer: the device pushes a
 `0x44` LOCK notification and the app answers by re-sending the stored PIN. A
 `0x43` STATE response with `data[0] != 1` means the PIN was rejected. The
-integration currently re-sends the PIN on a 25-second timer instead, which
-covers the same ground more bluntly; handling the `0x44` push and surfacing a
-rejected PIN are open improvements.
+integration handles the LOCK push immediately, tracks STATE responses, and
+retains a 25-second keepalive fallback when authentication requires it. Standard
+Octo setup reports rejected or inconclusive PIN checks before saving the entry;
+see [PIN verification](#pin-verification-during-setup-v4).
 
 The PIN feature does not exist in OCTO Smart Control 1.1.57 (versionCode
 10157); it was added by versionCode 10301.
@@ -457,7 +458,7 @@ The PIN feature does not exist in OCTO Smart Control 1.1.57 (versionCode
 Some Octo beds require PIN authentication to control the bed. The integration automatically:
 1. Detects if the bed requires PIN via feature discovery (`command=[0x20, 0x71]`)
 2. Sends the configured PIN on connection (`command=[0x20, 0x43], data=[digit1, digit2, digit3, digit4]`)
-3. Maintains the connection with periodic PIN keep-alive messages (every 25 seconds)
+3. Responds to PIN-lock notifications, tracks acceptance, and retains periodic PIN keepalive fallback (every 25 seconds when needed)
 
 **Note:** Octo beds with PIN enabled will drop the BLE connection after ~30 seconds without re-authentication.
 

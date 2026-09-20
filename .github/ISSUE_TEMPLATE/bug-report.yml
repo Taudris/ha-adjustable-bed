@@ -9,8 +9,8 @@ body:
         Thanks for taking the time to report this bug! Please fill out the form below to help us diagnose and fix the issue.
 
         **Before submitting:**
-        - Check the [Troubleshooting Guide](https://github.com/kristofferR/ha-adjustable-bed/blob/master/docs/TROUBLESHOOTING.md) for common solutions
-        - Read the [Getting Help Guide](https://github.com/kristofferR/ha-adjustable-bed/blob/master/docs/GETTING_HELP.md) for how to gather diagnostics
+        - Check the [v4 Troubleshooting Guide](https://github.com/kristofferR/ha-adjustable-bed/blob/release/4.0/docs/TROUBLESHOOTING.md) for common solutions
+        - Read the [v4 Getting Help Guide](https://github.com/kristofferR/ha-adjustable-bed/blob/release/4.0/docs/GETTING_HELP.md) for how to gather diagnostics
         - Search [existing issues](https://github.com/kristofferR/ha-adjustable-bed/issues) to avoid duplicates
 
   - type: textarea
@@ -38,7 +38,7 @@ body:
     attributes:
       label: Integration Version
       description: "Settings → Integrations → Adjustable Bed → version shown"
-      placeholder: "e.g., 1.4.0"
+      placeholder: "Exact installed version, including the beta suffix if present"
     validations:
       required: false
 
@@ -64,7 +64,7 @@ body:
 
         1. Go to Developer Tools → Actions
         2. Search for `adjustable_bed.generate_support_bundle`
-        3. Select your bed device and click "Perform action"
+        3. Select your bed device (the affected Left/Right child for a two-address combined bed) and click "Perform action"
         4. Click the **download link** in the notification that appears
         5. Drag and drop the JSON file here
 
@@ -94,6 +94,8 @@ body:
       label: Additional Context
       description: |
         Add any other context about the problem here:
+        - Home Assistant version and whether you upgraded from v3
+        - Standalone or combined bed; affected side and action target
         - Does the physical remote work?
         - Did this work before? What changed?
         - Any error messages in the UI?
@@ -108,9 +110,9 @@ body:
       label: Checklist
       description: Please confirm you've done the following
       options:
-        - label: I have checked the [Troubleshooting Guide](https://github.com/kristofferR/ha-adjustable-bed/blob/master/docs/TROUBLESHOOTING.md)
+        - label: I have checked the [Troubleshooting Guide](https://github.com/kristofferR/ha-adjustable-bed/blob/release/4.0/docs/TROUBLESHOOTING.md)
           required: true
-        - label: I have read the [Getting Help Guide](https://github.com/kristofferR/ha-adjustable-bed/blob/master/docs/GETTING_HELP.md) for how to gather diagnostics
+        - label: I have read the [Getting Help Guide](https://github.com/kristofferR/ha-adjustable-bed/blob/release/4.0/docs/GETTING_HELP.md) for how to gather diagnostics
           required: true
         - label: I have searched for [existing issues](https://github.com/kristofferR/ha-adjustable-bed/issues)
           required: true
