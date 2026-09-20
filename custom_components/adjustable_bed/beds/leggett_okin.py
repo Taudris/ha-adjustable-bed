@@ -1195,7 +1195,7 @@ class LeggettOkinController(BedController):
         if self.supports_light_state_feedback and self._light_is_on is not None:
             await self._set_light_state(not self._light_is_on)
         else:
-            await self._tap_keycode(LeggettOkinCommands.TOGGLE_LIGHTS, "lights_toggle")
+            await self._tap_light()
 
     async def lights_on(self) -> None:
         """Turn on using verified state, without blindly inverting the light."""
@@ -1205,9 +1205,13 @@ class LeggettOkinController(BedController):
         """Turn off using verified state, without blindly inverting the light."""
         await self._set_light_state(False)
 
+    async def _tap_light(self) -> None:
+        """Press the light key once, whatever the caller knows about the state."""
+        await self._tap_keycode(LeggettOkinCommands.TOGGLE_LIGHTS, "lights_toggle")
+
     async def _set_light_state(self, is_on: bool) -> None:
         if not self.supports_light_state_feedback:
-            await self.lights_toggle()
+            await self._tap_light()
             return
         if self._light_is_on is None:
             raise HomeAssistantError(
@@ -1217,7 +1221,7 @@ class LeggettOkinController(BedController):
         if self._light_is_on == is_on:
             return
         try:
-            await self._tap_keycode(LeggettOkinCommands.TOGGLE_LIGHTS, "lights_toggle")
+            await self._tap_light()
             async with asyncio.timeout(LIGHT_STATE_TIMEOUT_S):
                 while self._light_is_on != is_on:
                     self._light_state_changed.clear()
