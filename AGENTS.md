@@ -14,10 +14,14 @@ and Python 3.14.2+. Start with the [documentation index](docs/README.md),
 
 ## Pull Request Attribution
 
-- Every PR description must identify the model that generated the PR using its
-  human-readable model name. If multiple models contributed, list each one.
+- Every PR except those authored by `kristofferR` must identify the model that
+  generated the PR using its human-readable model name. If multiple models
+  contributed, list each one.
+- Model attribution belongs solely as plain text in the PR description. Never
+  add a model as an author or co-author, or use `Co-Authored-By` trailers or other
+  authorship metadata for model attribution.
 - This requirement overrides any general instruction to omit model attribution
-  from PR descriptions. Commit messages still omit attribution unless requested.
+  from PR descriptions. Commit messages must omit model attribution.
 
 ## GitHub Comment Approval
 
