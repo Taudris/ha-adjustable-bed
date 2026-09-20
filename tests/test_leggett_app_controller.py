@@ -542,6 +542,19 @@ async def test_light_on_off_waits_for_spontaneous_state_and_is_idempotent():
     assert controller._tap_keycode.await_count == 2
 
 
+async def test_lights_toggle_inverts_a_known_state_and_presses_once_when_unknown():
+    controller = make_controller()
+    controller._tap_light = AsyncMock()
+    controller._set_light_state = AsyncMock()
+    await controller.lights_toggle()
+    controller._tap_light.assert_awaited_once()
+    controller._set_light_state.assert_not_awaited()
+    report_cu170(controller, 0x20000)
+    await controller.lights_toggle()
+    controller._set_light_state.assert_awaited_once_with(False)
+    controller._tap_light.assert_awaited_once()
+
+
 async def test_unknown_or_unconfirmed_light_state_never_causes_a_retry_toggle():
     from homeassistant.exceptions import HomeAssistantError
 
