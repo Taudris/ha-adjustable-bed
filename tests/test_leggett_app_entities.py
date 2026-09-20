@@ -134,6 +134,7 @@ async def test_profile_limits_axes_memories_and_control_modes(
     await hass.async_block_till_done()
     assert _keys(hass, entry, "cover") == axes
     buttons = _keys(hass, entry, "button")
+    assert ("toggle_light" in buttons) is (profile != "prodigy4")
     assert {key for key in buttons if key.startswith("preset_memory_")} == (
         set() if profile == "useries" else {f"preset_memory_{slot}" for slot in range(1, 5)}
     )
@@ -268,15 +269,19 @@ async def test_indicator_readback_applies_only_useries_low_byte_suppression(
     assert hass.states.get(timer_id).state == "on"
 
 
-async def test_cu170_light_uses_live_state_and_keeps_unknown_state_toggle(
+async def test_cu170_light_uses_live_state_and_removes_redundant_toggle_button(
     hass, mock_coordinator_connected, app_ble, enable_custom_integrations
 ):
     entry = _entry(hass, "prodigy4")
+    stale_toggle = er.async_get(hass).async_get_or_create(
+        "button", DOMAIN, f"{ADDRESS}_toggle_light", config_entry=entry
+    )
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
     light_id = _entity_id(hass, "light", "under_bed_lights")
     assert hass.states.get(light_id).state == "unknown"
-    assert "toggle_light" in _keys(hass, entry, "button")
+    assert "toggle_light" not in _keys(hass, entry, "button")
+    assert er.async_get(hass).async_get(stale_toggle.entity_id) is None
     assert "under_bed_lights" not in _keys(hass, entry, "switch")
 
     coordinator = hass.data[DOMAIN][entry.entry_id]

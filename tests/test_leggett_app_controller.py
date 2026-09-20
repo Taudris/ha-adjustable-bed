@@ -283,6 +283,72 @@ async def test_reconnect_rechecks_revision_selector_and_unknown_target_never_def
         controller._build_command(1)
 
 
+@pytest.mark.parametrize("revision", [0, 1])
+async def test_connect_refreshes_light_after_subscribing_and_again_after_disconnect(revision):
+    controller = make_controller(revision=revision)
+    expected = bytes.fromhex("e5fe160000000006" if revision == 0 else "040200000000")
+
+    async def reply_to_idle(packet, **kwargs):
+        assert packet == expected
+        assert LEGGETT_OKIN_NOTIFY_CHAR_UUID in controller._notify_started
+        assert kwargs == {"repeat_count": 4, "repeat_delay_ms": 100}
+        report_cu170(controller, 0x20000)
+
+    controller.write_command.side_effect = reply_to_idle
+    await controller.start_notify()
+    assert controller.get_light_state() == {"is_on": True}
+    await controller.start_notify()
+    assert controller.write_command.await_count == 1
+    await controller.stop_notify()
+    await controller.start_notify()
+    assert controller.write_command.await_count == 2
+    assert controller.get_light_state() == {"is_on": True}
+
+
+@pytest.mark.parametrize("reason", ["other_profile", "cancelled", "subscribe_failed"])
+async def test_initial_light_query_requires_ce_subscription_and_active_startup(reason):
+    controller = make_controller("prodigy2" if reason == "other_profile" else "prodigy4")
+    if reason == "cancelled":
+        controller._coordinator.cancel_command.set()
+    elif reason == "subscribe_failed":
+        controller.client.start_notify.side_effect = BleakError("subscribe failed")
+    await controller.start_notify()
+    controller.write_command.assert_not_awaited()
+
+
+@pytest.mark.parametrize("revision", [0, 1])
+async def test_ce_stop_interrupts_latched_operation_even_after_cancellation(revision):
+    controller = make_controller(revision=revision)
+    controller._coordinator.cancel_command.set()
+    await controller.stop_all()
+    interrupt, release = controller.write_command.await_args_list
+    assert interrupt.args == (
+        bytes.fromhex("e5fe160004000002" if revision == 0 else "040200040000"),
+    )
+    assert not interrupt.kwargs["cancel_event"].is_set()
+    assert release.args == (
+        bytes.fromhex("e5fe160000000006" if revision == 0 else "040200000000"),
+    )
+    assert release.kwargs["repeat_count"] == 4
+    assert not release.kwargs["cancel_event"].is_set()
+
+
+@pytest.mark.parametrize("profile", ["prodigy2l", "prodigy2", "useries"])
+async def test_other_profiles_stop_with_release_only(profile):
+    controller = make_controller(profile)
+    await controller.stop_all()
+    assert controller.write_command.await_count == 1
+    assert controller.write_command.await_args.args == (bytes.fromhex("040200000000"),)
+
+
+async def test_failed_ce_stop_still_releases_and_preserves_interrupt_error():
+    controller = make_controller()
+    controller.write_command.side_effect = [BleakError("interrupt failed"), BleakError("release failed")]
+    with pytest.raises(BleakError, match="interrupt failed"):
+        await controller.stop_all()
+    assert controller.write_command.await_count == 2
+
+
 @pytest.mark.parametrize("profile", ["prodigy4", "useries"])
 def test_indicator_mask_obeys_useries_display_filter_without_losing_raw_bits(profile):
     controller = make_controller(profile)

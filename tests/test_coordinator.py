@@ -138,6 +138,67 @@ class TestCoordinatorInit:
 class TestCoordinatorConnection:
     """Test coordinator connection handling."""
 
+    @pytest.mark.parametrize("outcome", ["verified", "auth_failed", "inconclusive", "cancelled"])
+    async def test_pairing_repair_waits_for_automatic_recovery(
+        self, hass, mock_coordinator_connected, mock_bleak_client, outcome
+    ):
+        """Recovering a stale bond must not flash a repair between attempts."""
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={
+                CONF_ADDRESS: TEST_ADDRESS,
+                CONF_NAME: TEST_NAME,
+                CONF_BED_TYPE: BED_TYPE_LEGGETT_OKIN,
+                CONF_DISABLE_ANGLE_SENSING: True,
+                CONF_BLE_BOND_ESTABLISHED: True,
+            },
+            unique_id=TEST_ADDRESS,
+        )
+        entry.add_to_hass(hass)
+        coordinator = AdjustableBedCoordinator(hass, entry)
+        coordinator._max_retries = 2
+        coordinator._retry_base_delay = 0
+        reads = 0
+
+        async def read_characteristic(_uuid):
+            nonlocal reads
+            reads += 1
+            create_issue.assert_not_awaited()
+            if reads == 1 or outcome == "auth_failed":
+                raise BleakError("Insufficient authentication")
+            if outcome == "cancelled":
+                raise asyncio.CancelledError
+            if outcome == "inconclusive":
+                raise TimeoutError
+            return b"Model"
+
+        mock_bleak_client.read_gatt_char.side_effect = read_characteristic
+        with (
+            patch(
+                "custom_components.adjustable_bed.coordinator.create_pairing_required_issue",
+                new_callable=AsyncMock,
+            ) as create_issue,
+            patch(
+                "custom_components.adjustable_bed.coordinator.read_ble_device_info",
+                new=AsyncMock(return_value=("Leggett", "Model")),
+            ),
+        ):
+            if outcome == "cancelled":
+                with pytest.raises(asyncio.CancelledError):
+                    await coordinator.async_connect()
+            else:
+                result = await coordinator.async_connect()
+                assert result is (outcome != "auth_failed")
+
+            if outcome == "verified":
+                create_issue.assert_not_awaited()
+                assert coordinator.pairing_diagnostics["last_bond_verification"]["status"] == "succeeded"
+            else:
+                create_issue.assert_awaited_once()
+                assert create_issue.await_args.kwargs["evidence"]["status"] == "auth_failed"
+
+        assert coordinator._connection_attempt_count == 2
+
     async def test_connect_success(
         self,
         hass: HomeAssistant,

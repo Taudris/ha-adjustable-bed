@@ -1463,6 +1463,7 @@ class AdjustableBedCoordinator:
         holding_lock: bool = False,
         retain_link: bool = False,
         attempt_details: dict[str, Any] | None = None,
+        defer_pairing_issue: bool = False,
     ) -> None:
         """Handle a failure caused by an unauthenticated BLE connection.
 
@@ -1476,6 +1477,9 @@ class AdjustableBedCoordinator:
         has already failed: a link with no controller cannot drive the bed, and
         keeping it would only block the physical remote while leaving the
         coordinator in a half-initialised state.
+
+        Connection retries defer the repair until their final outcome; runtime
+        command failures still report it immediately.
         """
         if not requires_pairing(self._bed_type, self._protocol_variant):
             return
@@ -1511,7 +1515,8 @@ class AdjustableBedCoordinator:
             unreliable=True if latch else None,
         )
 
-        await self._async_raise_pairing_issue()
+        if not defer_pairing_issue:
+            await self._async_raise_pairing_issue()
 
         if self._client is not None and self._client.is_connected:
             if retain_link and grants_one_connection_per_pairing_window(
@@ -1519,7 +1524,7 @@ class AdjustableBedCoordinator:
             ):
                 # Disconnecting would cost us the box's single connection and
                 # the reconnect that "fixes" the bond can never happen. Leave
-                # the link up; the repair issue above tells the user to re-pair.
+                # the link up; the repair tells the user to re-pair.
                 _LOGGER.warning(
                     "Keeping the unbonded link to %s open: this bed grants one "
                     "connection per pairing window, so disconnecting to re-pair "
@@ -1695,7 +1700,12 @@ class AdjustableBedCoordinator:
                 return False
             return self._ble_bond_established
 
-    async def _async_verify_bonded(self, attempt_details: dict[str, Any] | None = None) -> bool:
+    async def _async_verify_bonded(
+        self,
+        attempt_details: dict[str, Any] | None = None,
+        *,
+        defer_pairing_issue: bool = False,
+    ) -> bool:
         """Probe an auth-gated characteristic to confirm the BLE bond is live.
 
         For beds that require pairing, a connection — even one made with
@@ -1707,8 +1717,8 @@ class AdjustableBedCoordinator:
 
         Returns True if the link is bonded (or the check is inconclusive), and
         False only when an authentication error is definitively observed — in
-        which case the bond marker is cleared, a repair issue is raised, and the
-        client is disconnected.
+        which case the bond marker is cleared and the client is disconnected.
+        Automatic retries may defer the repair until recovery has finished.
         """
         client = self._client
         if client is None or not client.is_connected:
@@ -1743,6 +1753,7 @@ class AdjustableBedCoordinator:
                     holding_lock=True,
                     retain_link=True,
                     attempt_details=attempt_details,
+                    defer_pairing_issue=defer_pairing_issue,
                 )
                 # For a one-connection-per-window bed the handler deliberately
                 # kept the link, so report success and let controller startup
@@ -2432,7 +2443,21 @@ class AdjustableBedCoordinator:
             self._controller = None
             self._intentional_disconnect = False
 
-    async def _async_connect_locked(  # pyright: ignore[reportGeneralTypeIssues]
+    async def _async_connect_locked(self, reset_timer: bool = True) -> bool:
+        """Allow automatic auth recovery before asking the user to re-pair."""
+        try:
+            return await self._async_connect_attempts_locked(reset_timer)
+        finally:
+            # A verified retry clears this evidence. An inconclusive retry,
+            # exhausted attempts or cancellation must still surface the repair.
+            if (
+                requires_pairing(self._bed_type, self._protocol_variant)
+                and self._last_bond_evidence is not None
+                and self._last_bond_evidence.status is BondVerificationStatus.AUTH_FAILED
+            ):
+                await self._async_raise_pairing_issue()
+
+    async def _async_connect_attempts_locked(  # pyright: ignore[reportGeneralTypeIssues]
         self, reset_timer: bool = True
     ) -> bool:
         """Connect to the bed (must hold lock)."""
@@ -3047,10 +3072,12 @@ class AdjustableBedCoordinator:
                         BED_TYPE_SLEEP_NUMBER_MCR,
                         BED_TYPE_JENSEN,
                     )
-                    and not await self._async_verify_bonded(attempt_details)
+                    and not await self._async_verify_bonded(
+                        attempt_details, defer_pairing_issue=True
+                    )
                 ):
-                    # _async_verify_bonded cleared the bond marker, raised the
-                    # repair issue, and disconnected. Retry — the next attempt
+                    # _async_verify_bonded cleared the bond marker and
+                    # disconnected. Retry before raising a repair; the next attempt
                     # requests pair=True again (the skip flag was consumed).
                     _LOGGER.warning(
                         "Bed %s connected but the BLE link is not bonded; retrying with pairing.",
@@ -3426,7 +3453,9 @@ class AdjustableBedCoordinator:
                     # and abort the remaining retries. CancelledError is a
                     # BaseException, so cancellation still propagates.
                     try:
-                        await self._async_handle_ble_authentication_error(err, holding_lock=True)
+                        await self._async_handle_ble_authentication_error(
+                            err, holding_lock=True, defer_pairing_issue=True
+                        )
                     except Exception:
                         _LOGGER.debug(
                             "Authentication recovery cleanup failed for %s",
@@ -3442,8 +3471,8 @@ class AdjustableBedCoordinator:
                         # the physical remote. Retrying cannot recover either,
                         # because the box will not grant a second connection
                         # until it is power-cycled. Stop instead of burning the
-                        # remaining attempts; the repair issue the handler
-                        # raised tells the user to re-pair.
+                        # remaining attempts; the connect wrapper then raises
+                        # the repair telling the user to re-pair.
                         _LOGGER.warning(
                             "Authentication failed for %s during startup. This "
                             "bed grants one connection per pairing window, so "

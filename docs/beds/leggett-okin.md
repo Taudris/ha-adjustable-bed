@@ -126,8 +126,17 @@ getting the distinction wrong is the main way to break it.
 
 **Held keycodes** (motors, flat, light, massage) stream every ~100 ms while the
 button is down. On release the app emits **exactly four** keycode-`0` frames and
-then goes silent. There is no distinct stop opcode; the release frame is an
-ordinary frame carrying zero.
+then goes silent. The release frame is an ordinary frame carrying zero.
+
+For **Prodigy CE / CU170 only**, explicit **Stop all** first sends the
+reporter's hardware-tested DUMMY keycode `0x00040000`, then the ordinary release
+burst. This interrupts a latched preset or preset-save sequence, which zero
+alone does not stop. It uses the selected R0/R1 framing (`e5fe160004000002` /
+`040200040000`) and ignores the cancelled movement's cancel event. Ordinary
+end-of-hold cleanup still sends only zero; other app profiles retain their
+accepted release behavior. This semantic correction comes from the
+[September hardware report](https://github.com/kristofferR/ha-adjustable-bed/issues/368#issuecomment-5747783066),
+not a newly discovered reachable app command.
 
 CU170 hardware testing measured a 217-218 ms motion watchdog. The integration
 therefore uses unconfirmed writes and measures the 100 ms interval from the
@@ -137,8 +146,8 @@ WiFi Bluetooth proxy and makes the motor stop and restart.
 
 **One-shot recalls** (the memory slots) are a burst of **exactly 10 frames at
 ~100 ms**, with **no terminator at all**. The control box drives the move to
-completion by itself. Appending a release frame here risks cancelling the motion
-the recall just started, so successful Prodigy recalls keep that behavior.
+completion by itself. Successful Prodigy recalls retain that app behavior;
+CU170 hardware testing shows that explicit interruption needs the DUMMY keycode.
 Cancellation or write failure uses the proven zero cleanup. U Series memory
 controls follow the ordinary held-key lifecycle instead. Memory 1, Memory 2 and
 Snore therefore have no one-shot preset buttons in this profile. Use
@@ -204,9 +213,17 @@ On/off actions only toggle when the known state differs from the requested
 state, then wait up to three seconds for confirmation. A missing confirmation
 leaves the light unknown and reports an error without retrying the toggle.
 State is not restored from an earlier Home Assistant session and is cleared on
-disconnect. **Toggle Light** remains available, as does `light.toggle`, even
-before the first status update. If an on/off action reports unknown state, use
-either toggle or the physical remote to obtain a live notification.
+disconnect. After subscribing, startup sends the app's four idle zero frames
+to request live status without toggling the light. The September hardware
+report confirms that a keycode write refreshes status. If no valid reply arrives,
+state stays unknown. The redundant **Toggle Light** button is removed from the
+entity registry; `light.toggle` remains available even before the first status
+update, as does the physical remote.
+
+An authentication failure during connection clears the cached bond marker and
+allows automatic pairing retries. A successful verified retry suppresses the
+pairing repair entirely. Failed, inconclusive or cancelled recovery still raises
+the repair, and command-time authentication errors remain immediately visible.
 
 Light and massage taps now leave one 100 ms command interval before the release
 burst. Previously the first zero could follow the press immediately, making

@@ -896,7 +896,11 @@ def _should_add_button(
         return False
 
     if description.key == "toggle_light" and controller is not None:
-        if controller.supports_discrete_light_control or controller.supports_light_color_control:
+        if (
+            controller.supports_discrete_light_control
+            or controller.supports_light_color_control
+            or controller.supports_light_state_feedback
+        ):
             return False
 
     if description.required_capability is not None:

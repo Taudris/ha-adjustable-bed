@@ -105,6 +105,9 @@ class LeggettOkinCommands:
     # Lights
     TOGGLE_LIGHTS = 0x20000
 
+    # CU170 hardware-confirmed in #368: interrupts latched recall and store.
+    CU170_STOP = 0x40000
+
     # Persistent handset-control mode settings
     CONTROL_MODE_PRESS_AND_HOLD = 0x08010000
     CONTROL_MODE_PRESS_AND_RELEASE = 0x01800000
@@ -682,6 +685,20 @@ class LeggettOkinController(BedController):
             except (BleakError, ConnectionError) as err:
                 _LOGGER.debug("Could not initialize Leggett Okin settings: %s", err)
 
+        if (
+            self.supports_light_state_feedback
+            and self._light_is_on is None
+            and LEGGETT_OKIN_NOTIFY_CHAR_UUID.lower() in self._notify_started
+            and not self._coordinator.cancel_command.is_set()
+        ):
+            # The app starts with idle frames. CU170 replies with live status,
+            # so subscribe first and use zero, which does not toggle the light.
+            await self.write_command(
+                self._build_command(0),
+                repeat_count=RELEASE_FRAME_COUNT,
+                repeat_delay_ms=RELEASE_FRAME_DELAY_MS,
+            )
+
         await self._read_device_information(characteristic_uuids)
 
     async def _read_device_information(self, available: frozenset[str]) -> None:
@@ -895,8 +912,7 @@ class LeggettOkinController(BedController):
                     await asyncio.shield(release)
             raise
         except BleakError, ConnectionError:
-            # The release burst is this protocol's only stop, so a failure can
-            # leave the bed still moving. That is worth surfacing, not hiding.
+            # Losing release can leave a held command active.
             _LOGGER.warning(
                 "Failed to send release frames after %s; the bed may still be moving",
                 context,
@@ -955,13 +971,22 @@ class LeggettOkinController(BedController):
         await self.move_legs_stop()
 
     async def stop_all(self) -> None:
-        """Stop all motors by sending the release burst.
+        """Release held keys and interrupt Prodigy CE's latched operations.
 
         An explicit stop must not report success when it never reached the bed,
         so failures propagate here rather than being logged and swallowed.
         """
         self._motor_state = {}
-        await self._send_release_frames("stop_all", raise_on_error=True)
+        completed = False
+        try:
+            if self._app_profile == "prodigy4":
+                await self.write_command(
+                    self._build_command(LeggettOkinCommands.CU170_STOP),
+                    cancel_event=asyncio.Event(),
+                )
+            completed = True
+        finally:
+            await self._send_release_frames("stop_all", raise_on_error=completed)
 
     # Preset methods
     _MEMORY_SLOTS = {

@@ -531,3 +531,24 @@ destructive reset. Physical evidence takes precedence for Prodigy CE. The report
 itself remains frozen: this changes the integration disposition, not the app's
 recovered behavior. Light/massage taps also retain a full 100 ms interval before
 release, addressing the later report of light toggles failing on fast links.
+
+### September connection, light and STOP corrections
+
+The [2026-09-20 hardware follow-up](https://github.com/kristofferR/ha-adjustable-bed/issues/368#issuecomment-5747783066)
+adds four scoped findings. The accepted C report and all ten manifest entries
+were reverified against the hashes above. Its startup idle frames, R0/R1
+builders and ordinary release lifecycle are reused; the reporter establishes
+the CU170 status-refresh and DUMMY interrupt semantics absent from reachable
+app behavior. No report or corpus acceptance changes.
+
+| Finding | Disposition | Implementation and focused evidence |
+| --- | --- | --- |
+| Unknown light after connect | `IMPLEMENTED` | `LeggettOkinController.start_notify` subscribes before sending idle zeros; `test_connect_refreshes_light_after_subscribing_and_again_after_disconnect` checks both frame revisions and reconnect. |
+| Redundant Toggle Light button | `IMPLEMENTED` | `_should_add_button` suppresses buttons for feedback-backed lights, including registry cleanup; `test_cu170_light_uses_live_state_and_removes_redundant_toggle_button` preserves the light and `light.toggle`. |
+| Stop all does not interrupt latched recall/store | `IMPLEMENTED` | CE-only `stop_all` sends hardware-tested `0x40000` then release; `test_ce_stop_interrupts_latched_operation_even_after_cancellation` checks both revisions and cancellation. Other profiles retain zero-only STOP. |
+| Transient pairing repair during recovery | `IMPLEMENTED` | Coordinator defers the repair until connection retries finish; `test_pairing_repair_waits_for_automatic_recovery` covers verified, failed, inconclusive and cancelled outcomes. This fixes notification timing, not a proven physical bond loss. |
+
+Follow-up totals: **4 IMPLEMENTED, 0 ALREADY_IMPLEMENTED, 0 EXCLUDED**.
+The original 154-row app ledger and its exclusions remain unchanged. The
+reporter's hold-streaming and card-loading changes are separate work. Actual
+behavior of this patch awaits user validation after a beta/release.

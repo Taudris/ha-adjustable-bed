@@ -424,11 +424,10 @@ class TestLeggettOkinController:
             call(LEGGETT_OKIN_NOTIFY_CHAR_UUID, controller._handle_notification),
             call(OKIN_SMART_REMOTE_CSS_NOTIFY_CHAR_UUID, controller._handle_notification),
         ]
-        client.write_gatt_char.assert_awaited_once_with(
-            OKIN_SMART_REMOTE_CSS_WRITE_CHAR_UUID,
-            b"\x01\x02",
-            response=True,
-        )
+        assert client.write_gatt_char.await_args_list == [
+            call(OKIN_SMART_REMOTE_CSS_WRITE_CHAR_UUID, b"\x01\x02", response=True),
+            *[call(LEGGETT_OKIN_CHAR_UUID, bytes.fromhex("040200000000"), response=False)] * 4,
+        ]
         assert controller.protocol_diagnostics["settings_initialized"] is True
 
         controller._handle_notification(
