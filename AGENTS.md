@@ -12,6 +12,13 @@ This is a Home Assistant custom integration for controlling smart adjustable bed
 and Python 3.14.2+. Start with the [documentation index](docs/README.md),
 [migration notes](docs/HA_2026_9.md), and [validation matrix](docs/V4_VALIDATION.md).
 
+## Pull Request Attribution
+
+- Every PR description must identify the model that generated the PR using its
+  human-readable model name. If multiple models contributed, list each one.
+- This requirement overrides any general instruction to omit model attribution
+  from PR descriptions. Commit messages still omit attribution unless requested.
+
 ## GitHub Comment Approval
 
 - Never post GitHub comments (issues, pull requests, discussions, releases, etc.) without explicit and specific user approval for that exact comment action.
