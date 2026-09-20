@@ -671,7 +671,7 @@ def test_pairing_repair_translations_cover_every_progress_and_result() -> None:
         "recovery_partial",
     }
     for relative in ("strings.json", "translations/en.json"):
-        data = json.loads((root / relative).read_text())
+        data = json.loads((root / relative).read_text(encoding="utf-8"))
         pairing = data["issues"]["pairing_required"]
         flow = pairing["fix_flow"]
         assert required_progress <= flow["progress"].keys()
