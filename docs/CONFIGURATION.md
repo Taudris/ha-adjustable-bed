@@ -398,41 +398,68 @@ bytes as before. The per-call side binding is used only after this opt-in.
 
 ---
 
-## Split-King / Sync Mode
+## Split-King / Controller Sync
 
-Split-king beds have two independently adjustable sides connected to the same controller. The **Synchro Mode** switch lets you link or unlink both sides so they move together or independently — without physically connecting or disconnecting the sync cable.
+The **Controller Sync** switch (previously **Synchro Mode**) sends a sync command
+to the bed controller. Any resulting synchronization depends on the controller's
+firmware and its existing relationship with the other frame. Turning it on does
+not discover another Home Assistant bed entry or mirror commands between entries.
+It does not establish a hardware pairing or replace a sync cable.
 
-### Supported Beds
+For example, the Richmat HJC9 report in
+[discussion #503](https://github.com/kristofferR/ha-adjustable-bed/discussions/503)
+found that enabling the switch on both frames did not make movement mirror.
+Use Home Assistant's paired-bed controls for two independently controlled frames.
 
-| Bed Type | Sync Control | State Tracking |
-|----------|-------------|----------------|
-| Octo | On/Off | Precise (reads back from bed) |
-| Richmat | On/Off | Assumed (tracks commands sent) |
-| SUTA | On/Off | Assumed (tracks commands sent) |
-| MotoSleep | Toggle | Unreliable (toggle-only, no separate on/off) |
+### State and Availability
 
-### How to Enable
+The switch is exposed only when the selected controller supports it and is
+**disabled by default**. Its displayed state is not confirmation that both frames
+are synchronized: the current switch has no sync-state feedback subscription.
+It starts off after setup or reload and records successful on/off requests.
+Physical-remote changes may not be reflected, and a toggle-only controller cannot
+reliably enforce a requested on/off state. Do not assume that reloading Home
+Assistant resets the bed's own sync setting.
 
-The Synchro Mode switch is **disabled by default** to avoid confusion for users without split-king beds. To enable it:
+To enable it, open **Settings → Devices & Services → Adjustable Bed**, select the
+bed, and enable **Controller Sync** under **Entities**. Existing custom entity
+names may still show the old label.
 
-1. Go to **Settings** → **Devices & Services**
-2. Click on your adjustable bed device
-3. Under **Entities**, find **Synchro Mode** (it will show as disabled)
-4. Click on it and toggle **Enabled** on
-5. The switch will appear on your device's dashboard
+### Two Independent Frames in v4
 
-### How It Works
+Add each frame as its own Adjustable Bed entry and confirm that each controls
+only its intended side. For compatible entries, start **Add Integration →
+Adjustable Bed**, then choose **Combine two beds into one (Dual Bed)** and select
+Left and Right. The resulting parent device provides
+combined controls; the child devices provide side-specific controls. The card
+also offers Left/Both/Right selection. This does not require Controller Sync.
 
-- **Sync On:** Both sides of the bed move together when you control either side
-- **Sync Off:** Each side moves independently
+If a sync cable or the bed's firmware already makes either frame control both
+sides, keep a single entry rather than combining those frames as independent
+sides.
 
-For beds with discrete on/off commands (Octo, Richmat, SUTA), the switch state accurately reflects whether sync is enabled. For MotoSleep, the sync command is a toggle — the switch state may drift if the physical remote is also used to toggle sync.
+### Keeping Two Standalone Entries
 
-### Tips
+You can instead use a script or automation to send an action to both entries.
+For example, this script raises both back motors using their existing movement
+actions. Replace the example entity IDs with your own:
 
-- You can leave the physical sync cable connected and control sync mode via this switch instead
-- The sync state persists on the bed controller — it survives Home Assistant restarts
-- Add the switch to automations (e.g., enable sync at bedtime, disable in the morning for independent adjustment)
+```yaml
+alias: Raise both bed backs
+sequence:
+  - parallel:
+      - action: cover.open_cover
+        target:
+          entity_id: cover.left_bed_back
+      - action: cover.open_cover
+        target:
+          entity_id: cover.right_bed_back
+```
+
+This runs each cover's normal movement action; it does not make movement
+continuous or synchronize positions. To stop, call `cover.stop_cover` targeting
+both covers. Unlike the v4 paired-bed controls, this simple script does not stop
+the other side automatically if one side fails.
 
 ---
 

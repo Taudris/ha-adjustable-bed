@@ -2003,7 +2003,7 @@
         "name": "Under Bed Lights"
       },
       "synchro_mode": {
-        "name": "Synchro Mode"
+        "name": "Controller Sync"
       },
       "linak_automatic_drive": {
         "name": "Automatic Drive"
@@ -2018,13 +2018,13 @@
         "name": "Both sides: Under Bed Lights"
       },
       "synchro_mode_left": {
-        "name": "Left: Synchro Mode"
+        "name": "Left: Controller Sync"
       },
       "synchro_mode_right": {
-        "name": "Right: Synchro Mode"
+        "name": "Right: Controller Sync"
       },
       "synchro_mode_both": {
-        "name": "Both sides: Synchro Mode"
+        "name": "Both sides: Controller Sync"
       },
       "linak_automatic_drive_left": {
         "name": "Left: Automatic Drive"

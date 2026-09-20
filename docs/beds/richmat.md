@@ -69,7 +69,20 @@ capability review is tracked separately from this page's tested legacy support.
 | Under-bed Lights | ✅ (toggle; RGB color picker + timer on select models) |
 | Zero-G / Anti-Snore / TV / Lounge | ✅ |
 | Yoga / Read Presets | ✅ (some models) |
-| Split-King Sync | ✅ (discrete on/off) |
+| Split-King Sync | ✅ (controller-level on/off; assumed state) |
+
+## Controller Sync and Split-King Beds
+
+**Controller Sync** (previously **Synchro Mode**) sends the selected controller's
+sync command. It does not mirror commands between two Home Assistant entries.
+The displayed switch state records requested changes, not confirmed movement or
+sync status from the bed. In the HJC9 report, enabling it on both frames did not
+make them move together.
+
+For independently controllable frames, use v4's **Combine two beds into one
+(Dual Bed)** flow, or keep standalone entries and control both with a script.
+See [Controller Sync and two-frame setup](../CONFIGURATION.md#split-king--controller-sync)
+for the distinction, setup guidance, and a script example.
 
 ## Protocol Variants
 
