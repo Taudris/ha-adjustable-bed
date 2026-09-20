@@ -1,5 +1,6 @@
 """Home Assistant entity surfaces for the accepted Prodigy and U-series apps."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -309,10 +310,36 @@ async def test_cu170_light_uses_live_state_and_removes_redundant_toggle_button(
         await hass.services.async_call("light", "toggle", {"entity_id": light_id}, blocking=True)
     toggle.assert_awaited_once()
     assert hass.states.get(light_id).state == "unknown"
-    # An explicit toggle remains usable before state is known.
-    with patch.object(controller, "_tap_keycode", new=AsyncMock()) as toggle:
+    # An explicit toggle remains usable before state is known, and waits for the
+    # bed's report exactly as an on or off action does.
+    with (
+        patch.object(controller, "_tap_keycode", new=AsyncMock()) as toggle,
+        patch("custom_components.adjustable_bed.beds.leggett_okin.LIGHT_STATE_TIMEOUT_S", 0),
+        pytest.raises(HomeAssistantError, match="did not confirm"),
+    ):
         await hass.services.async_call("light", "toggle", {"entity_id": light_id}, blocking=True)
-        toggle.assert_awaited_once()
+    toggle.assert_awaited_once()
+    assert hass.states.get(light_id).state == "unknown"
+    # An on action with no known state presses once and shows what the bed
+    # reports, never an optimistic on.
+    pressed = asyncio.Event()
+
+    async def press(*args, **kwargs):
+        pressed.set()
+
+    with patch.object(controller, "_tap_keycode", new=AsyncMock(side_effect=press)):
+        turning_on = asyncio.create_task(
+            hass.services.async_call("light", "turn_on", {"entity_id": light_id}, blocking=True)
+        )
+        await pressed.wait()
+        assert hass.states.get(light_id).state == "unknown"
+        controller._handle_notification(
+            LEGGETT_OKIN_NOTIFY_CHAR_UUID,
+            bytearray.fromhex("090b0002000000020000ff000000000000000000"),
+        )
+        await turning_on
+    await hass.async_block_till_done()
+    assert hass.states.get(light_id).state == "on"
     await controller.stop_notify()
     await hass.async_block_till_done()
     assert hass.states.get(light_id).state == "unknown"
