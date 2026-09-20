@@ -77,6 +77,7 @@ from custom_components.adjustable_bed.const import (
     BED_TYPE_OCTO,
     BED_TYPE_OKIMAT,
     BED_TYPE_OKIN_CST,
+    BED_TYPE_OKIN_ORE,
     BED_TYPE_OKIN_RF_ECO_BT,
     BED_TYPE_OKIN_UUID,
     BED_TYPE_REVERIE,
@@ -2668,8 +2669,16 @@ class TestManualFlow:
             in result["description_placeholders"]["setup_note"]
         )
 
+    @pytest.mark.parametrize(
+        ("bed_type", "disconnect_after_command"),
+        [(BED_TYPE_LINAK, True), (BED_TYPE_OKIN_ORE, False)],
+    )
     async def test_manual_entry_creates_entry(
-        self, hass: HomeAssistant, enable_custom_integrations
+        self,
+        hass: HomeAssistant,
+        enable_custom_integrations,
+        bed_type: str,
+        disconnect_after_command: bool,
     ):
         """Test manual entry creates a config entry."""
         # First go to user step
@@ -2688,14 +2697,14 @@ class TestManualFlow:
                 user_input={CONF_ADDRESS: "manual"},
             )
 
-        # The raw form starts with the conservative False default. Linak recommends
-        # True, so confirm the bed-specific value before the entry is created.
+        # Confirm Linak's recommended disconnect setting; ORE keeps the form's
+        # False default and creates its entry without a follow-up question.
         with patch.object(AdjustableBedConfigFlow, "_verification_possible", return_value=False):
             result = await hass.config_entries.flow.async_configure(
                 result["flow_id"],
                 user_input={
                     CONF_ADDRESS: "11:22:33:44:55:66",
-                    CONF_BED_TYPE: BED_TYPE_LINAK,
+                    CONF_BED_TYPE: bed_type,
                     CONF_NAME: "Manual Bed",
                     CONF_MOTOR_COUNT: 3,
                     CONF_HAS_MASSAGE: False,
@@ -2703,20 +2712,20 @@ class TestManualFlow:
                     CONF_PREFERRED_ADAPTER: "auto",
                 },
             )
-            assert result["step_id"] == "disconnect_after_command"
-            result = await hass.config_entries.flow.async_configure(
-                result["flow_id"],
-                user_input={CONF_DISCONNECT_AFTER_COMMAND: True},
-            )
+            if disconnect_after_command:
+                assert result["step_id"] == "disconnect_after_command"
+                result = await hass.config_entries.flow.async_configure(
+                    result["flow_id"],
+                    user_input={CONF_DISCONNECT_AFTER_COMMAND: True},
+                )
             result = await _advance_progress(hass, result)
 
         assert result["type"] == FlowResultType.CREATE_ENTRY
         assert result["title"] == "Manual Bed"
         assert result["data"][CONF_ADDRESS] == "11:22:33:44:55:66"
-        assert result["data"][CONF_BED_TYPE] == BED_TYPE_LINAK
+        assert result["data"][CONF_BED_TYPE] == bed_type
         assert result["data"][CONF_MOTOR_COUNT] == 3
-        # The follow-up displayed Linak's recommendation and kept it enabled.
-        assert result["data"][CONF_DISCONNECT_AFTER_COMMAND] is True
+        assert result["data"][CONF_DISCONNECT_AFTER_COMMAND] is disconnect_after_command
 
     async def test_manual_entry_normalizes_cst_profile_motor_count(
         self, hass: HomeAssistant, enable_custom_integrations
