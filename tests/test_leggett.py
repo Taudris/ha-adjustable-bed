@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -17,6 +18,9 @@ from custom_components.adjustable_bed.beds.leggett_gen2 import (
     LeggettGen2Controller,
 )
 from custom_components.adjustable_bed.beds.leggett_okin import (
+    CU170_LIGHT_MASK,
+    CU170_PRESS_HOLD_S,
+    CU170_PRESS_RECEIPT_BACKSTOP_S,
     LeggettOkinCommands,
     LeggettOkinController,
     parse_leggett_okin_feedback,
@@ -82,6 +86,35 @@ def mock_leggett_gen2_config_entry(
     return entry
 
 
+class _FakeLoopClock:
+    """Virtual loop time, so a timing assertion costs no real seconds.
+
+    Patch it over the running loop's ``time``. Timers scheduled against it
+    expire only when ``advance`` moves the clock past them, and ``advance``
+    then lets the loop run whatever that expiry released.
+    """
+
+    # Small enough that no single step looks like a slow callback to asyncio,
+    # which measures a handle's duration with this very clock.
+    _STEP_S = 0.05
+
+    def __init__(self) -> None:
+        self.loop = asyncio.get_running_loop()
+        self.now = self.loop.time()
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def advance(self, seconds: float) -> None:
+        """Move virtual time forward and give the loop its expired timers."""
+        target = self.now + seconds
+        while self.now < target:
+            self.now = min(target, self.now + self._STEP_S)
+            await asyncio.sleep(0)
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+
 class TestLeggettGen2Controller:
     """Test Leggett & Platt Gen2 controller."""
 
@@ -141,7 +174,9 @@ class TestLeggettOkinController:
         assert command[2:] == bytes([0x00, 0x00, 0x00, 0x01])
 
     @staticmethod
-    def _controller_with_characteristics(*uuids: str) -> LeggettOkinController:
+    def _controller_with_characteristics(
+        *uuids: str, app_profile: str = "prodigy4"
+    ) -> LeggettOkinController:
         coordinator = MagicMock()
         if not uuids:
             uuids = (LEGGETT_OKIN_CHAR_UUID, LEGGETT_OKIN_REVISION_SELECTOR_CHAR_UUID)
@@ -156,9 +191,27 @@ class TestLeggettOkinController:
         )
         coordinator.cancel_command = asyncio.Event()
         coordinator.address = "AA:BB:CC:DD:EE:FF"
-        controller = LeggettOkinController(coordinator)
+        controller = LeggettOkinController(coordinator, app_profile=app_profile)
         controller._wait_hold_deadline = AsyncMock()
         return controller
+
+    @staticmethod
+    def _report_status_frame(controller: LeggettOkinController, mask: int = 0) -> None:
+        """Deliver the 20-byte status notification the box sends for a frame it receives."""
+        field = mask.to_bytes(4, "big")
+        controller._handle_notification(
+            SimpleNamespace(uuid=LEGGETT_OKIN_NOTIFY_CHAR_UUID),
+            bytearray(b"\x09\x0b" + field + field + b"\xff" + bytes(9)),
+        )
+
+    @staticmethod
+    def _receipt_on_write(controller: LeggettOkinController) -> AsyncMock:
+        """Answer every write the way the box does, with a status notification."""
+        return AsyncMock(
+            side_effect=lambda *args, **kwargs: TestLeggettOkinController._report_status_frame(
+                controller
+            )
+        )
 
     def test_revision_zero_framing_selected_when_selector_is_absent(self):
         """The write characteristic without 1721 selects the checksummed R0 frame."""
@@ -228,7 +281,7 @@ class TestLeggettOkinController:
     async def test_massage_wave_mode_is_advertised_and_sends_release(self):
         """Expose the proven wave keycode through the shared mode-step entity."""
         controller = self._controller_with_characteristics()
-        controller.write_command = AsyncMock()
+        controller.write_command = self._receipt_on_write(controller)
 
         assert controller.supports_massage_mode_step_control is True
 
@@ -533,7 +586,7 @@ class TestLeggettOkinController:
         then not recognise the next press of the same control.
         """
         controller = self._controller_with_characteristics()
-        controller.write_command = AsyncMock()
+        controller.write_command = self._receipt_on_write(controller)
 
         await controller.lights_toggle()
 
@@ -548,6 +601,140 @@ class TestLeggettOkinController:
         press, release = controller.write_command.await_args_list
         assert press.args == (bytes.fromhex("040200000100"),)
         assert release.args == (bytes.fromhex("040200000000"),)
+
+    def test_a_cu170_status_frame_records_the_box_receipt(self):
+        """The real 20-byte status frame is what marks the press as received.
+
+        A tap dates its release from this event, so if the handler stops setting
+        it every tap silently falls back to its backstop instead.
+        """
+        controller = self._controller_with_characteristics()
+        assert controller._status_frame_received.is_set() is False
+
+        self._report_status_frame(controller, CU170_LIGHT_MASK)
+
+        assert controller._status_frame_received.is_set() is True
+
+    async def test_the_release_is_timed_from_the_receipt_not_from_the_write(self):
+        """A late receipt moves the release out with it, by the whole press hold.
+
+        The box makes its press and release edges from frame arrival, so a
+        release measured from the write lands inside the press floor whenever
+        the transport is quick and the tap is lost.
+        """
+        controller = self._controller_with_characteristics()
+        controller.write_command = AsyncMock()
+        clock = _FakeLoopClock()
+
+        with patch.object(clock.loop, "time", clock):
+            written_at = clock.now
+            tap = asyncio.create_task(controller.massage_toggle())
+            await asyncio.sleep(0)
+            await clock.advance(0.3)
+            self._report_status_frame(controller)
+            await tap
+
+        deadline = controller._wait_hold_deadline.await_args.args[0]
+        assert deadline - written_at == pytest.approx(0.3 + CU170_PRESS_HOLD_S, abs=0.001)
+
+    async def test_a_lost_receipt_releases_on_the_backstop(self, caplog):
+        """A dropped receipt must not strand the key, or hold the lock past the backstop.
+
+        The notify channel loses frames. By the backstop the box has made its own
+        release edge from the silence, so the explicit zero is harmless.
+        """
+        controller = self._controller_with_characteristics()
+        controller.write_command = AsyncMock()
+        clock = _FakeLoopClock()
+
+        with (
+            caplog.at_level(
+                logging.DEBUG, logger="custom_components.adjustable_bed.beds.leggett_okin"
+            ),
+            patch.object(clock.loop, "time", clock),
+        ):
+            written_at = clock.now
+            tap = asyncio.create_task(controller.massage_toggle())
+            await asyncio.sleep(0)
+            assert not tap.done()  # the key stays down while the receipt is due
+            await clock.advance(CU170_PRESS_RECEIPT_BACKSTOP_S)
+            await tap
+            released_at = clock.now
+
+        assert released_at - written_at <= CU170_PRESS_RECEIPT_BACKSTOP_S
+        assert "No status frame acknowledged the massage_toggle press" in caplog.text
+        controller._wait_hold_deadline.assert_not_awaited()
+        release = controller.write_command.await_args_list[-1]
+        assert release.args == (bytes.fromhex("040200000000"),)
+
+    async def test_a_stop_during_the_receipt_wait_releases_without_the_backstop(self):
+        """A stop asked for mid-tap releases the key instead of sitting out the backstop.
+
+        The deadline wait this receipt wait replaced ended on the cancel event,
+        and the tap holds the command lock until it has released.
+        """
+        controller = self._controller_with_characteristics()
+        controller.write_command = AsyncMock()
+        clock = _FakeLoopClock()
+
+        with patch.object(clock.loop, "time", clock):
+            written_at = clock.now
+            tap = asyncio.create_task(controller.massage_toggle())
+            await asyncio.sleep(0)
+            assert not tap.done()  # the key stays down while the receipt is due
+
+            controller._coordinator.cancel_command.set()
+            # Virtual time stands still, so nothing but the cancel can end the
+            # wait, and the backstop timer never comes due.
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert tap.done()
+            await tap
+
+        assert clock.now == written_at
+        controller._wait_hold_deadline.assert_not_awaited()
+        release = controller.write_command.await_args_list[-1]
+        assert release.args == (bytes.fromhex("040200000000"),)
+
+    async def test_a_profile_without_measured_timing_taps_on_the_app_interval(self):
+        """Only the CU170 was measured, so the other profiles keep the app's wait.
+
+        They never report the CU170 status frame, so a receipt wait would spend
+        the whole backstop on every tap.
+        """
+        controller = self._controller_with_characteristics(app_profile="prodigy2")
+        controller.write_command = AsyncMock()
+        started = asyncio.get_running_loop().time()
+
+        await controller.massage_toggle()
+
+        elapsed = asyncio.get_running_loop().time() - started
+        assert elapsed < CU170_PRESS_RECEIPT_BACKSTOP_S
+        deadline = controller._wait_hold_deadline.await_args.args[0]
+        assert deadline - started == pytest.approx(
+            LEGGETT_OKIN_PULSE_DEFAULTS[1] / 1000, abs=0.05
+        )
+        press, release = controller.write_command.await_args_list
+        assert press.args == (bytes.fromhex("040200000100"),)
+        assert release.args == (bytes.fromhex("040200000000"),)
+        assert release.kwargs["repeat_count"] == 4
+
+    async def test_a_failed_press_still_releases_the_key(self):
+        """A press that failed part way through can still have latched the key.
+
+        The write raises before any receipt can arrive, so the release has to
+        come from the tap's cleanup rather than from the wait completing.
+        """
+        controller = self._controller_with_characteristics()
+        controller.write_command = AsyncMock(side_effect=BleakError("press failed"))
+
+        with pytest.raises(BleakError, match="press failed"):
+            await controller.massage_toggle()
+
+        release = controller.write_command.await_args_list[-1]
+        assert release.args == (bytes.fromhex("040200000000"),)
+        assert release.kwargs["cancel_event"].is_set() is False
+        controller._wait_hold_deadline.assert_not_awaited()
 
     async def test_program_memory_surfaces_a_failed_final_release(self):
         """On the success path the closing release is the operation, not cleanup.
@@ -587,7 +774,15 @@ class TestLeggettOkinController:
         coordinator.motor_pulse_delay_ms = 100
         coordinator.client = self._controller_with_characteristics().client
         controller = LeggettOkinController(coordinator)
-        controller.write_command = AsyncMock(side_effect=[None, BleakError("release failed")])
+        outcomes = [None, BleakError("release failed")]
+
+        async def write(*args, **kwargs):
+            self._report_status_frame(controller)
+            outcome = outcomes.pop(0)
+            if outcome is not None:
+                raise outcome
+
+        controller.write_command = AsyncMock(side_effect=write)
         coordinator.cancel_command = asyncio.Event()
 
         with pytest.raises(BleakError, match="release failed"):

@@ -153,6 +153,19 @@ CU170_SLEEP_MASK = 0x00800000
 # Integration response timeout, not a firmware timing requirement.
 LIGHT_STATE_TIMEOUT_S = 3.0
 
+# Prodigy CE / CU170 only: how long a tap holds the key once the box has the
+# press. The owner's 2026-09-06 sweep put the under-bed light's
+# press-to-release floor at 150 ms, with 101 of 101 taps registering at 150 ms
+# or more and the last failure at 114 ms, timing the gap at the writer. This
+# hold runs from the box's receipt of the press instead, so the gap the box
+# sees is this hold plus the receipt's return trip plus the release's delivery,
+# above the measured floor by construction.
+CU170_PRESS_HOLD_S = 0.15
+# How long a tap holds the key before releasing without having seen a receipt.
+# The notify channel drops 2.5-4.5% of receipts under a stream (2026-08), and by
+# this point the box has made its own release edge from the silence.
+CU170_PRESS_RECEIPT_BACKSTOP_S = 0.5
+
 
 def _build_revision_0_command(command_value: int) -> bytes:
     """Build the APK's revision-0 E5 FE 16 command frame."""
@@ -239,6 +252,11 @@ class LeggettOkinController(BedController):
         self._cu170_status_mask: int | None = None
         self._light_is_on: bool | None = None
         self._light_state_changed = asyncio.Event()
+        # Every CU170 status frame, which the box sends for every frame it
+        # receives. A tap clears this before its press write and waits on it for
+        # the box's receipt of that press; the light logic waits on
+        # _light_state_changed for a later, different frame on the same channel.
+        self._status_frame_received = asyncio.Event()
         self._notify_started: set[str] = set()
         self._notifications_stopped = False
         self._settings_initialized = False
@@ -759,6 +777,7 @@ class LeggettOkinController(BedController):
             self._notification_led_mask = mask
             self._notification_status = None
             self._light_state_changed.set()
+            self._status_frame_received.set()
             self.forward_controller_state_updates(
                 {
                     "leggett_led_mask": mask,
@@ -1170,20 +1189,72 @@ class LeggettOkinController(BedController):
         """Send a keycode as a short press, then release it.
 
         Lights and massage are ordinary held keycodes in the app, not one-shot
-        recalls: a tap leaves one 100 ms interval after writing before release.
-        Sending the frame alone can leave the key asserted, so the next press of the same
-        control may not register.
+        recalls. Sending the frame alone can leave the key asserted, so the next
+        press of the same control may not register.
         """
         completed = False
         try:
+            # Cleared before the write, so a receipt that arrives while the
+            # frame is still on the wire still counts as this press's.
+            self._status_frame_received.clear()
             await self.write_command(self._build_command(command))
-            deadline = (
-                asyncio.get_running_loop().time() + LEGGETT_OKIN_PULSE_DEFAULTS[1] / 1000
-            )
-            await self._wait_hold_deadline(deadline)
+            await self._hold_press(context)
             completed = True
         finally:
             await self._send_release_frames(context, raise_on_error=completed)
+
+    async def _hold_press(self, context: str) -> None:
+        """Hold a tapped key down long enough for the control box to register it."""
+        if self._app_profile == "prodigy4":
+            await self._hold_cu170_press_from_receipt(context)
+            return
+        # The app's own one-interval wait, on the profiles whose press floor no
+        # hardware run has measured.
+        await self._wait_hold_deadline(
+            asyncio.get_running_loop().time() + LEGGETT_OKIN_PULSE_DEFAULTS[1] / 1000
+        )
+
+    async def _hold_cu170_press_from_receipt(self, context: str) -> None:
+        """Wait for the box's receipt of the press, then hold the key past its floor.
+
+        The control box makes its press and release edges from the arrival of
+        frames rather than from their contents, so a release timed from the
+        write lands inside the press floor whenever the transport is quick and
+        the tap does not register. Every frame the box receives draws a status
+        notification, so that receipt dates the press on the box's own clock.
+        """
+        if await self._wait_for_press_receipt(context):
+            await self._wait_hold_deadline(asyncio.get_running_loop().time() + CU170_PRESS_HOLD_S)
+
+    async def _wait_for_press_receipt(self, context: str) -> bool:
+        """Report whether the box acknowledged the press within the backstop.
+
+        False means release the key now: either a stop was requested, which
+        releases at once rather than behind the backstop, or the receipt was
+        lost and the box has already made its release edge from the silence.
+        """
+        receipt = asyncio.create_task(self._status_frame_received.wait())
+        cancelled = asyncio.create_task(self._coordinator.cancel_command.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {receipt, cancelled},
+                timeout=CU170_PRESS_RECEIPT_BACKSTOP_S,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in (receipt, cancelled):
+                if not task.done():
+                    task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        if not done:
+            _LOGGER.debug(
+                "No status frame acknowledged the %s press within %.1fs; releasing it",
+                context,
+                CU170_PRESS_RECEIPT_BACKSTOP_S,
+            )
+            return False
+        return receipt in done
 
     # Light methods
     def get_light_state(self) -> dict[str, Any]:

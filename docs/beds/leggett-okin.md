@@ -225,10 +225,19 @@ allows automatic pairing retries. A successful verified retry suppresses the
 pairing repair entirely. Failed, inconclusive or cancelled recovery still raises
 the repair, and command-time authentication errors remain immediately visible.
 
-Light and massage taps now leave one 100 ms command interval before the release
-burst. Previously the first zero could follow the press immediately, making
-the light toggle too short to register. This uses the accepted app cadence;
-the precise minimum hardware debounce interval is not established.
+For **Prodigy CE / CU170 only**, a light or massage tap holds the key until the
+box acknowledges the press and then for a further 150 ms, before the release
+frame. Because the box builds its press and release edges from frame arrival, a
+release timed from the write alone falls inside the press floor on a quick
+transport and the tap is lost. The owner's 2026-09-06 sweep put the light's
+press-to-release floor at 150 ms, where 101 of 101 taps registered at 150 ms or
+more and the last failure was at 114 ms, timing the gap at the writer. This hold
+runs from the box's receipt of the press instead, so the gap the box sees is the
+150 ms plus the receipt's return trip plus the release's delivery, above the
+measured floor by construction. If no status frame arrives within 500 ms of the
+press, the integration logs a debug line and releases anyway, because the box
+made its own release edge from the silence long before that. Other app profiles
+keep the accepted one-interval wait.
 
 The integration also retains raw LED-mask and signed-status sensors for the
 app parser, and reads available standard Device Information strings for
