@@ -1,0 +1,34 @@
+name: Feature Request
+description: Request a missing capability or an improvement
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests belong in Issues so they can be tracked and prioritized.
+        Search [existing issues](https://github.com/kristofferR/ha-adjustable-bed/issues?q=is%3Aissue) first.
+        For an unsupported bed, use the New Bed Support Request form instead.
+        A support bundle is optional for feature requests.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would you like to do?
+      description: Describe the missing capability and how you would use it.
+      placeholder: "I want to recall named positions from the bed card..."
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Suggested behavior
+      description: Describe how you would like it to work, if you have a preference.
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Relevant setup and alternatives
+      description: Include the bed model, official app, integration version, or current workaround where relevant. Links to an existing discussion are welcome.
+    validations:
+      required: false

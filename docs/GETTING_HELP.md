@@ -2,16 +2,16 @@
 
 Need help with the Adjustable Bed integration? This guide explains how to get support and what information we'll need.
 
-> **Before opening any issue, generate a support bundle.** It's the single most useful thing you can provide — it includes your configuration, BLE details, connection state, and recent logs all in one file. Without it, the first response to your issue will be a request to generate one.
+> **For bugs and bed compatibility reports, include a support bundle if possible.** It includes your configuration, BLE details, connection state, and recent logs. If capture fails, describe what happened and submit the report anyway. Feature requests and general questions do not require a bundle.
 
 ## Quick Links
 
 | I need to... | Go here |
 |--------------|---------|
-| Get help with setup | [Ask a Question](https://github.com/kristofferR/ha-adjustable-bed/discussions/new?category=q-a) |
+| Get help with setup | [Ask a Question](https://github.com/kristofferR/ha-adjustable-bed/discussions/new?category=help-questions) |
 | Report a bug | [Bug Report](https://github.com/kristofferR/ha-adjustable-bed/issues/new?template=bug-report.yml) |
 | Request support for a new bed | [New Bed Support Request](https://github.com/kristofferR/ha-adjustable-bed/issues/new?template=new-bed-support.yml) |
-| Suggest a feature | [Ideas & Suggestions](https://github.com/kristofferR/ha-adjustable-bed/discussions/new?category=ideas) |
+| Suggest a feature | [Feature Request](https://github.com/kristofferR/ha-adjustable-bed/issues/new?template=feature-request.yml) |
 | Fix a common issue | [Troubleshooting Guide](TROUBLESHOOTING.md) |
 | Set up Bluetooth | [Connection Guide](CONNECTION_GUIDE.md) |
 | Find my bed's actuator brand | [Supported Actuators](SUPPORTED_ACTUATORS.md) |
@@ -20,15 +20,43 @@ Need help with the Adjustable Bed integration? This guide explains how to get su
 
 ## Need Help with Setup?
 
-For setup questions, configuration help, or general "how do I..." questions, the best place to ask is the **[Q&A Discussions](https://github.com/kristofferR/ha-adjustable-bed/discussions/new?category=q-a)**. The community can help with:
+For configuration help or general "how do I..." questions, ask in **[Help & questions](https://github.com/kristofferR/ha-adjustable-bed/discussions/new?category=help-questions)**. The community can help with:
 
 - Identifying which bed type or actuator brand to select
-- Bluetooth connection and pairing issues
+- Choosing a Bluetooth adapter or proxy
 - ESPHome proxy configuration
 - Automations and scripts using the integration
 - General Home Assistant integration questions
 
 **Tip:** Search [existing discussions](https://github.com/kristofferR/ha-adjustable-bed/discussions) first - someone may have already answered your question!
+
+If connection, pairing, or controls fail, use a [Bug Report](https://github.com/kristofferR/ha-adjustable-bed/issues/new?template=bug-report.yml).
+You do not need to know whether the cause is configuration or a software bug.
+
+## Requesting a Feature
+
+Use the [Feature Request](https://github.com/kristofferR/ha-adjustable-bed/issues/new?template=feature-request.yml)
+form for missing controls, card improvements, and automation capabilities. Describe
+what you want to do and any current workaround. A request does not need a technical
+design or a support bundle to be tracked.
+
+## How Reports Are Handled
+
+Issues are the tracking queue for bugs, features, and bed compatibility. Discussions
+are for help, shared dashboards and automations, experiences, and announcements.
+
+If a discussion reveals work to do, a maintainer creates or links an issue,
+preserving the report and diagnostic links. You do not need to submit it again.
+Follow the linked issue for progress; a closed discussion does not mean the bug
+was fixed or the feature shipped.
+
+- **Answered:** a help question has a useful answer. Follow-up questions remain welcome.
+- **Closed:** the topic is completed, declined, duplicated, or handed off to a linked issue. The thread should explain which.
+- **Locked:** reserved for moderation or deliberately read-only announcements.
+- **Waiting for information:** an issue remains open with the `needs-info` label and a specific request for the missing details. Asking for a bundle is not an answer or a fix.
+
+We do not close reports just because they are old. An accepted answer should be
+updated if later replies show it is wrong or the problem has returned.
 
 ---
 
@@ -46,7 +74,9 @@ Please check these resources first:
 
 If you've found a bug, please file a [Bug Report](https://github.com/kristofferR/ha-adjustable-bed/issues/new?template=bug-report.yml).
 
-**Start by generating a support bundle** — it contains everything we need to investigate. Then fill in the issue template with a description of the problem, steps to reproduce, and any other context.
+Generate a support bundle if possible, then fill in the issue template with the
+problem, steps to reproduce, and any other context. If capture fails, describe the
+failure instead so the report can still be tracked.
 
 For v4, include the exact beta version, Home Assistant version, whether this was
 a v3 upgrade, and whether the bed is standalone or combined. For a combined bed,
@@ -110,7 +140,9 @@ This captures only the relevant logs for this integration, making it easier to d
 
 If your bed isn't supported yet, file a [New Bed Support Request](https://github.com/kristofferR/ha-adjustable-bed/issues/new?template=new-bed-support.yml).
 
-**Start by generating a support bundle** — it captures all the BLE data (service UUIDs, device name, GATT structure) needed to implement a new protocol. Without it, we cannot begin implementation.
+Start by generating a support bundle if possible. It captures BLE details needed
+to investigate compatibility. If capture fails, include the bed model, official
+app, and capture error so we can track the request and identify what is missing.
 
 You don't need to configure anything first — the support bundle action works directly on any BLE device your Home Assistant can see:
 
@@ -211,9 +243,10 @@ disconnect it before using the official app on a bed that accepts one BLE link.
 
 After you submit an issue:
 
-1. **We'll review it** - Usually within a few days
-2. **We may ask for more info** - Check back for follow-up questions
+1. **We'll triage it** - Check for an existing issue and identify the next step
+2. **We may ask for more info** - The issue stays open with `needs-info` while details are missing
 3. **For bugs** - We'll try to reproduce and fix the issue
 4. **For new beds** - We'll analyze the protocol and may ask you to test
+5. **For features** - We'll assess the scope and record whether the request is planned or declined
 
 **Note:** This is a community-maintained integration. Response times vary based on contributor availability.

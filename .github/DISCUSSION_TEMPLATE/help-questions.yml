@@ -1,0 +1,23 @@
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this category for questions about configuring or using the integration.
+        For broken controls or connection failures, [report a bug](https://github.com/kristofferR/ha-adjustable-bed/issues/new?template=bug-report.yml).
+        For missing capabilities, [request a feature](https://github.com/kristofferR/ha-adjustable-bed/issues/new?template=feature-request.yml).
+        For an unsupported model, [request bed support](https://github.com/kristofferR/ha-adjustable-bed/issues/new?template=new-bed-support.yml).
+        You do not need to prove the cause is a bug before reporting a failure.
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: What are you trying to do, and where do you need help?
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Relevant setup and what you tried
+      description: Include your bed model, integration and Home Assistant versions, or links where useful. Diagnostics are optional for questions.
+    validations:
+      required: false

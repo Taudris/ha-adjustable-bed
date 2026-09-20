@@ -1,17 +1,14 @@
 blank_issues_enabled: false
 contact_links:
   - name: Troubleshooting Guide
-    url: https://github.com/kristofferR/ha-adjustable-bed/blob/release/4.0/docs/TROUBLESHOOTING.md
+    url: https://github.com/kristofferR/ha-adjustable-bed/blob/master/docs/TROUBLESHOOTING.md
     about: Solutions for common issues with connection, commands, and position feedback
   - name: Getting Help Guide
-    url: https://github.com/kristofferR/ha-adjustable-bed/blob/release/4.0/docs/GETTING_HELP.md
+    url: https://github.com/kristofferR/ha-adjustable-bed/blob/master/docs/GETTING_HELP.md
     about: How to get support, generate diagnostics, and what info we need
   - name: 💬 Ask a Question
-    url: https://github.com/kristofferR/ha-adjustable-bed/discussions/new?category=q-a
-    about: Get help from the community with setup, configuration, or troubleshooting
-  - name: 💡 Suggest an Idea
-    url: https://github.com/kristofferR/ha-adjustable-bed/discussions/new?category=ideas
-    about: Share feature requests and improvement ideas
+    url: https://github.com/kristofferR/ha-adjustable-bed/discussions/new?category=help-questions
+    about: Ask how to configure or use the integration. Report failures and missing features using the issue forms above.
   - name: ❤️ Praise and Feedback
     url: https://github.com/kristofferR/ha-adjustable-bed/discussions/131
     about: Share your experience or say thanks

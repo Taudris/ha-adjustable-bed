@@ -54,9 +54,15 @@ See the [documentation index](docs/README.md) for migration and developer guides
 
 | | |
 |---|---|
-| 💬 **[Ask a Question](https://github.com/kristofferR/ha-adjustable-bed/discussions/new?category=q-a)** | Get help from the community |
-| 💡 **[Suggest an Idea](https://github.com/kristofferR/ha-adjustable-bed/discussions/new?category=ideas)** | Feature requests and improvements |
+| 🐛 **[Report a Bug](https://github.com/kristofferR/ha-adjustable-bed/issues/new?template=bug-report.yml)** | Broken controls, connection failures, or regressions |
+| 💡 **[Request a Feature](https://github.com/kristofferR/ha-adjustable-bed/issues/new?template=feature-request.yml)** | Missing capabilities and improvements |
+| 🛏️ **[Request Bed Support](https://github.com/kristofferR/ha-adjustable-bed/issues/new?template=new-bed-support.yml)** | Unsupported bed brands or models |
+| 💬 **[Ask a Question](https://github.com/kristofferR/ha-adjustable-bed/discussions/new?category=help-questions)** | How to configure or use the integration |
 | ❤️ **[Praise and Feedback](https://github.com/kristofferR/ha-adjustable-bed/discussions/131)** | Share your experience or say thanks |
+
+Issues track work; Discussions host help and community conversations. You do not
+need to prove a problem is a bug before reporting it. See [how reports are
+handled](docs/GETTING_HELP.md#how-reports-are-handled).
 
 <details>
 <summary><b>Quick troubleshooting</b></summary>
