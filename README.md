@@ -58,9 +58,15 @@
 
 </details>
 
-## Donate
+## ❤️ Support the project
 
-If you love this integration, please consider [sending a thanks my way](https://github.com/sponsors/kristofferR).
+Enjoying Adjustable Bed? Sponsoring its development is a lovely way to say thanks and help keep the project growing.
+
+[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor_on_GitHub-%E2%99%A1-ec6cb9?style=for-the-badge)](https://github.com/sponsors/kristofferR)
+
+<p align="center">
+  <img src="https://files.kristofferr.com/artifacts/adjustable-bed-v4-dual-controls.png?k=HdLGHefHqT2P" alt="Adjustable Bed v4 dashboard with independent left and right positions" width="432">
+</p>
 
 ## Supported Beds
 
