@@ -542,26 +542,24 @@ async def test_light_on_off_waits_for_spontaneous_state_and_is_idempotent():
     assert controller._tap_keycode.await_count == 2
 
 
-async def test_lights_toggle_inverts_a_known_state_and_presses_once_when_unknown():
+async def test_lights_toggle_inverts_a_known_state_and_presses_blind_when_unknown():
+    """Toggle takes the same blind press as on and off, so all three doors report alike."""
     controller = make_controller()
-    controller._tap_light = AsyncMock()
+    controller._tap_light_and_confirm = AsyncMock()
     controller._set_light_state = AsyncMock()
     await controller.lights_toggle()
-    controller._tap_light.assert_awaited_once()
+    controller._tap_light_and_confirm.assert_awaited_once()
     controller._set_light_state.assert_not_awaited()
     report_cu170(controller, 0x20000)
     await controller.lights_toggle()
     controller._set_light_state.assert_awaited_once_with(False)
-    controller._tap_light.assert_awaited_once()
+    controller._tap_light_and_confirm.assert_awaited_once()
 
 
-async def test_unknown_or_unconfirmed_light_state_never_causes_a_retry_toggle():
+async def test_an_unconfirmed_light_state_is_invalidated_without_a_retry_toggle():
     from homeassistant.exceptions import HomeAssistantError
 
     controller = make_controller()
-    with pytest.raises(HomeAssistantError, match="unknown"):
-        await controller.lights_on()
-    controller.write_command.assert_not_awaited()
     report_cu170(controller, 0)
     controller._tap_keycode = AsyncMock()
     with (
@@ -570,9 +568,79 @@ async def test_unknown_or_unconfirmed_light_state_never_causes_a_retry_toggle():
     ):
         await controller.lights_on()
     controller._tap_keycode.assert_awaited_once()
-    with pytest.raises(HomeAssistantError, match="unknown"):
+    assert controller.get_light_state() == {"is_on": None}
+
+
+@pytest.mark.parametrize("requested", [True, False])
+async def test_an_unknown_light_state_presses_once_and_takes_the_reported_state(requested):
+    controller = make_controller()
+    controller._tap_keycode = AsyncMock()
+    task = asyncio.create_task(controller.lights_on() if requested else controller.lights_off())
+    await asyncio.sleep(0)
+    report_cu170(controller, 0)  # Receipt: the state before the press.
+    report_cu170(controller, 0x20000)  # The change the press produced.
+    await task
+    controller._tap_keycode.assert_awaited_once()
+    assert controller.get_light_state() == {"is_on": True}
+
+
+async def test_a_receipt_alone_hydrates_the_light_state_without_an_error():
+    controller = make_controller()
+    controller._tap_keycode = AsyncMock()
+    task = asyncio.create_task(controller.lights_on())
+    await asyncio.sleep(0)
+    report_cu170(controller, 0x20000)  # The release frames draw receipts too.
+    await task
+    controller._tap_keycode.assert_awaited_once()
+    assert controller.get_light_state() == {"is_on": True}
+
+
+async def test_an_unreported_blind_press_stays_unknown_and_presses_again():
+    from homeassistant.exceptions import HomeAssistantError
+
+    controller = make_controller()
+    controller._tap_keycode = AsyncMock()
+    for _ in range(2):
+        with (
+            patch("custom_components.adjustable_bed.beds.leggett_okin.LIGHT_STATE_TIMEOUT_S", 0),
+            pytest.raises(HomeAssistantError, match="did not confirm"),
+        ):
+            await controller.lights_on()
+        assert controller.get_light_state() == {"is_on": None}
+    assert controller._tap_keycode.await_count == 2
+
+
+@pytest.mark.parametrize(
+    "failure", [BleakError("press failed"), ConnectionError("link gone"), asyncio.CancelledError()]
+)
+async def test_a_failed_blind_press_leaves_the_light_unknown(failure):
+    """The receipt a lost press drew carries the state from before it, not a result.
+
+    Leaving that receipt standing would report the light as the press found it,
+    and the next on or off action would then believe it had nothing to do.
+    """
+    controller = make_controller()
+
+    async def press_then_fail(*args, **kwargs):
+        report_cu170(controller, 0x20000)
+        raise failure
+
+    controller._tap_keycode = AsyncMock(side_effect=press_then_fail)
+
+    with pytest.raises(type(failure)):
+        await controller.lights_on()
+
+    controller._tap_keycode.assert_awaited_once()
+    assert controller.get_light_state() == {"is_on": None}
+
+
+async def test_a_profile_without_light_feedback_presses_once_without_waiting():
+    controller = make_controller("prodigy2")
+    controller._tap_keycode = AsyncMock()
+    with patch("custom_components.adjustable_bed.beds.leggett_okin.LIGHT_STATE_TIMEOUT_S", 0):
         await controller.lights_on()
     controller._tap_keycode.assert_awaited_once()
+    assert controller.get_light_state() == {"is_on": None}
 
 
 async def test_disconnect_invalidates_cu170_light_state():

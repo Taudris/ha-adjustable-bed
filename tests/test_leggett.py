@@ -534,6 +534,9 @@ class TestLeggettOkinController:
         """
         controller = self._controller_with_characteristics()
         controller.write_command = AsyncMock()
+        # The burst is the subject here, not the state the press produces, so
+        # the blind press does not wait for the bed to report one.
+        controller._wait_for_light_report = AsyncMock()
 
         await controller.lights_toggle()
 
