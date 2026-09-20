@@ -2,7 +2,7 @@
 
 Issue: #551
 
-Scope: the nine accepted Okin CST package reports in Phase 4 cluster 011
+Scope: the nine accepted Okin CST package reports in APK Protocol Audit cluster 011
 
 Status: implementation complete; physical hardware validation deferred
 
@@ -110,5 +110,5 @@ Totals: **18 IMPLEMENTED, 54 ALREADY IMPLEMENTED, 27 EXCLUDED**.
 
 There is no remaining static-analysis blocker or unimplemented actionable
 cluster finding. Hardware behavior is explicitly unverified, as allowed by the
-Phase 4 completion policy. After this change is reviewed and merged, #551 can be
+APK Protocol Audit completion policy. After this change is reviewed and merged, #551 can be
 closed once the queue and discovery ledgers are synchronized.

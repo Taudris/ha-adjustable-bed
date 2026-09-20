@@ -22,7 +22,7 @@ a retail brand or guessed model name.
 ## Analysis provenance
 
 All three current corpus packages have frozen COMPLETE reports that pass the
-reusable [Phase 4 completion gates](https://github.com/kristofferR/ha-adjustable-bed/issues/443).
+reusable [APK Protocol Audit completion gates](https://github.com/kristofferR/ha-adjustable-bed/issues/443).
 The APKs, decompilation output, and reports remain machine-local as required by
 [issue #436](https://github.com/kristofferR/ha-adjustable-bed/issues/436).
 

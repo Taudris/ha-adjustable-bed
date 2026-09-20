@@ -1,4 +1,4 @@
-"""Concurrency and integrity tests for the Phase 4 v2 queue core."""
+"""Concurrency and integrity tests for the APK Protocol Audit v2 queue core."""
 
 from __future__ import annotations
 

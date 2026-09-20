@@ -1,4 +1,4 @@
-"""Mutation tests for the Phase 4 v2 filesystem-integrity validator."""
+"""Mutation tests for the APK Protocol Audit v2 filesystem-integrity validator."""
 
 from __future__ import annotations
 

@@ -824,7 +824,7 @@ class TestSolacePresets:
         mock_coordinator_connected,
         mock_bleak_client: MagicMock,
     ):
-        """Yoga stays unavailable until its separate APK passes Phase 4."""
+        """Yoga stays unavailable until its separate APK passes APK Protocol Audit."""
         coordinator = AdjustableBedCoordinator(hass, mock_solace_config_entry)
         await coordinator.async_connect()
 

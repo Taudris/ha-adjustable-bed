@@ -8,7 +8,7 @@ This controller covers a family of beds that write fixed 11-byte frames to FFE1.
 
 ## Evidence status
 
-| App | Package and version | Phase 4 result |
+| App | Package and version | APK Protocol Audit result |
 |---|---|---|
 | HomeKobo | `com.ly.homekobo` 1.4 | COMPLETE |
 | Sealy MotionFlex | `com.sealy.motionflex` 1.0.3 | COMPLETE |
@@ -92,7 +92,7 @@ MotionFlex proves light brightness levels 0-10; level 0 is the accepted off comm
 
 ## Intentionally withheld behavior
 
-These historical commands remain out of accepted profiles until their own APKs pass Phase 4:
+These historical commands remain out of accepted profiles until their own APKs pass APK Protocol Audit:
 
 - Yoga selector `4E`
 - Legacy all-flat selector `2A` outside the exact S4-Y compatibility profile

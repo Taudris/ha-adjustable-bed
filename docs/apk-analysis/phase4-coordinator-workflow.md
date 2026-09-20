@@ -1,4 +1,4 @@
-# Phase 4 coordinator workflow
+# APK Protocol Audit coordinator workflow
 
 This is the small v3 operating amendment for #443, not a new analysis schema or
 execution platform. The canonical analyst prompt and all 17 completion gates

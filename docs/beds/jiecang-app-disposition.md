@@ -1,6 +1,6 @@
 # ERGOBALANCE and Dream Motion app protocol
 
-This is the implementation disposition for Phase 4 row020, formal cluster-004,
+This is the implementation disposition for APK Protocol Audit row020, formal cluster-004,
 against `release/4.0`. The bed type `jiecang_app` provides the app-derived protocol
 through explicit app-profile and actuator-layout selections. The existing
 `jiecang` controller remains separate: shared service UUIDs alone do not identify

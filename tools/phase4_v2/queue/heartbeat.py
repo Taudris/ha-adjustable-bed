@@ -1,4 +1,4 @@
-"""Non-model lease heartbeat loop for a running Phase 4 worker."""
+"""Non-model lease heartbeat loop for a running APK Protocol Audit worker."""
 
 from __future__ import annotations
 

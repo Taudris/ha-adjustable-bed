@@ -5,7 +5,7 @@ Control boxes sold as Leggett & Platt Prodigy Comfort Elite and similar, marked
 
 Select the app profile matching the bed's remote application. The default remains
 **Prodigy CE / Prodigy 4**, preserving existing configurations. The accepted
-Phase 4 cluster-005 reports establish these distinct BLE control surfaces:
+APK Protocol Audit cluster-005 reports establish these distinct BLE control surfaces:
 
 | Profile | Accepted package/version | Movement axes | Direct memories |
 |---|---|---|---|
@@ -273,7 +273,7 @@ the app's raw `01 02` initialization write.
 ## Provenance
 
 Command values, framing, timing, notification parsing and release semantics
-come from the accepted Phase 4 clean-room analysis of `com.leggett.prodigy4`
+come from the accepted APK Protocol Audit clean-room analysis of `com.leggett.prodigy4`
 1.2.0 (versionCode 18, artifact SHA-256 `45922c518c9e8070…`), traced from layout
 binding to the GATT boundary and independently audited. The report is COMPLETE;
 the hardware status mapping above supplements that frozen app evidence and does

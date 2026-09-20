@@ -20,7 +20,7 @@ The [README Supported Beds table](../../README.md#supported-beds) remains the
 canonical support matrix. Protocol evidence here was frozen from MotoSleep
 `com.HHC.MotoSleep` 5.1.5 (`2026071001`) and Power Bob
 `com.HHC.PowerBob` 2.0.3. Both reports are COMPLETE and pass the reusable
-[Phase 4 completion gates](https://github.com/kristofferR/ha-adjustable-bed/issues/443):
+[APK Protocol Audit completion gates](https://github.com/kristofferR/ha-adjustable-bed/issues/443):
 
 | Package | Artifact-set SHA-256 | Frozen report evidence |
 |---------|---------------------|------------------------|

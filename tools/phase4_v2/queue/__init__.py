@@ -1,4 +1,4 @@
-"""Host-local queue primitives for the Phase 4 v2 pipeline."""
+"""Host-local queue primitives for the APK Protocol Audit v2 pipeline."""
 
 from .core import (
     CapabilityPin,

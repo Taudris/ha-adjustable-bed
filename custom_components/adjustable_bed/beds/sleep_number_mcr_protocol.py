@@ -1,6 +1,6 @@
 """SleepIQ 5.4.11 MCR response decoders and bounded command values.
 
-Derived from the frozen Phase 4 MCR/SE evidence; no hardware validation claimed.
+Derived from the frozen APK Protocol Audit MCR/SE evidence; no hardware validation claimed.
 """
 
 from __future__ import annotations

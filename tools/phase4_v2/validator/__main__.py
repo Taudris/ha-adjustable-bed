@@ -1,4 +1,4 @@
-"""Command-line entry point for the Phase 4 bundle validator."""
+"""Command-line entry point for the APK Protocol Audit bundle validator."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ _MAX_LINEAGE_BYTES = 64 * 1024**2
 def main() -> int:
     """Validate one report directory and print its canonical receipt."""
     parser = argparse.ArgumentParser(
-        description="Validate a frozen Phase 4 report bundle without modifying it."
+        description="Validate a frozen APK Protocol Audit report bundle without modifying it."
     )
     parser.add_argument("report_root", type=Path)
     parser.add_argument("--preflight-sha256")

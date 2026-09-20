@@ -1,6 +1,6 @@
 # LOGICDATA MOTIONrelax phone and tablet apps
 
-These explicit app profiles implement the accepted Phase 4 cluster-006 evidence:
+These explicit app profiles implement the accepted APK Protocol Audit cluster-006 evidence:
 `com.logicdata.app.android.bed` **1.0.6 (7)** and
 `com.logicdata.app.android.pad.bed` **1.0.4 (5)**.
 **Static verified, hardware unverified.**

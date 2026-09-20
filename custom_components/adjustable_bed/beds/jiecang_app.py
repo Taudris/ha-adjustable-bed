@@ -1,4 +1,4 @@
-"""Explicit Dreamask/Dreamotion app profiles from accepted Phase 4 evidence.
+"""Explicit Dreamask/Dreamotion app profiles from accepted APK Protocol Audit evidence.
 
 These opt-in profiles preserve the older, separately tested Jiecang controller.
 Transport selection and physical layout are independent of app release timing.

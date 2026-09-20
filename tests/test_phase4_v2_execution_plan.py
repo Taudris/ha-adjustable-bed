@@ -1,4 +1,4 @@
-"""Hostile tests for immutable Phase 4 v2 package execution plans."""
+"""Hostile tests for immutable APK Protocol Audit v2 package execution plans."""
 
 from __future__ import annotations
 

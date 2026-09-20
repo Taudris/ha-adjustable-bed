@@ -1,6 +1,6 @@
 # MOTIONrelax phone and tablet implementation disposition
 
-This records the complete Phase 4 row021, formal cluster-006, implementation
+This records the complete APK Protocol Audit row021, formal cluster-006, implementation
 against `release/4.0`. The accepted phone and tablet apps use explicit MOTIONrelax
 profiles. Their packet family, configured actuator layout and GATT transport are
 separate choices. Existing legacy controllers remain separate; a brand name or

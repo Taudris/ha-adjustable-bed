@@ -1,6 +1,6 @@
 # Leggett app cluster implementation disposition
 
-This is the post-freeze implementation ledger for Phase 4 row022,
+This is the post-freeze implementation ledger for APK Protocol Audit row022,
 `cluster-005`, against `release/4.0`. It reuses the four accepted reports from
 2026-08-27. It does not replace, amend, or redistribute those reports.
 

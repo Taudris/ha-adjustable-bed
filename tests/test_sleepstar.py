@@ -93,7 +93,7 @@ def sleepstar_controller() -> tuple[SleepStarController, MagicMock, MagicMock]:
     ],
 )
 def test_frozen_clean_room_vectors(actual: bytes, expected: str) -> None:
-    """Production builders must preserve the frozen Phase 4 packet oracles."""
+    """Production builders must preserve the frozen APK Protocol Audit packet oracles."""
     assert actual.hex().upper() == expected
 
 

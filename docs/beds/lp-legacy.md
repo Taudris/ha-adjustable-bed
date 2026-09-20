@@ -3,7 +3,7 @@
 This explicit controller follows **L&P Adjustable Base 2.2.1 (13)**,
 package `com.richmat.lp`. Its 122 remote layouts are selected by the four-character
 code used in that app's manual or QR setup. The implementation uses the accepted
-Phase 4 report for queue row019. It does not change existing Richmat or L&P QRRM
+APK Protocol Audit report for queue row019. It does not change existing Richmat or L&P QRRM
 configurations.
 
 **Static verified, hardware unverified.** The app's labels describe the available

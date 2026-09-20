@@ -1,6 +1,6 @@
 # ERGOBALANCE and Dream Motion app profiles
 
-These explicit profiles implement the accepted Phase 4 cluster-004 evidence for
+These explicit profiles implement the accepted APK Protocol Audit cluster-004 evidence for
 `com.jiecang.dreamask.app.android.bed` **1.0.8 (8)** and
 `com.jiecang.dreamotion.app.android.bed` **1.0.5 (11)**.
 **Static verified, hardware unverified.** Existing legacy Jiecang configurations

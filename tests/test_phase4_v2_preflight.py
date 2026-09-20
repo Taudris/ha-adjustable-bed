@@ -1,4 +1,4 @@
-"""Focused tests for deterministic Phase 4 v2 delivery preflight."""
+"""Focused tests for deterministic APK Protocol Audit v2 delivery preflight."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from typing import overload
 import pytest
 
 if sys.platform != "linux":
-    pytest.skip("Phase 4 v2 preflight requires Linux", allow_module_level=True)
+    pytest.skip("APK Protocol Audit v2 preflight requires Linux", allow_module_level=True)
 
 import tools.phase4_v2.preflight.core as legacy_preflight
 from tools.phase4_v2.preflight import (

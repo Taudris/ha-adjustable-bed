@@ -1,4 +1,4 @@
-"""Immutable, queue-shaped execution contracts for Phase 4 v2 packages."""
+"""Immutable, queue-shaped execution contracts for APK Protocol Audit v2 packages."""
 
 from __future__ import annotations
 

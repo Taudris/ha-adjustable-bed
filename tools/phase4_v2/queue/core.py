@@ -1,4 +1,4 @@
-"""Atomic SQLite work leasing for independent Phase 4 v2 workers.
+"""Atomic SQLite work leasing for independent APK Protocol Audit v2 workers.
 
 Every path is supplied by the caller. The module has no live-database default and
 never removes an attempt workspace. SQLite serializes claims; fencing tokens stop

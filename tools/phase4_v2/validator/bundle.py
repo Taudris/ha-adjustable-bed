@@ -1,4 +1,4 @@
-"""Read-only integrity checks for one frozen Phase 4 report directory.
+"""Read-only integrity checks for one frozen APK Protocol Audit report directory.
 
 The validator treats the directory as hostile input. Relative members are opened
 through directory file descriptors with ``O_NOFOLLOW`` and no report-local code

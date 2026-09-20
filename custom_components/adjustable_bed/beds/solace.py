@@ -556,7 +556,7 @@ class SolaceController(BedController):
 
     @property
     def supports_preset_yoga(self) -> bool:
-        # Yoga belongs to a different app whose Phase 4 analysis is pending.
+        # Yoga belongs to a different app whose APK Protocol Audit analysis is pending.
         return False
 
     @property

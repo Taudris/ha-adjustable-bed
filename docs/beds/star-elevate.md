@@ -55,7 +55,7 @@ feedback for this controller.
 
 ## Evidence
 
-The implementation is based on the frozen COMPLETE Phase 4 reports for:
+The implementation is based on the frozen COMPLETE APK Protocol Audit reports for:
 
 - `com.starcode.adjustablem1x12` 1.1.3
 - `com.starcode.abm5_5` 1.2.3

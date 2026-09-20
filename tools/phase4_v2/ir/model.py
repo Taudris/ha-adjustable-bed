@@ -1,4 +1,4 @@
-"""Strict, protocol-neutral core model for the Phase 4 v2 protocol IR."""
+"""Strict, protocol-neutral core model for the APK Protocol Audit v2 protocol IR."""
 
 from __future__ import annotations
 

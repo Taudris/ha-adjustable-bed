@@ -1,4 +1,4 @@
-"""Create a deterministic, read-only inventory of legacy Phase 4 workspaces.
+"""Create a deterministic, read-only inventory of legacy APK Protocol Audit workspaces.
 
 The source tree is never opened for writing. Output is first built in a sibling
 temporary directory, then published into a newly created destination outside
@@ -1387,7 +1387,7 @@ def _human_summary(manifest: dict[str, object]) -> str:
         f"- {status}: {count}" for status, count in sorted(counts["report_statuses"].items())
     )
     active_lines = "\n".join(f"- `{path}`" for path in active) or "- None"
-    return f"""# Phase 4 legacy preservation inventory
+    return f"""# APK Protocol Audit legacy preservation inventory
 
 - Schema: `{manifest["schema"]}`
 - Source: `{manifest["source_root"]}`
