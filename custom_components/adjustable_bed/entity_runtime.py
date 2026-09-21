@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Collection, Coroutine, Mapping
 from datetime import datetime
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from homeassistant.helpers.device_registry import ChildDeviceInfo, DeviceInfo
 
@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
 
     from .coordinator import ChildEntryView
+    from .hold_reconstructor import HoldReconstructor
+    from .hold_roster import ControlRoster
 
 type ControllerCommand = Callable[[BedController], Coroutine[object, object, None]]
 
@@ -52,6 +54,12 @@ class EntityRuntime(Protocol):
 
     @property
     def capability_controller(self) -> BedController | SideBoundController | None: ...
+
+    @property
+    def control_roster(self) -> ControlRoster: ...
+
+    @property
+    def hold_reconstructor(self) -> HoldReconstructor: ...
 
     @property
     def position_data(self) -> dict[str, float]: ...
@@ -140,6 +148,27 @@ class EntityRuntimeView(ABC):
     def _entity_source(self) -> EntityRuntime:
         """Runtime supplying this view's identity and state."""
 
+    def __getattr__(self, name: str) -> Any:
+        """Forward a public member this view does not define to its source.
+
+        The forwarders below name the members whose value or routing differs
+        for a view, and the subclasses name the rest of those. Everything else
+        a bed publishes is the same object for a side as for the bed behind it,
+        and a view that had to name each one breaks that side's entities every
+        time the bed publishes a new member - the control roster and the hold
+        reconstructor being two the entity platforms read.
+
+        Private names are not forwarded: a subclass reads its own state through
+        them before it can answer what its source is.
+
+        Raises:
+            AttributeError: Thrown for a private name, and by the source for a
+                public one it does not carry either.
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._entity_source, name)
+
     @property
     def entry(self) -> ConfigEntry | ChildEntryView:
         return self._entity_source.entry
@@ -181,6 +210,14 @@ class EntityRuntimeView(ABC):
     @property
     def capability_controller(self) -> BedController | SideBoundController | None:
         return self._entity_source.capability_controller
+
+    @property
+    def control_roster(self) -> ControlRoster:
+        return self._entity_source.control_roster
+
+    @property
+    def hold_reconstructor(self) -> HoldReconstructor:
+        return self._entity_source.hold_reconstructor
 
     @property
     def position_data(self) -> dict[str, float]:

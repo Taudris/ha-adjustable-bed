@@ -254,7 +254,9 @@ async def test_timed_move_uses_fixed_app_cadence_despite_user_pulse_setting(
     await hass.async_block_till_done()
     coordinator = hass.data[DOMAIN][entry.entry_id]
     coordinator._motor_pulse_delay_ms = 500
-    _, count, delay, _ = await _timed_move_plan(coordinator, coordinator, [], "back", "up", 1000)
+    plan = await _timed_move_plan(coordinator, coordinator, [], "back", "up", 1000)
+    assert plan is not None
+    _, count, delay, _ = plan
     assert (count, delay) == (9, 100)
 
 

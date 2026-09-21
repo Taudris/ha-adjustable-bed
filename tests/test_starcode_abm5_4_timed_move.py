@@ -57,9 +57,9 @@ async def test_actual_public_plan_and_scheduler_override_keep_native_duration_bo
     ctrl = co.controller
     assert isinstance(ctrl, StarcodeAbm5_4Controller)
     try:
-        action, count, cadence, resource = await _timed_move_plan(
-            co, co, [], "back", "up", duration
-        )
+        plan = await _timed_move_plan(co, co, [], "back", "up", duration)
+        assert plan is not None
+        action, count, cadence, resource = plan
         assert (count, cadence) == ((duration + 99) // 100, 100)
         # Execute the real registered motor handler under the real scheduler's
         # override. The 60-second boundary validates without waiting a minute.

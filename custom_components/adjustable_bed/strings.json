@@ -5849,6 +5849,28 @@
           "name": "Action"
         }
       }
+    },
+    "send_intents": {
+      "name": "Send Intents",
+      "description": "Send a client's complete set of active hold intents to a bed that supports them.",
+      "fields": {
+        "device_id": {
+          "name": "Device",
+          "description": "The adjustable bed device."
+        },
+        "sender_id": {
+          "name": "Sender ID",
+          "description": "Identifies the client sending the set."
+        },
+        "seq": {
+          "name": "Sequence Number",
+          "description": "Increases with every message from this sender; an older message is discarded whole."
+        },
+        "samples": {
+          "name": "Samples",
+          "description": "The complete active set: one entry per intent, each with an intent ID, a control, an action, and a ttl for a hold."
+        }
+      }
     }
   },
   "exceptions": {
@@ -5932,6 +5954,24 @@
     },
     "preset_duration_not_supported": {
       "message": "Device \"{device_name}\" does not accept a hold duration for preset recall. Leave the duration unset."
+    },
+    "hold_not_supported": {
+      "message": "Device \"{device_name}\" does not support hold intents."
+    },
+    "hold_control_unknown": {
+      "message": "Device \"{device_name}\" declares no control \"{control}\"."
+    },
+    "hold_action_unsupported": {
+      "message": "Control \"{control}\" on device \"{device_name}\" does not support the \"{action}\" action."
+    },
+    "hold_operation_control_sampled": {
+      "message": "Control \"{control}\" on device \"{device_name}\" is a staged operation and cannot be sent as an intent. Use its button entity instead."
+    },
+    "hold_ttl_mismatch": {
+      "message": "A \"hold\" sample must carry ttl_ms and an \"activate\" sample must not. Check the \"{action}\" sample for control \"{control}\" on device \"{device_name}\"."
+    },
+    "hold_sender_reserved": {
+      "message": "Sender id \"{sender_id}\" is reserved for the integration's own hold submissions. Choose a different sender_id."
     }
   },
   "issues": {
