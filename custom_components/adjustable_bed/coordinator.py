@@ -228,6 +228,13 @@ _INITIAL_POSITION_READ_TOTAL_TIMEOUT = 40.0
 _INITIAL_POSITION_READ_RETRY_DELAY = 3.0
 _INITIAL_POSITION_READ_MAX_ATTEMPTS = 6
 _PASSIVE_POSITION_RECONCILIATION_IDLE_MARGIN = 15.0
+_PAIRING_RELEASE_RESTORE_TIMEOUT = 5.0
+
+
+class PairingOnlyConnectionActiveError(RuntimeError):
+    """Raised when pair takeover would consume a receiver's one-use link."""
+
+
 # Share a connection across rapid taps, then give the physical remote back its link.
 _COMMAND_BURST_GRACE_SECONDS = 1.0
 # One reconnect gives a stale preserved OKIN profile another chance to reveal
@@ -519,6 +526,7 @@ class AdjustableBedCoordinator:
         self._pending_capability_reload = False
         self._capability_reload_scheduled = False
         self._shutting_down = False
+        self._pairing_transfer_active = False
         self._last_bond_verification: dict[str, Any] = {
             "status": "not_attempted",
             "timestamp": None,
@@ -627,6 +635,7 @@ class AdjustableBedCoordinator:
             not self._pending_capability_reload
             or self._capability_reload_scheduled
             or self._shutting_down
+            or self._pairing_transfer_active
         ):
             return
         self._capability_reload_scheduled = True
@@ -659,7 +668,11 @@ class AdjustableBedCoordinator:
 
     async def _async_reload_if_capability_changed(self) -> None:
         """Reload if this disconnected coordinator still owns the loaded entry."""
-        if not self._pending_capability_reload or self._shutting_down:
+        if (
+            not self._pending_capability_reload
+            or self._shutting_down
+            or self._pairing_transfer_active
+        ):
             return
         if self._client is not None and self._client.is_connected:
             return
@@ -679,6 +692,14 @@ class AdjustableBedCoordinator:
         """Wait for this child's command lane and keep it idle."""
         async with self._command_lock:
             yield
+
+    @contextlib.asynccontextmanager
+    async def async_connection_operation_guard(
+        self,
+    ) -> AsyncIterator[Callable[[str], Coroutine[object, object, bool]]]:
+        """Keep the connection lane idle and expose its locked disconnect."""
+        async with self._lock:
+            yield self._async_disconnect_locked
 
     def _capability_reload_blocks_connection(self) -> bool:
         """Return whether a deferred entity reload owns the next disconnected state."""
@@ -1971,6 +1992,11 @@ class AdjustableBedCoordinator:
         return list(self._connection_attempt_details)
 
     @property
+    def connection_attempt_count(self) -> int:
+        """Return the monotonic number of connection attempts."""
+        return self._connection_attempt_count
+
+    @property
     def device_info(self) -> DeviceInfo:
         """Return device info for this bed."""
         return DeviceInfo(
@@ -2445,6 +2471,12 @@ class AdjustableBedCoordinator:
 
     async def _async_connect_locked(self, reset_timer: bool = True) -> bool:
         """Allow automatic auth recovery before asking the user to re-pair."""
+        if self._pairing_transfer_active:
+            _LOGGER.debug(
+                "Skipping connection to %s while ownership transfers to a paired entry",
+                self._address,
+            )
+            return False
         try:
             return await self._async_connect_attempts_locked(reset_timer)
         finally:
@@ -2708,6 +2740,7 @@ class AdjustableBedCoordinator:
 
                 def _get_fresh_device_for_connection(
                     selected_source: str | None = target_source,
+                    current_attempt: dict[str, Any] = attempt_details,
                 ) -> BLEDevice:
                     """Return a fresh BLEDevice from the current scanner data."""
                     discovered = get_discovered_service_info(
@@ -2719,6 +2752,8 @@ class AdjustableBedCoordinator:
                             continue
                         svc_source = getattr(svc_info, "source", None)
                         if selected_source is None or svc_source == selected_source:
+                            if isinstance(svc_source, str) and svc_source:
+                                current_attempt["actual_source"] = svc_source
                             if svc_info.device.name:
                                 self._record_observed_ble_device_name(svc_info.device.name)
                             _LOGGER.debug(
@@ -2743,6 +2778,14 @@ class AdjustableBedCoordinator:
                     )
                     if fallback is None:
                         raise BleakError(f"Device {self._address} not found")
+                    fallback_details = getattr(fallback, "details", None)
+                    fallback_source = (
+                        fallback_details.get("source")
+                        if isinstance(fallback_details, dict)
+                        else None
+                    )
+                    if isinstance(fallback_source, str) and fallback_source:
+                        current_attempt["actual_source"] = fallback_source
                     if fallback.name:
                         self._record_observed_ble_device_name(fallback.name)
                     if connectable is False:
@@ -3511,8 +3554,8 @@ class AdjustableBedCoordinator:
                 # Detect connection slot exhaustion and exclude the adapter
                 # on subsequent retries so we try an alternative (issue #152).
                 if "connection slot" in err_str and adapter_result is not None:
-                    failed_source = adapter_result.source
-                    if failed_source:
+                    failed_source = attempt_details.get("actual_source") or adapter_result.source
+                    if isinstance(failed_source, str) and failed_source:
                         exhausted_adapters.add(failed_source)
                         _LOGGER.info(
                             "Adapter %s out of connection slots for %s, "
@@ -4163,6 +4206,67 @@ class AdjustableBedCoordinator:
         async with self._lock:
             return await self._async_disconnect_locked(reason)
 
+    async def async_release_for_pairing_transfer(self) -> bool:
+        """Release this standalone link for takeover by a paired entry.
+
+        Pairing-window-only receivers must be checked after any command or
+        automatic reconnect already using the connection lane has completed.
+        Holding both lanes through teardown keeps that check atomic.
+        """
+        async with self._command_lock, self._lock:
+            controller = self._controller
+            if (
+                self.is_connected
+                and controller is not None
+                and controller.manual_disconnect_strands_connection
+            ):
+                raise PairingOnlyConnectionActiveError
+            self._pairing_transfer_active = True
+            try:
+                released = await self._async_disconnect_locked("absorbed_by_pair")
+            except asyncio.CancelledError:
+                try:
+                    await self._async_restore_cancelled_pairing_release()
+                finally:
+                    self._pairing_transfer_active = False
+                raise
+            except Exception:
+                self._pairing_transfer_active = False
+                raise
+            if not released:
+                self._pairing_transfer_active = False
+            return released
+
+    async def _async_restore_cancelled_pairing_release(self) -> None:
+        """Restore controller tasks when a bounded pairing release is cancelled."""
+        controller = self._controller
+        if not self.is_connected or controller is None:
+            return
+        try:
+            async with asyncio.timeout(_PAIRING_RELEASE_RESTORE_TIMEOUT):
+                await self.async_start_notify()
+                if hasattr(controller, "send_pin"):
+                    await cast(Any, controller).send_pin()
+                if hasattr(controller, "start_keepalive"):
+                    await cast(Any, controller).start_keepalive()
+                self._reset_disconnect_timer()
+        except TimeoutError:
+            _LOGGER.warning(
+                "Timed out restoring controller tasks for %s after pairing transfer "
+                "cancellation",
+                self._address,
+            )
+        except Exception:
+            _LOGGER.exception(
+                "Could not restore controller tasks for %s after pairing transfer cancellation",
+                self._address,
+            )
+
+    def finish_pairing_transfer(self) -> None:
+        """Allow standalone reconnects after pair setup absorbs or releases us."""
+        self._pairing_transfer_active = False
+        self._schedule_pending_capability_reload()
+
     @contextlib.asynccontextmanager
     async def async_transport_operation(self, operation: str) -> AsyncIterator[None]:
         """Hold the bed out of use for the whole of a transport operation.
@@ -4275,7 +4379,6 @@ class AdjustableBedCoordinator:
             # Track disconnect reason for diagnostics (issue #168)
             self._last_disconnect_reason = reason
             client = self._client
-            disconnect_failed = False
             try:
                 # Stop keep-alive and notifications before disconnecting
                 if self._controller is not None:
@@ -4293,15 +4396,14 @@ class AdjustableBedCoordinator:
                 await client.disconnect()
                 _LOGGER.debug("Successfully disconnected from %s", self._address)
             except BleakError as err:
-                disconnect_failed = True
                 _LOGGER.debug("Error during disconnect from %s: %s", self._address, err)
             finally:
                 self._intentional_disconnect = False
-            # Bleak can raise while the OS link remains active. Keep the live
-            # client/controller instead of reporting a logical disconnect: the
-            # paired sequential guard must know that opening the other side
-            # could create two physical links.
-            if disconnect_failed and client.is_connected:
+            # Bleak can raise or return while the OS link remains active. Keep
+            # the live client/controller instead of reporting a logical
+            # disconnect: the paired sequential guard must know that opening
+            # the other side could create two physical links.
+            if client.is_connected:
                 self._client = client
                 _LOGGER.warning("Disconnect from %s did not release the BLE link", self._address)
                 return False
