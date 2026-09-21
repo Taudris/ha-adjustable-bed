@@ -128,6 +128,17 @@ goto_preset:
               label: Left
             - value: right
               label: Right
+    duration_ms:
+      name: Duration (ms)
+      description: How long to hold the preset key, in milliseconds. Beds that hold a preset key rather than pulsing it use this; every other bed accepts and ignores it. Leave it out for the shortest press the bed registers, which is what a bed in latch mode needs.
+      required: false
+      selector:
+        number:
+          min: 100
+          max: 30000
+          step: 100
+          unit_of_measurement: ms
+          mode: box
 
 save_preset:
   name: Save to Preset
@@ -1102,5 +1113,38 @@ sleep_number_command:
     parameters:
       name: Parameters
       description: Command-specific fields. Unknown fields and unsupported values are rejected. A parameter side cannot override the selected physical side.
+      selector:
+        object:
+
+send_intents:
+  name: Send Intents
+  description: Send a client's complete set of active hold intents to a bed that supports them. Each message replaces the sender's previous set, so a held control is released by sending it with a ttl of 0. Beds that do not declare a hold control reject the call.
+  fields:
+    device_id:
+      name: Device
+      description: The adjustable bed device.
+      required: true
+      selector:
+        device:
+          integration: adjustable_bed
+    sender_id:
+      name: Sender ID
+      description: Identifies the client sending the set. Mint one per client and keep it for that client's lifetime.
+      required: true
+      selector:
+        text:
+    seq:
+      name: Sequence Number
+      description: Increases with every message from this sender. A message at or below the highest sequence number already seen is discarded whole.
+      required: true
+      selector:
+        number:
+          min: 0
+          mode: box
+    samples:
+      name: Samples
+      description: "The complete active set, one entry per intent: `intent_id` (the client's own id for this press), `control` (a control the bed declares, for example `motor-head-up`), `action` (`hold` or `activate`), and `ttl_ms` for a hold. A hold with `ttl_ms` 0 releases it."
+      required: true
+      example: "[{\"intent_id\": \"c0ffee\", \"control\": \"motor-head-up\", \"action\": \"hold\", \"ttl_ms\": 800}]"
       selector:
         object:

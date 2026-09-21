@@ -77,7 +77,11 @@ from custom_components.adjustable_bed.const import (
     MALOUF_LAYOUT_HILO,
     OCTO_VARIANT_STANDARD,
 )
+from custom_components.adjustable_bed.coordinator import AdjustableBedCoordinator
+from custom_components.adjustable_bed.hold_reconstructor import HoldReconstructor
 from custom_components.adjustable_bed.pairing import is_paired
+
+_LOAD_DECLARATIONS = "custom_components.adjustable_bed.coordinator.load_control_declarations"
 
 
 def _configure_linak_advanced(
@@ -2521,3 +2525,75 @@ class TestServices:
 
         controller.move_pillow_up.assert_awaited_once()
         controller.move_pillow_stop.assert_awaited_once()
+
+
+class TestHoldPiecesLifecycle:
+    """The entry's ownership of the roster and the reconstructor."""
+
+    async def test_setup_builds_the_roster_before_the_first_connect(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """roster-build-site: the build is at entry setup, not inside the connect."""
+        order: list[str] = []
+
+        async def _declarations(coordinator):
+            del coordinator
+            order.append("roster")
+            return ()
+
+        original_connect = AdjustableBedCoordinator.async_connect
+
+        async def _connect(self, *args, **kwargs):
+            order.append("connect")
+            return await original_connect(self, *args, **kwargs)
+
+        with (
+            patch(_LOAD_DECLARATIONS, _declarations),
+            patch.object(AdjustableBedCoordinator, "async_connect", _connect),
+        ):
+            await hass.config_entries.async_setup(mock_config_entry.entry_id)
+            await hass.async_block_till_done()
+
+        assert order[:2] == ["roster", "connect"]
+        coordinator = hass.data[DOMAIN][mock_config_entry.entry_id]
+        assert coordinator.control_roster.declares_hold is False
+        assert coordinator.hold_reconstructor.holds_anything is False
+
+    async def test_unload_closes_intake_then_quiesces_before_the_disconnect(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry,
+        mock_coordinator_connected,
+        mock_bleak_client: MagicMock,
+        enable_custom_integrations,
+    ):
+        """The hass.data pop closes intake; the empty set then reaches a live link."""
+        del mock_bleak_client
+        await hass.config_entries.async_setup(mock_config_entry.entry_id)
+        await hass.async_block_till_done()
+        order: list[str] = []
+
+        original_quiesce = HoldReconstructor.quiesce
+        original_disconnect = AdjustableBedCoordinator.async_disconnect
+
+        def _quiesce(self) -> None:
+            order.append("quiesce")
+            original_quiesce(self)
+
+        async def _disconnect(self, *args, **kwargs) -> None:
+            order.append("disconnect")
+            await original_disconnect(self, *args, **kwargs)
+
+        with (
+            patch.object(HoldReconstructor, "quiesce", _quiesce),
+            patch.object(AdjustableBedCoordinator, "async_disconnect", _disconnect),
+        ):
+            await hass.config_entries.async_unload(mock_config_entry.entry_id)
+            await hass.async_block_till_done()
+
+        assert order[:2] == ["quiesce", "disconnect"]
+        assert mock_config_entry.entry_id not in hass.data[DOMAIN]

@@ -50,6 +50,7 @@ from custom_components.adjustable_bed.controller_factory import (
     _create_from_registry,
     create_controller,
 )
+from custom_components.adjustable_bed.hold_capability import HoldCapable
 
 SHARED_CAPABILITY_FLAGS: tuple[str, ...] = (
     "supports_memory_presets",
@@ -274,6 +275,18 @@ def test_base_declares_shared_capability_flags() -> None:
     """Base controller should define all shared capability flags."""
     for flag in SHARED_CAPABILITY_FLAGS:
         assert hasattr(BedController, flag), f"Missing shared capability on base: {flag}"
+
+
+def test_hold_capability_is_declared_by_inheritance_alone() -> None:
+    """A controller is hold-capable only by inheriting HoldCapable.
+
+    The class relationship is the whole declaration, so a controller that does
+    not inherit it is not hold-capable and no capability flag answers the same
+    question a second way.
+    """
+    assert not issubclass(BedController, HoldCapable)
+    assert not isinstance(_ContractController(_FactoryCoordinator()), HoldCapable)
+    assert not any("hold" in flag for flag in SHARED_CAPABILITY_FLAGS)
 
 
 @pytest.mark.parametrize("bed_type", SUPPORTED_BED_TYPES)

@@ -21,7 +21,7 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, CONF_DEVICE_ID
 from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.exceptions import ServiceValidationError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.service import async_get_device_and_config_entry
@@ -48,6 +48,24 @@ from .const import (
     bed_type_has_position_feedback,
     resolve_explicit_bed_type,
 )
+from .coordinator import AdjustableBedCoordinator
+from .hold_capability import HoldCapable
+from .hold_intent import (
+    Activate,
+    Hold,
+    IntentAction,
+    IntentId,
+    IntentSample,
+    IntentSampleSet,
+    SenderId,
+)
+from .hold_reconstructor import SUBMISSION_SENDER
+from .hold_roster import (
+    ActionKind,
+    Control,
+    motor_control_name,
+    preset_control_name,
+)
 from .paired_coordinator import BedChild, PairedBedCoordinator
 from .paired_devices import side_identifier
 from .pairing import is_paired, pair_member_addresses
@@ -68,6 +86,7 @@ PreflightedSides = list[tuple[BedTarget, BedChild]]
 SERVICE_GOTO_PRESET = "goto_preset"
 SERVICE_GENERATE_SUPPORT_BUNDLE = "generate_support_bundle"
 SERVICE_SAVE_PRESET = "save_preset"
+SERVICE_SEND_INTENTS = "send_intents"
 SERVICE_SET_POSITION = "set_position"
 SERVICE_SET_POSITIONS = "set_positions"
 SERVICE_STOP_ALL = "stop_all"
@@ -164,6 +183,15 @@ POSITION_MOTOR_OPTIONS = (
     "back", "legs", "head", "feet", "lumbar",
     "left_back", "right_back", "left_legs", "right_legs",
 )
+
+# send_intents attributes: the sample set, and one sample's fields
+ATTR_SENDER_ID = "sender_id"
+ATTR_SEQ = "seq"
+ATTR_SAMPLES = "samples"
+ATTR_INTENT_ID = "intent_id"
+ATTR_CONTROL = "control"
+ATTR_ACTION = "action"
+ATTR_TTL_MS = "ttl_ms"
 
 TIMED_MOVE_MOTOR_OPTIONS = (
     "tv_lift",
@@ -516,10 +544,177 @@ def _plan_key(target: BedChild) -> int:
     return getattr(target, "operation_identity", id(target))
 
 
+def _resolve_sampled_control(coordinator: AdjustableBedCoordinator, name: str) -> Control:
+    """Return the declared control a sample names.
+
+    Raises:
+        ServiceValidationError: Thrown when the bed declares no such control, or
+            declares it as a staged operation, which reaches the bed only
+            through the command path.
+    """
+    roster = coordinator.control_roster
+    control = roster.find(name)
+    if control is None:
+        raise ServiceValidationError(
+            f"Device '{coordinator.name}' declares no control '{name}'",
+            translation_domain=DOMAIN,
+            translation_key="hold_control_unknown",
+            translation_placeholders={"device_name": coordinator.name, "control": name},
+        )
+    if roster.is_operation(control):
+        raise ServiceValidationError(
+            f"Control '{name}' on device '{coordinator.name}' is a staged operation and "
+            "cannot be sampled",
+            translation_domain=DOMAIN,
+            translation_key="hold_operation_control_sampled",
+            translation_placeholders={"device_name": coordinator.name, "control": name},
+        )
+    return control
+
+
+def _resolve_sampled_action(
+    coordinator: AdjustableBedCoordinator, control: Control, sample: dict[str, Any]
+) -> IntentAction:
+    """Return the action a sample carries.
+
+    Neither action is ever clamped or coerced into the other one.
+
+    Raises:
+        ServiceValidationError: Thrown when the control does not support the
+            action, or when a hold carries no ttl or an activate carries one.
+    """
+    kind = ActionKind(sample[ATTR_ACTION])
+    ttl_ms = sample.get(ATTR_TTL_MS)
+    if not coordinator.control_roster.supports(control, kind):
+        raise ServiceValidationError(
+            f"Control '{control.name}' on device '{coordinator.name}' does not support "
+            f"'{kind.value}'",
+            translation_domain=DOMAIN,
+            translation_key="hold_action_unsupported",
+            translation_placeholders={
+                "device_name": coordinator.name,
+                "control": control.name,
+                "action": kind.value,
+            },
+        )
+    if (kind is ActionKind.HOLD) != (ttl_ms is not None):
+        raise ServiceValidationError(
+            f"A 'hold' sample carries ttl_ms and an 'activate' sample does not; "
+            f"control '{control.name}' on device '{coordinator.name}' carries neither shape",
+            translation_domain=DOMAIN,
+            translation_key="hold_ttl_mismatch",
+            translation_placeholders={
+                "device_name": coordinator.name,
+                "control": control.name,
+                "action": kind.value,
+            },
+        )
+    return Hold(ttl_ms) if ttl_ms is not None else Activate()
+
+
+def _resolve_sample(coordinator: AdjustableBedCoordinator, sample: dict[str, Any]) -> IntentSample:
+    """Return one sample with its control and action resolved against the roster."""
+    control = _resolve_sampled_control(coordinator, sample[ATTR_CONTROL])
+    return IntentSample(
+        intent_id=IntentId(sample[ATTR_INTENT_ID]),
+        control=control,
+        action=_resolve_sampled_action(coordinator, control, sample),
+    )
+
+
+def _intent_bed(target: BedTarget, inferred_side: str | None) -> AdjustableBedCoordinator | None:
+    """Return the one bed device a sample set addresses, or None for no single one.
+
+    A sample set is one bed device's complete active set, and each device keeps
+    its own roster and reconstructor. A paired bed's parent device therefore
+    addresses two of them and resolves to neither; a side's own device resolves
+    to that side.
+    """
+    if isinstance(target, PairedBedCoordinator):
+        child = target.child_for_side(inferred_side) if inferred_side is not None else None
+    else:
+        child = target
+    return child if isinstance(child, AdjustableBedCoordinator) else None
+
+
+async def handle_send_intents(call: ServiceCall) -> None:
+    """Handle send_intents service call."""
+    hass = call.hass
+    device_ids = call.data.get(CONF_DEVICE_ID, [])
+    sender = SenderId(call.data[ATTR_SENDER_ID])
+    seq = call.data[ATTR_SEQ]
+    samples = call.data[ATTR_SAMPLES]
+
+    # Direct submissions are filed under a reserved sender, so a client using
+    # that name would share their seq gate, quiet horizon and intent ids.
+    if sender == SUBMISSION_SENDER:
+        raise ServiceValidationError(
+            f"Sender id '{SUBMISSION_SENDER}' is reserved for this integration's own "
+            "submissions",
+            translation_domain=DOMAIN,
+            translation_key="hold_sender_reserved",
+            translation_placeholders={"sender_id": SUBMISSION_SENDER},
+        )
+
+    for device_id in device_ids:
+        resolved = _resolve_sided_target(hass, device_id)
+        if resolved is None:
+            raise _missing_device_error(device_id)
+        target, inferred_side = resolved
+        coordinator = _intent_bed(target, inferred_side)
+        # The roster answers hold-capability, never a controller instance,
+        # which is absent while the bed sits idle.
+        if coordinator is None or not coordinator.control_roster.declares_hold:
+            raise ServiceValidationError(
+                f"Device '{target.name}' does not support hold intents",
+                translation_domain=DOMAIN,
+                translation_key="hold_not_supported",
+                translation_placeholders={"device_name": target.name},
+            )
+
+        # Every sample resolves before any of them reaches the reconstructor.
+        message = IntentSampleSet(
+            sender=sender,
+            seq=seq,
+            samples=tuple(_resolve_sample(coordinator, sample) for sample in samples),
+        )
+        coordinator.hold_reconstructor.handle_samples(message)
+
+
+async def _submit_hold(
+    coordinator: AdjustableBedCoordinator, control_name: str, ttl_ms: int | None
+) -> None:
+    """Hold one control for ttl_ms and wait for the intent to end.
+
+    A ttl of None asks for the control's press minimum, the shortest press the
+    bed registers, which a latch-mode box latches into a whole travel.
+
+    Raises:
+        HomeAssistantError: Thrown when the bed's roster declares no such
+            control. The handler validated the motor or the slot before this
+            branch, so the caller's input is good and the bed module's
+            declarations disagree with its own controller class.
+    """
+    roster = coordinator.control_roster
+    control = roster.find(control_name)
+    if control is None:
+        raise HomeAssistantError(
+            f"Device '{coordinator.name}' is hold-capable but declares no control "
+            f"'{control_name}'"
+        )
+
+    press_min_ms = roster.declaration(control).press_min_ms
+    outcome = await coordinator.hold_reconstructor.submit(
+        control, press_min_ms if ttl_ms is None else ttl_ms
+    )
+    _LOGGER.debug("Hold intent on %s ended: %s", control_name, outcome)
+
+
 async def handle_goto_preset(call: ServiceCall) -> None:
     """Handle goto_preset service call with sided all-target preflight."""
     hass = call.hass
     preset = call.data[ATTR_PRESET]
+    duration_ms = call.data.get(ATTR_DURATION_MS)
     device_ids = call.data.get(CONF_DEVICE_ID, [])
     explicit_side = call.data.get(ATTR_SIDE)
 
@@ -532,10 +727,15 @@ async def handle_goto_preset(call: ServiceCall) -> None:
     # Phase 1: validate the preset on EVERY targeted side before moving any
     # bed, so a multi-target call never half-executes.
     preflighted: PreflightedSides = []
+    hold_targets: list[AdjustableBedCoordinator] = []
     try:
         for coordinator, side in targets:
             for target in _command_targets(coordinator, side):
                 controller = await _validation_controller(coordinator, target, preflighted)
+                if isinstance(controller, HoldCapable) and isinstance(
+                    target, AdjustableBedCoordinator
+                ):
+                    hold_targets.append(target)
                 if not controller.supports_memory_presets:
                     raise ServiceValidationError(
                         f"Device '{target.name}' does not support memory presets",
@@ -566,6 +766,19 @@ async def handle_goto_preset(call: ServiceCall) -> None:
     # so never reset their idle timer) before propagating.
     try:
         for coordinator, side in targets:
+            side_targets = _command_targets(coordinator, side)
+            side_holds = [
+                target
+                for target in side_targets
+                if isinstance(target, AdjustableBedCoordinator) and target in hold_targets
+            ]
+            if side_holds and len(side_holds) == len(side_targets):
+                # A hold-capable bed recalls the slot as a hold intent, so the
+                # command path stays free for the staged operations. A side the
+                # submission cannot reach keeps the pulse path below.
+                for target in side_holds:
+                    await _submit_hold(target, preset_control_name(preset), duration_ms)
+                continue
             await _execute_sided(
                 coordinator,
                 side,
@@ -1014,8 +1227,12 @@ async def _timed_move_plan(
     motor: str,
     direction: str,
     duration_ms: int,
-) -> tuple[Callable[[BedController], Coroutine[Any, Any, None]], int, int, str]:
-    """Validate one physical side and build its timed command."""
+) -> tuple[Callable[[BedController], Coroutine[Any, Any, None]], int, int, str] | None:
+    """Validate one physical side and build its timed command.
+
+    Returns None for a hold-capable side, whose motion is a hold intent rather
+    than a pulse train; the caller submits it.
+    """
     async with _release_idle_on_validation_failure(coordinator):
         controller = await _validation_controller(parent, coordinator, preflighted)
 
@@ -1039,6 +1256,11 @@ async def _timed_move_plan(
                     "valid_motors": ", ".join(sorted(valid_motors)),
                 },
             )
+
+        if isinstance(controller, HoldCapable) and isinstance(
+            coordinator, AdjustableBedCoordinator
+        ):
+            return None
 
         spec = motor_specs[motor]
 
@@ -1132,7 +1354,7 @@ async def handle_timed_move(call: ServiceCall) -> None:
     preflighted: PreflightedSides = []
     plans: dict[
         int,
-        tuple[Callable[[BedController], Coroutine[Any, Any, None]], int, int, str],
+        tuple[Callable[[BedController], Coroutine[Any, Any, None]], int, int, str] | None,
     ] = {}
     try:
         for coordinator, side in targets:
@@ -1145,7 +1367,14 @@ async def handle_timed_move(call: ServiceCall) -> None:
         raise
 
     async def move(target: BedChild) -> None:
-        command, pulse_count, pulse_delay_ms, resource = plans[_plan_key(target)]
+        plan = plans[_plan_key(target)]
+        if plan is None:
+            # One direct submission, awaited to its end, so the blocking
+            # semantics are the pulse path's.
+            assert isinstance(target, AdjustableBedCoordinator)
+            await _submit_hold(target, motor_control_name(motor, direction), duration_ms)
+            return
+        command, pulse_count, pulse_delay_ms, resource = plan
         await target.async_execute_controller_command(
             command,
             resource=resource,
@@ -1157,8 +1386,9 @@ async def handle_timed_move(call: ServiceCall) -> None:
         for coordinator, side in targets:
             if isinstance(coordinator, PairedBedCoordinator):
                 resources = {
-                    plans[_plan_key(target)][3]
+                    plan[3]
                     for target in _command_targets(coordinator, side)
+                    if (plan := plans[_plan_key(target)]) is not None
                 }
                 await coordinator.async_run_child_operation(
                     "timed move",
@@ -2093,6 +2323,12 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 vol.Required(CONF_DEVICE_ID): cv.ensure_list,
                 vol.Required(ATTR_PRESET): vol.All(vol.Coerce(int), vol.Range(min=1)),
                 **SIDE_FIELD,
+                # timed_move's own bounds, which are also a preset control's ttl
+                # maximum, so the schema and the roster cannot disagree.
+                vol.Optional(ATTR_DURATION_MS): vol.All(
+                    vol.Coerce(int),
+                    vol.Range(min=MIN_TIMED_MOVE_DURATION_MS, max=MAX_TIMED_MOVE_DURATION_MS),
+                ),
             }
         ),
     )
@@ -2438,6 +2674,38 @@ async def async_register_services(hass: HomeAssistant) -> None:
                     vol.Range(min=MIN_CAPTURE_DURATION, max=MAX_CAPTURE_DURATION),
                 ),
                 vol.Optional(ATTR_INCLUDE_LOGS, default=True): cv.boolean,
+            }
+        ),
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SEND_INTENTS,
+        handle_send_intents,
+        schema=vol.Schema(
+            {
+                vol.Required(CONF_DEVICE_ID): cv.ensure_list,
+                vol.Required(ATTR_SENDER_ID): cv.string,
+                vol.Required(ATTR_SEQ): vol.All(vol.Coerce(int), vol.Range(min=0)),
+                # A hold ends with a ttl-0 sample, so no empty set exists.
+                vol.Required(ATTR_SAMPLES): vol.All(
+                    cv.ensure_list,
+                    vol.Length(min=1),
+                    [
+                        vol.Schema(
+                            {
+                                vol.Required(ATTR_INTENT_ID): cv.string,
+                                vol.Required(ATTR_CONTROL): cv.string,
+                                vol.Required(ATTR_ACTION): vol.In(["hold", "activate"]),
+                                # No ceiling here: the control's roster maximum
+                                # clamps the ttl, and a second authority on one
+                                # value is one too many.
+                                vol.Optional(ATTR_TTL_MS): vol.All(
+                                    vol.Coerce(int), vol.Range(min=0)
+                                ),
+                            }
+                        )
+                    ],
+                ),
             }
         ),
     )

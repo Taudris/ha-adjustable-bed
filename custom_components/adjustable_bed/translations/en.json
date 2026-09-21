@@ -2334,6 +2334,10 @@
         "preset": {
           "name": "Preset Number",
           "description": "Memory slot number (1-4)."
+        },
+        "duration_ms": {
+          "name": "Duration (ms)",
+          "description": "How long to hold the preset key, in milliseconds. Beds that hold a preset key rather than pulsing it use this; every other bed accepts and ignores it."
         }
       }
     },
@@ -2657,6 +2661,28 @@
           "description": "Command-specific fields. Unknown fields and values are rejected. Parameter side cannot override the selected physical side."
         }
       }
+    },
+    "send_intents": {
+      "name": "Send Intents",
+      "description": "Send a client's complete set of active hold intents to a bed that supports them.",
+      "fields": {
+        "device_id": {
+          "name": "Device",
+          "description": "The adjustable bed device."
+        },
+        "sender_id": {
+          "name": "Sender ID",
+          "description": "Identifies the client sending the set."
+        },
+        "seq": {
+          "name": "Sequence Number",
+          "description": "Increases with every message from this sender; an older message is discarded whole."
+        },
+        "samples": {
+          "name": "Samples",
+          "description": "The complete active set: one entry per intent, each with an intent ID, a control, an action, and a ttl for a hold."
+        }
+      }
     }
   },
   "exceptions": {
@@ -2713,6 +2739,24 @@
     },
     "bundle_needs_side_for_paired": {
       "message": "{device_name} is a paired bed; pick one side's device to generate a support bundle."
+    },
+    "hold_not_supported": {
+      "message": "Device \"{device_name}\" does not support hold intents."
+    },
+    "hold_control_unknown": {
+      "message": "Device \"{device_name}\" declares no control \"{control}\"."
+    },
+    "hold_action_unsupported": {
+      "message": "Control \"{control}\" on device \"{device_name}\" does not support the \"{action}\" action."
+    },
+    "hold_operation_control_sampled": {
+      "message": "Control \"{control}\" on device \"{device_name}\" is a staged operation and cannot be sent as an intent. Use its button entity instead."
+    },
+    "hold_ttl_mismatch": {
+      "message": "A \"hold\" sample must carry ttl_ms and an \"activate\" sample must not. Check the \"{action}\" sample for control \"{control}\" on device \"{device_name}\"."
+    },
+    "hold_sender_reserved": {
+      "message": "Sender id \"{sender_id}\" is reserved for the integration's own hold submissions. Choose a different sender_id."
     }
   },
   "issues": {

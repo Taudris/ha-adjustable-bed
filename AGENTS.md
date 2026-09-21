@@ -78,6 +78,10 @@ custom_components/adjustable_bed/
 │   └── ...               # See the README "Supported Beds" table and docs/beds/
 ├── cover.py / button.py / sensor.py / switch.py / light.py / climate.py /
 │       select.py / number.py / binary_sensor.py   # HA entity platforms
+├── hold_roster.py        # Per-bed control declarations: actions, ttl max, marks
+├── hold_intent.py        # The values a hold intent travels as
+├── hold_capability.py    # HoldCapable — the contract a controller opts into
+├── hold_reconstructor.py # Held set from samples and direct submissions
 ├── diagnostics.py        # HA diagnostics download support
 ├── ble_diagnostics.py    # BLE protocol capture for new bed support
 ├── bluetooth_transport.py # Which path (host adapter vs proxy) reaches a bed
@@ -253,6 +257,11 @@ with dedicated RMControl and Sleep Number handlers. Memory actions accept slots
 1–6 subject to controller capabilities. `set_positions` validates all requested
 targets before executing the ordered movement. Control actions support paired
 side routing; support capture requires one physical target.
+
+`send_intents` takes `device_id`, `sender_id`, `seq`, and `samples`, and hands a
+client's complete set of active hold intents to a bed whose roster declares a
+hold control. No bed module declares one yet, so the action refuses every bed and
+stays out of the user-facing index.
 
 ## Critical Implementation Details
 

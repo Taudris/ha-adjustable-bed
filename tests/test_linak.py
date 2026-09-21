@@ -1347,9 +1347,11 @@ async def test_timed_move_waits_for_linak_readiness_before_duration(
             ready = True
 
     with patch.object(controller, "_await_control_ready", side_effect=readiness):
-        movement, _, _, _ = await _timed_move_plan(
+        plan = await _timed_move_plan(
             coordinator, coordinator, [], "back", "up", 20,
         )
+        assert plan is not None
+        movement, _, _, _ = plan
         await movement(controller)
 
     commands = _written_commands(mock_bleak_client)

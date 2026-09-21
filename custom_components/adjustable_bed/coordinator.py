@@ -197,6 +197,9 @@ from .detection import (
     refine_qrrm_protocol_from_device_info,
 )
 from .diagnostic_payloads import new_connection_attempt_details
+from .hold_capability import HoldCapable
+from .hold_reconstructor import HoldReconstructor
+from .hold_roster import ControlRoster, load_control_declarations
 from .pairing import inheritable_child_fields, octo_snapshot_from_descriptor
 from .position_seek import (
     PositionFeedbackError,
@@ -572,6 +575,17 @@ class AdjustableBedCoordinator:
         # same-direction from opposite-direction transitions.
         self._seek_outcomes: dict[str, dict[str, Any]] = {}
         self._last_seek_motion: dict[str, SeekMotion] = {}
+
+        # The intent tier's durable pieces. The roster starts empty and
+        # async_build_hold_pieces replaces it once the bed module has been
+        # imported off the event loop; the reconstructor is built here so that
+        # no entry point - a stop above all - has to ask whether it exists yet.
+        self._control_roster = ControlRoster.empty()
+        self._hold_reconstructor = HoldReconstructor(hass, self._control_roster, self)
+        self._hold_connect_task: asyncio.Task[bool] | None = None
+        self._disconnect_after_hold_release: bool = False
+        self.register_connection_state_callback(self._hold_connection_state_changed)
+        self._hold_reconstructor.async_add_listener(self._held_set_changed)
 
         # Adapter selection details for diagnostics (issue #168)
         self._actual_adapter: str | None = None
@@ -1948,6 +1962,81 @@ class AdjustableBedCoordinator:
         }
 
     @property
+    def control_roster(self) -> ControlRoster:
+        """Return this bed's control declarations."""
+        return self._control_roster
+
+    @property
+    def hold_reconstructor(self) -> HoldReconstructor:
+        """Return the reconstructor holding this bed's intent set."""
+        return self._hold_reconstructor
+
+    @property
+    def hold_diagnostics(self) -> dict[str, Any]:
+        """Return hold-intent state for diagnostics."""
+        return self._hold_reconstructor.diagnostics
+
+    async def async_build_hold_pieces(self) -> None:
+        """Build the control roster and hand it to the reconstructor.
+
+        Asynchronous because resolving a bed module imports it, which runs off
+        the event loop. Entry setup calls this before the first connect, and the
+        connect calls it again when a protocol correction changes the bed type.
+        """
+        self._control_roster = ControlRoster(await load_control_declarations(self))
+        self._hold_reconstructor.use_roster(self._control_roster)
+
+    @callback
+    def connect_on_demand(self) -> None:
+        """Start a connect so a held set has a controller to reach.
+
+        The reconstructor asks for this whenever it pushes a non-empty set with
+        no controller attached, which is what keeps the first press after an
+        idle disconnect working.
+        """
+        if self._hold_connect_task is not None and not self._hold_connect_task.done():
+            return
+        self._hold_connect_task = self.entry.async_create_background_task(
+            self.hass,
+            self.async_ensure_connected(),
+            name=f"adjustable_bed_hold_connect_{self._address}",
+        )
+
+    def _hold_connection_state_changed(self, connected: bool) -> None:
+        """Attach the reconstructor to a hold-capable link, or detach at its end."""
+        controller = self._controller
+        if connected and isinstance(controller, HoldCapable):
+            self._hold_reconstructor.attach(controller)
+            return
+        self._hold_reconstructor.detach()
+
+    def _held_set_changed(self) -> None:
+        """Resume the link lifecycle a held set was holding open.
+
+        A non-empty held set counts as an in-flight command, so the idle timer
+        re-arms and any deferred post-command disconnect runs once the set
+        empties rather than while the bed is still moving.
+        """
+        link_idle = (
+            not self._hold_reconstructor.holds_anything
+            and self._client is not None
+            and self._client.is_connected
+        )
+        if not link_idle:
+            return
+
+        if self._disconnect_after_hold_release:
+            self._disconnect_after_hold_release = False
+            self.entry.async_create_background_task(
+                self.hass,
+                self.async_disconnect(),
+                name=f"adjustable_bed_hold_release_disconnect_{self._address}",
+            )
+            return
+
+        self._reset_disconnect_timer()
+
+    @property
     def adapter_details(self) -> dict[str, Any]:
         """Return adapter selection details for diagnostics."""
         return {
@@ -3193,6 +3282,11 @@ class AdjustableBedCoordinator:
                     self._client.services,
                 )
                 bed_type_corrected = self._apply_runtime_bed_type_correction(corrected_bed_type)
+                if self._bed_type != previous_bed_type:
+                    # The declarations are the bed module's, so a corrected bed
+                    # type is a different roster, and the controller built below
+                    # is the first thing that can express against it.
+                    await self.async_build_hold_pieces()
                 if (
                     bed_type_corrected
                     and not bed_requires_pairing
@@ -4161,6 +4255,10 @@ class AdjustableBedCoordinator:
             await self._async_cancel_position_hydration()
         finally:
             self._cancel_passive_position_reconciliation_task()
+            # Ahead of the disconnect, so the empty set reaches the controller
+            # while it still has a link, and a caller awaiting a submission wakes
+            # rather than hanging on teardown.
+            self._hold_reconstructor.quiesce()
             try:
                 await self._command_scheduler.async_shutdown()
             finally:
@@ -4510,6 +4608,14 @@ class AdjustableBedCoordinator:
                     self._address,
                 )
                 return
+            if self._hold_reconstructor.holds_anything:
+                # A held set is an in-flight command; the timer re-arms when it
+                # empties.
+                _LOGGER.debug(
+                    "Skipping idle disconnect for %s: the bed is holding controls",
+                    self._address,
+                )
+                return
             async with self._lock:
                 await self._async_disconnect_locked("idle_timeout")
 
@@ -4658,6 +4764,12 @@ class AdjustableBedCoordinator:
 
     async def async_stop_command(self) -> None:
         """Immediately stop any running command and send stop to bed."""
+        # First, ahead of the cancel counter and the command lock, so no
+        # message queues between ending the intents and the shrunken set
+        # reaching the controller. This runs with the link down too, which is
+        # why it sits ahead of the early return below.
+        self._hold_reconstructor.stop_all()
+
         _LOGGER.info("Stop requested - cancelling current command")
 
         # Invalidate active and queued movement before awaiting the wire lane.
@@ -4772,11 +4884,13 @@ class AdjustableBedCoordinator:
             )
             or (not scheduler_managed and self._cancel_counter > entry_cancel_count)
         )
-        if (
+        disconnect_wanted = (
             self._disconnect_after_operation_enabled()
             and not skip_disconnect
             and not command_preempted
-        ):
+        )
+        holding = self._hold_reconstructor.holds_anything
+        if disconnect_wanted and not holding:
             _LOGGER.debug(
                 "Scheduling disconnect after %s (disconnect_after_command=True) for %s",
                 operation_name,
@@ -4785,7 +4899,16 @@ class AdjustableBedCoordinator:
             await self._async_release_command_connection()
             return
 
-        if command_preempted:
+        if disconnect_wanted:
+            # A held set is an in-flight command, so the disconnect waits for
+            # the release rather than cutting the bed off mid-hold.
+            self._disconnect_after_hold_release = True
+            _LOGGER.debug(
+                "Deferring the disconnect after %s for %s: the bed is holding controls",
+                operation_name,
+                self._address,
+            )
+        elif command_preempted:
             _LOGGER.debug(
                 "Skipping disconnect for %s: newer command is pending",
                 self._address,
@@ -5962,6 +6085,7 @@ class AdjustableBedCoordinator:
                             (context := current_command_context()) is not None
                             and context.defer_disconnect
                         )
+                        and not self._hold_reconstructor.holds_anything
                     ):
                         _LOGGER.debug(
                             "Scheduling disconnect after seek (disconnect_after_command=True) for %s",

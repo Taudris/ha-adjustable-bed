@@ -857,6 +857,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = AdjustableBedCoordinator(hass, entry)
     _async_ensure_device_registry_entry(hass, entry, coordinator)
 
+    # Before the first connect, because the roster is what says whether this
+    # bed takes hold intents at all, and building it imports the bed module.
+    await coordinator.async_build_hold_pieces()
+
     # Connect to the bed with a timeout to avoid blocking startup forever
     _LOGGER.debug("Attempting initial connection to bed (timeout: %.0fs)...", SETUP_TIMEOUT)
     try:
