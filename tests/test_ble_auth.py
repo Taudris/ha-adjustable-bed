@@ -81,7 +81,7 @@ def test_repair_text_does_not_assume_the_bond_lives_on_the_host() -> None:
     from pathlib import Path
 
     strings = json.loads(
-        Path("custom_components/adjustable_bed/strings.json").read_text()
+        Path("custom_components/adjustable_bed/strings.json").read_text(encoding="utf-8")
     )
     flow = strings["issues"]["pairing_required"]["fix_flow"]
     description = flow["step"]["confirm"]["description"]
@@ -108,7 +108,7 @@ def test_shared_repair_text_prescribes_no_bed_specific_reset() -> None:
     from pathlib import Path
 
     strings = json.loads(
-        Path("custom_components/adjustable_bed/strings.json").read_text()
+        Path("custom_components/adjustable_bed/strings.json").read_text(encoding="utf-8")
     )
     flow = strings["issues"]["pairing_required"]["fix_flow"]
     shared = json.dumps(
@@ -137,7 +137,7 @@ def test_repair_text_does_not_assert_an_unproven_cause() -> None:
     from pathlib import Path
 
     strings = json.loads(
-        Path("custom_components/adjustable_bed/strings.json").read_text()
+        Path("custom_components/adjustable_bed/strings.json").read_text(encoding="utf-8")
     )
     flow = strings["issues"]["pairing_required"]["fix_flow"]
     description = flow["step"]["confirm"]["description"]
@@ -175,6 +175,6 @@ def test_translation_strings_contain_no_angle_brackets() -> None:
     assert files, "no translation files found"
 
     for path in files:
-        walk(json.loads(path.read_text()), path.name)
+        walk(json.loads(path.read_text(encoding="utf-8")), path.name)
 
     assert offenders == []

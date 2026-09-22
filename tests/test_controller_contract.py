@@ -333,7 +333,7 @@ def test_registry_and_explicit_branches_are_disjoint() -> None:
     create_controller() consults the registry only after every explicit branch, so
     a duplicate would be silently unreachable rather than an error.
     """
-    factory_source = Path(controller_factory.__file__).read_text()
+    factory_source = Path(controller_factory.__file__).read_text(encoding="utf-8")
     create_fn = next(
         node
         for node in ast.walk(ast.parse(factory_source))

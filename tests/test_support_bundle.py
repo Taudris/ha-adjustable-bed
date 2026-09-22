@@ -2078,7 +2078,7 @@ class TestSupportBundleLogProbeSafety:
         from custom_components.adjustable_bed.support_report import _probe_log_file
 
         path = tmp_path / "home-assistant.log"
-        path.write_text("2026-07-26 00:00:00.000 INFO (MainThread) [x] hi\n")
+        path.write_text("2026-07-26 00:00:00.000 INFO (MainThread) [x] hi\n", encoding="utf-8")
 
         assert _probe_log_file(str(path)) == (True, None, None)
 
@@ -2679,7 +2679,7 @@ class TestSupportBundleLogProbeSafety:
         from custom_components.adjustable_bed.support_report import _probe_log_file
 
         real = tmp_path / "real.log"
-        real.write_text("2026-07-26 00:00:00.000 INFO (MainThread) [x] hi\n")
+        real.write_text("2026-07-26 00:00:00.000 INFO (MainThread) [x] hi\n", encoding="utf-8")
         link = tmp_path / "home-assistant.log"
         link.symlink_to(real)
 
