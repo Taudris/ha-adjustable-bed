@@ -311,12 +311,21 @@ under `custom_components/adjustable_bed/frontend/`.
     as an argument, which is what the gate tests hand a fake.
   - `loader.ts` — the bundle entry HA serves. It defines nothing; it awaits the
     gate and only then imports the chunk.
+  - `freshness.ts` — travels in the chunk and evaluates once per document. It
+    asks `adjustable_bed/card_freshness` for the cache key the server serves,
+    when `hass` first reaches a card and on every websocket reconnect after
+    that. It reloads the page when the answer is not the key its own
+    `import.meta.url` carries. On the app page only: the registry it is handed
+    says which root the gate saw, and a Cast receiver, whose `hc-main` won, is
+    skipped because what a reload does to a cast session is unread. Pure: the
+    registry, the connection, and the reload are all handed in, which is what
+    its tests fake.
 - **Build** (requires [bun](https://bun.sh)):
   ```bash
   cd custom_components/adjustable_bed/frontend
   bun install --frozen-lockfile
   bun run check   # tsc (TypeScript 7) typecheck + esbuild bundle
-  bun test        # discovery, paired-state, hold, gate and build-output behavior
+  bun test        # discovery, paired-state, hold, gate, freshness and build-output behavior
   ```
   The build writes two files, `frontend/dist/adjustable-bed-card.js` (the
   loader) and `frontend/dist/adjustable-bed-card-chunk.js` (the card), and both
@@ -328,7 +337,9 @@ under `custom_components/adjustable_bed/frontend/`.
   content-versioned path and a stable, uncached module loader at
   `/adjustable_bed_frontend/adjustable-bed-card.js`. It registers a Lovelace
   resource and an extra frontend module automatically, consolidating old
-  storage-mode resources. `frontend` and `lovelace` are in `after_dependencies`;
+  storage-mode resources. The same run registers the
+  `adjustable_bed/card_freshness` command `freshness.ts` asks, closing over that
+  run's cache key. `frontend` and `lovelace` are in `after_dependencies`;
   registration is best-effort and does not block setup.
 
 ## Development
