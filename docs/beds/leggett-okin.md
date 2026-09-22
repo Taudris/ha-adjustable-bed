@@ -128,9 +128,29 @@ getting the distinction wrong is the main way to break it.
 button is down. On release the app emits **exactly four** keycode-`0` frames and
 then goes silent. The release frame is an ordinary frame carrying zero.
 
+For **Prodigy CE / CU170 only**, the integration sends that zero **once, as a
+Write Request**. A zero frame ends the press on arrival: that is graded
+hardware, from the release bursts in every capture (2026-08). For the light the
+count is measured as well, because a single zero-frame release ended the press
+in 101 of 101 taps at a press-to-release gap of 150 ms or more (the owner's
+2026-09-06 sweep). Motion-key registration latency was never measured, so for
+motion the single frame rests on the arrival fact rather than on a count of its
+own.
+
+The box accepts both ATT write types (hardware), so that one frame can be a
+Write Request, whose completion reports non-delivery, which **Stop all** has to
+do and an unconfirmed write cannot. Confirmation costs a round trip, measured on
+the owner's proxy at p50 128-174 ms and p99 259-412 ms (2026-08), and only the
+release pays it. The write carries a five-second bound, so a request the box
+accepts but never answers cannot hold the command lock for the rest of the
+connection: the worst case on a dead link is a five-second hold. A release the
+box rejects, or one that times out, raises for every command family, where the
+four unconfirmed writes it replaces returned silently. Other app profiles keep
+those four frames.
+
 For **Prodigy CE / CU170 only**, explicit **Stop all** first sends the
-reporter's hardware-tested DUMMY keycode `0x00040000`, then the ordinary release
-burst. This interrupts a latched preset or preset-save sequence, which zero
+reporter's hardware-tested DUMMY keycode `0x00040000`, then the ordinary zero
+release. This interrupts a latched preset or preset-save sequence, which zero
 alone does not stop. It uses the selected R0/R1 framing (`e5fe160004000002` /
 `040200040000`) and ignores the cancelled movement's cancel event. Ordinary
 end-of-hold cleanup still sends only zero; other app profiles retain their
@@ -138,11 +158,12 @@ accepted release behavior. This semantic correction comes from the
 [September hardware report](https://github.com/kristofferR/ha-adjustable-bed/issues/368#issuecomment-5747783066),
 not a newly discovered reachable app command.
 
-CU170 hardware testing measured a 217-218 ms motion watchdog. The integration
-therefore uses unconfirmed writes and measures the 100 ms interval from the
-start of each write. Awaiting a confirmed write and then sleeping 100 ms adds
-the BLE round trip to every gap, which repeatedly crosses the watchdog over a
-WiFi Bluetooth proxy and makes the motor stop and restart.
+CU170 hardware testing measured a 217-218 ms motion watchdog. Streamed frames
+are therefore unconfirmed writes that measure the 100 ms interval from the start
+of each write. Awaiting a confirmed write and then sleeping 100 ms adds the BLE
+round trip to every gap, which repeatedly crosses the watchdog over a WiFi
+Bluetooth proxy and makes the motor stop and restart. Only the final release
+pays for confirmation, where nothing is paced behind it.
 
 **One-shot recalls** (the memory slots) are a burst of **exactly 10 frames at
 ~100 ms**, with **no terminator at all**. The control box drives the move to
@@ -169,11 +190,11 @@ sequence:
 
 1. hold `0x00010000` for approximately 5 seconds
 2. switch directly to the selected slot for approximately 2 seconds
-3. finish with the ordinary four zero frames
+3. finish with the profile's ordinary zero release
 
 The app's reset and slot assignment are consecutive calls in one callback.
 An intermediate zero can occur through scheduling, but the integration does not
-insert a guaranteed four-zero gap between the two stages. U Series has only the
+insert a guaranteed zero gap between the two stages. U Series has only the
 standalone held SET path, available through `leggett_hold_control`.
 
 The shipped user guide corroborates this: "Touch Save… the massage motors will
@@ -216,12 +237,14 @@ While no state has been reported, an on or off action presses the light key
 once and waits the same three seconds for the bed to report the resulting
 state. If the press went the wrong way, one more action corrects it.
 State is not restored from an earlier Home Assistant session and is cleared on
-disconnect. After subscribing, startup sends the app's four idle zero frames
-to request live status without toggling the light. The September hardware
-report confirms that a keycode write refreshes status. If no valid reply arrives,
-state stays unknown. The redundant **Toggle Light** button is removed from the
-entity registry; the `light.toggle` action and the physical remote remain
-available.
+disconnect. After subscribing, startup sends four zero frames to request live
+status without toggling the light. The September hardware report confirms that a
+keycode write refreshes status. One frame would draw one receipt, but the notify
+channel loses 2.5-4.5% of receipts (owner hardware runs, 2026-08) and this query
+runs once per connection, so the other three frames are its retry. If no valid
+reply arrives, state stays unknown. The redundant **Toggle Light** button is
+removed from the entity registry; the `light.toggle` action and the physical
+remote remain available.
 
 An authentication failure during connection clears the cached bond marker and
 allows automatic pairing retries. A successful verified retry suppresses the
