@@ -212,13 +212,16 @@ Prodigy CE exposes an under-bed **light entity** backed by those notifications.
 On/off actions only toggle when the known state differs from the requested
 state, then wait up to three seconds for confirmation. A missing confirmation
 leaves the light unknown and reports an error without retrying the toggle.
+While no state has been reported, an on or off action presses the light key
+once and waits the same three seconds for the bed to report the resulting
+state. If the press went the wrong way, one more action corrects it.
 State is not restored from an earlier Home Assistant session and is cleared on
 disconnect. After subscribing, startup sends the app's four idle zero frames
 to request live status without toggling the light. The September hardware
 report confirms that a keycode write refreshes status. If no valid reply arrives,
 state stays unknown. The redundant **Toggle Light** button is removed from the
-entity registry; `light.toggle` remains available even before the first status
-update, as does the physical remote.
+entity registry; the `light.toggle` action and the physical remote remain
+available.
 
 An authentication failure during connection clears the cached bond marker and
 allows automatic pairing retries. A successful verified retry suppresses the

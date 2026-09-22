@@ -1191,44 +1191,79 @@ class LeggettOkinController(BedController):
         return {"is_on": self._light_is_on}
 
     async def lights_toggle(self) -> None:
-        """Toggle once, confirming the result when the initial state is known."""
-        if self.supports_light_state_feedback and self._light_is_on is not None:
-            await self._set_light_state(not self._light_is_on)
+        """Toggle once, then wait for the bed to report the state it produced."""
+        if self._light_is_on is None:
+            await self._tap_light_and_confirm()
         else:
-            await self._tap_keycode(LeggettOkinCommands.TOGGLE_LIGHTS, "lights_toggle")
+            await self._set_light_state(not self._light_is_on)
 
     async def lights_on(self) -> None:
-        """Turn on using verified state, without blindly inverting the light."""
+        """Turn on the light, or press once when its state is unknown."""
         await self._set_light_state(True)
 
     async def lights_off(self) -> None:
-        """Turn off using verified state, without blindly inverting the light."""
+        """Turn off the light, or press once when its state is unknown."""
         await self._set_light_state(False)
 
+    async def _tap_light(self) -> None:
+        """Press the light key once, whatever the caller knows about the state."""
+        await self._tap_keycode(LeggettOkinCommands.TOGGLE_LIGHTS, "lights_toggle")
+
+    def _forget_light_state(self) -> None:
+        """Drop a state the bed has not confirmed, so nothing reports a guess."""
+        self._light_is_on = None
+        self.forward_controller_state_update("under_bed_lights_on", None)
+
+    async def _wait_for_light_report(self) -> None:
+        """Wait for the frame that reports the state a blind press produced."""
+        try:
+            async with asyncio.timeout(LIGHT_STATE_TIMEOUT_S):
+                while self._light_is_on is None:
+                    self._light_state_changed.clear()
+                    await self._light_state_changed.wait()
+        except TimeoutError as err:
+            self._forget_light_state()
+            raise HomeAssistantError("The bed did not confirm the requested light state") from err
+
+    async def _tap_light_and_confirm(self) -> None:
+        """Press once with no state known, then take the state the bed reports.
+
+        Without feedback the profile never learns a state and always presses
+        once; with feedback and no state yet, one press is the command and the
+        bed reports the result. Every frame the box receives draws a receipt
+        carrying the current state, so the release frame's receipt, or the
+        receipts of the release frames where the profile sends more than one,
+        reports the state the press produced. The pre-press receipt is left as
+        the last word only when the state-change frame and every release receipt
+        are lost, and that residual grows the fewer release frames there are.
+        """
+        try:
+            await self._tap_light()
+            if self.supports_light_state_feedback:
+                await self._wait_for_light_report()
+        except (asyncio.CancelledError, BleakError, ConnectionError):
+            # A press that failed or was cancelled produced nothing to report,
+            # and the receipt it drew carries the state from before it.
+            self._forget_light_state()
+            raise
+
     async def _set_light_state(self, is_on: bool) -> None:
-        if not self.supports_light_state_feedback:
-            await self.lights_toggle()
-            return
         if self._light_is_on is None:
-            raise HomeAssistantError(
-                "Light state is unknown. Use Toggle Light or the physical remote "
-                "to obtain a current status notification."
-            )
+            await self._tap_light_and_confirm()
+            return
         if self._light_is_on == is_on:
             return
         try:
-            await self._tap_keycode(LeggettOkinCommands.TOGGLE_LIGHTS, "lights_toggle")
+            await self._tap_light()
             async with asyncio.timeout(LIGHT_STATE_TIMEOUT_S):
                 while self._light_is_on != is_on:
                     self._light_state_changed.clear()
                     await self._light_state_changed.wait()
         except TimeoutError as err:
-            self._light_is_on = None
-            self.forward_controller_state_update("under_bed_lights_on", None)
+            self._forget_light_state()
             raise HomeAssistantError("The bed did not confirm the requested light state") from err
         except (asyncio.CancelledError, BleakError, ConnectionError):
-            self._light_is_on = None
-            self.forward_controller_state_update("under_bed_lights_on", None)
+            self._forget_light_state()
             raise
 
     # Massage methods
