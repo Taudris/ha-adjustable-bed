@@ -67,7 +67,10 @@ If the problem persists:
 
 1. Open the permanent URL on the **same Home Assistant address** used by the
    failing browser/app. It should return an `import` statement. Open the path in
-   that statement too; it should return JavaScript, not a login page or a 404.
+   that statement too; it should return a short module that imports
+   `./adjustable-bed-card-chunk.js`. Open that chunk as well, at the same path
+   with `adjustable-bed-card.js` replaced by `adjustable-bed-card-chunk.js`. All
+   three should return JavaScript, not a login page or a 404.
 2. Check **Settings → Dashboards → Resources** (enable Advanced mode in your
    profile if needed). There should be one Adjustable Bed resource using the
    permanent URL above, with type **JavaScript module**.

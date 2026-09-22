@@ -305,21 +305,31 @@ under `custom_components/adjustable_bed/frontend/`.
   - `bed-graphic.ts` — theme-aware angle SVG. `localize.ts` + `translations/`
     hold the card's own strings (section headers / editor labels);
     entity names come from HA's localized `friendly_name`.
+  - `gate.ts` — waits for `home-assistant` or `hc-main` (a Cast receiver's
+    root), so every `customElements.define` the chunk makes lands after the
+    frontend replaces the custom element registry. Pure: it takes the registry
+    as an argument, which is what the gate tests hand a fake.
+  - `loader.ts` — the bundle entry HA serves. It defines nothing; it awaits the
+    gate and only then imports the chunk.
 - **Build** (requires [bun](https://bun.sh)):
   ```bash
   cd custom_components/adjustable_bed/frontend
   bun install --frozen-lockfile
   bun run check   # tsc (TypeScript 7) typecheck + esbuild bundle
-  bun test        # discovery, paired-state and hold behavior
+  bun test        # discovery, paired-state, hold, gate and build-output behavior
   ```
-  The bundle is written to `frontend/dist/adjustable-bed-card.js` and is
-  **committed** (it ships with the integration). Rebuild and commit it whenever
-  you change `frontend/src`.
-- **Registration**: `frontend.py` serves the committed bundle and a stable,
-  uncached module loader at `/adjustable_bed_frontend/adjustable-bed-card.js`.
-  It registers a Lovelace resource and an extra frontend module automatically,
-  consolidating old storage-mode resources. `frontend` and `lovelace` are in
-  `after_dependencies`; registration is best-effort and does not block setup.
+  The build writes two files, `frontend/dist/adjustable-bed-card.js` (the
+  loader) and `frontend/dist/adjustable-bed-card-chunk.js` (the card), and both
+  are **committed** (they ship with the integration). `frontend.py` digests both
+  into the versioned path segment it serves them under, so a change to either
+  one moves that path. Rebuild and commit both whenever you change
+  `frontend/src`.
+- **Registration**: `frontend.py` serves both committed files under that
+  content-versioned path and a stable, uncached module loader at
+  `/adjustable_bed_frontend/adjustable-bed-card.js`. It registers a Lovelace
+  resource and an extra frontend module automatically, consolidating old
+  storage-mode resources. `frontend` and `lovelace` are in `after_dependencies`;
+  registration is best-effort and does not block setup.
 
 ## Development
 
