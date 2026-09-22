@@ -29,6 +29,7 @@ import {
   resolvePairedParentId,
 } from "./discovery";
 import { MotorHold } from "./hold";
+import { cardNavigationPath, compactActions, compactStopEntities } from "./compact";
 import { localize } from "./localize";
 import {
   type AdjustableBedCardConfig,
@@ -45,7 +46,6 @@ import "./editor";
 interface PairedPane {
   key: string;
   label: string;
-  icon: string;
   bed: BedEntities;
   graphicTone?: BedGraphicTone;
   synchronizationTarget?: {
@@ -82,6 +82,9 @@ export class AdjustableBedCard extends LitElement {
   @state() private _synchronizationFailed = false;
 
   private _watched: string[] = [];
+  // Retain STOP targets across tab changes, including presets that outlive their
+  // service response. A later Stop must still reach movement this card started.
+  private readonly _compactStopTargets = new Map<string, symbol>();
   // Press-and-hold rules live in MotorHold; this class owns only the event
   // wiring and the service calls it drives.
   private readonly _hold = new MotorHold({
@@ -100,12 +103,13 @@ export class AdjustableBedCard extends LitElement {
           }) as Promise<void> | undefined)
         : undefined;
     },
-    stopCover: (cover) => this._cover(cover, "stop_cover"),
+    stopCover: (cover, stopEntityId) =>
+      this._stopCompactTarget(cover, stopEntityId ?? cover),
     // Which stop applies depends on the bed the held motor belongs to, so it is
     // threaded in from the row that started the hold rather than read from a
     // single bed-wide stop, which a paired render does not have.
     stopBed: (stopEntityId) => {
-      if (stopEntityId) this._press(stopEntityId);
+      if (stopEntityId) this._stopCompactTarget(stopEntityId);
     },
   });
 
@@ -123,11 +127,32 @@ export class AdjustableBedCard extends LitElement {
 
   public setConfig(config: AdjustableBedCardConfig): void {
     if (!config) throw new Error("Invalid configuration");
+    if (this._config) {
+      this._hold.abandon();
+      this._stopCompact();
+    }
+    if (config.device_id !== this._config?.device_id ||
+        config.default_target !== this._config?.default_target) {
+      this._activePairedPane = config.default_target ?? "both";
+    }
     this._config = config;
   }
 
   public getCardSize(): number {
-    return 8;
+    if (this._config?.layout !== "compact") return 8;
+    const c = this._config;
+    return Math.ceil((24 + (c.show_header !== false ? 36 : 0) +
+      (c.show_graphic !== false ? 150 : 0) +
+      (c.compact_labels !== "none" ? 40 : 0) +
+      (c.compact_actions?.length === 0 ? 0 : 110) +
+      (c.show_motors === true ? 180 : 0) +
+      (c.show_lighting === true ? 70 : 0) +
+      (c.show_connection === true ? 50 : 0)) / 50);
+  }
+
+  public getGridOptions() {
+    return { columns: this._config?.layout === "compact" ? 6 : 12,
+      min_columns: 6, rows: "auto" };
   }
 
   public override disconnectedCallback(): void {
@@ -185,6 +210,11 @@ export class AdjustableBedCard extends LitElement {
     this._watched = this._collectWatched(bed);
 
     if (bedIsEmpty(bed)) return this._notice("card.no_entities");
+    if (this._config.layout === "compact") {
+      return this._renderCompact(this._config.device_id, [{
+        key: "both", label: this._title(), bed,
+      }], false);
+    }
 
     return html`
       <ha-card>
@@ -229,7 +259,6 @@ export class AdjustableBedCard extends LitElement {
     const sides = childIds.map((id, index) => ({
       key: id,
       label: this._deviceLabel(id),
-      icon: "mdi:bed-single-outline",
       bed: bedEntitiesForDevice(hass, id),
       graphicTone: index === 0 ? ("left" as const) : ("right" as const),
       // Target the selected child device instead of inferring its backend side
@@ -249,7 +278,6 @@ export class AdjustableBedCard extends LitElement {
       {
         key: "both",
         label: localize(hass, "card.both_sides"),
-        icon: "mdi:link-variant",
         bed: parentBed,
       },
       ...sides,
@@ -273,13 +301,11 @@ export class AdjustableBedCard extends LitElement {
       {
         key: "both",
         label: localize(hass, "card.both_sides"),
-        icon: "mdi:link-variant",
         bed: beds.both,
       },
       {
         key: "left",
         label: localize(hass, "card.left_side"),
-        icon: "mdi:bed-single-outline",
         bed: beds.left,
         graphicTone: "left",
         synchronizationTarget: { deviceId, side: "left" },
@@ -287,7 +313,6 @@ export class AdjustableBedCard extends LitElement {
       {
         key: "right",
         label: localize(hass, "card.right_side"),
-        icon: "mdi:bed-single-outline",
         bed: beds.right,
         graphicTone: "right",
         synchronizationTarget: { deviceId, side: "right" },
@@ -299,6 +324,9 @@ export class AdjustableBedCard extends LitElement {
     titleDeviceId: string,
     allPanes: PairedPane[],
   ): TemplateResult {
+    if (this._config?.layout === "compact") {
+      return this._renderCompact(titleDeviceId, allPanes, true);
+    }
     const panes = allPanes.filter((pane) => !bedIsEmpty(pane.bed));
     const active =
       panes.find((pane) => pane.key === this._activePairedPane) ?? panes[0];
@@ -315,14 +343,13 @@ export class AdjustableBedCard extends LitElement {
           ${panes.map(
             (pane) => html`
               <button
-                class="pane-tab ${pane.key === active.key ? "active" : ""}"
+                class="pane-tab side-${pane.graphicTone ?? "theme"} ${pane.key === active.key ? "active" : ""}"
                 role="tab"
                 aria-selected=${pane.key === active.key ? "true" : "false"}
                 @click=${() => this._selectPairedPane(pane.key)}
               >
-                <ha-icon icon=${pane.icon}></ha-icon>
-                <span>${pane.label}</span>
-                ${this._connectionDot(pane.bed)}
+                ${pane.graphicTone ? html`<span class="dual-swatch" aria-hidden="true"></span>` : nothing}
+                <span>${pane.key === "both" ? localize(this.hass, "card.both") : pane.label}</span>
               </button>
             `,
           )}
@@ -344,8 +371,179 @@ export class AdjustableBedCard extends LitElement {
     `;
   }
 
+  private _renderCompact(
+    titleDeviceId: string,
+    panes: PairedPane[],
+    paired: boolean,
+  ): TemplateResult {
+    const c = this._config!;
+    const active = panes.find((pane) => pane.key === this._activePairedPane);
+    const bed = active?.bed;
+    const actions = bed ? compactActions(this.hass!, bed, c.compact_actions) : [];
+    const motors = c.show_motors === true && bed
+      ? bed.motors.filter((m) => m.cover || m.up || m.down || m.position) : [];
+    const hasControls = actions.length > 0 || motors.length > 0 ||
+      c.show_lighting === true;
+    const wantsControls = c.compact_actions?.length !== 0 ||
+      c.show_motors === true || c.show_lighting === true;
+    const sides = paired ? panes.filter((pane) => pane.key !== "both") : panes;
+    const canStop = !!bed && compactStopEntities(bed).length > 0;
+    const movingControls = actions.length > 0 || motors.length > 0;
+    const nav = cardNavigationPath(c.navigation_path);
+    return html`
+      <ha-card class="compact-card ${!wantsControls ? "compact-glance" : ""} ${c.animate === false ? "no-animation" : ""}">
+        ${c.show_header !== false ? html`
+          <div class="compact-header">
+            <span class="title">${this._title(titleDeviceId)}</span>
+            ${nav ? html`<button class="compact-open" @click=${this._navigate}
+              aria-label=${localize(this.hass, "compact.open")}>
+              <ha-icon icon="mdi:open-in-new"></ha-icon>
+            </button>` : nothing}
+          </div>` : nothing}
+        ${paired && wantsControls ? c.show_side_selector !== false ? html`
+          <div class="pane-tabs compact-tabs" role="group"
+            style=${`--pane-count:${panes.filter((pane) => !bedIsEmpty(pane.bed)).length}`}
+            aria-label=${localize(this.hass, "compact.target")}>
+            ${panes.filter((pane) => !bedIsEmpty(pane.bed)).map((pane) => html`
+              <button class="pane-tab side-${pane.graphicTone ?? "theme"} ${pane.key === active?.key ? "active" : ""}"
+                aria-pressed=${pane.key === active?.key ? "true" : "false"}
+                title=${pane.label}
+                @click=${() => this._selectPairedPane(pane.key)}>
+                ${pane.graphicTone ? html`<span class="dual-swatch" aria-hidden="true"></span>` : nothing}
+                <span class="compact-tab-label">${pane.key === "both" ? localize(this.hass, "card.both") : pane.label}</span>
+              </button>`)}
+          </div>` : html`<div class="compact-target">
+            ${localize(this.hass, "compact.target")}: ${active?.label ?? localize(this.hass, "compact.target_missing")}
+          </div>` : nothing}
+        ${c.show_graphic !== false ? this._compactGraphic(sides) : nothing}
+        ${this._compactReadouts(sides)}
+        ${!active && wantsControls ? html`<div class="hint" role="status">
+          ${localize(this.hass, "compact.target_missing")}</div>` : nothing}
+        ${motors.length ? html`<div class="rows compact-motors">
+          ${motors.map((m) => m.cover || m.up || m.down
+            ? this._motorRow(m, bed?.stop, true)
+            : this._moreInfoRow(m.position!))}
+        </div>` : nothing}
+        ${actions.length || movingControls || this._compactStopTargets.size ? html`
+          <div class="tiles compact-actions">
+            ${actions.map(({ entityId }) => html`<button class="tile"
+              ?disabled=${!canStop || !this._available(entityId)}
+              @click=${() => this._compactRecall(entityId, bed!)}>
+              ${this._icon(entityId)}<span class="tile-label">${this._name(entityId)}</span>
+            </button>`)}
+            <button class="tile compact-stop"
+              ?disabled=${!canStop && this._compactStopTargets.size === 0}
+              @click=${() => this._stopCompact(bed)}>
+              <ha-icon icon="mdi:stop"></ha-icon>
+              <span class="tile-label">${localize(this.hass, "action.stop")}</span>
+            </button>
+          </div>` : nothing}
+        ${c.show_lighting === true && bed ? html`
+          ${this._lighting(bed)}
+          ${paired && active?.key === "both" ? this._combinedLighting(bed, sides) : nothing}
+        ` : nothing}
+        ${c.show_connection === true ? html`<div class="compact-connections">
+          ${sides.map((pane) => {
+            const status = this._connectionStatus(pane.bed);
+            return status ? html`<span>${this._connectionDot(pane.bed)}
+              ${pane.label}: ${localize(this.hass, `status.${status}`)}</span>` : nothing;
+          })}
+        </div>` : nothing}
+        ${!hasControls && c.show_graphic === false && c.compact_labels === "none" &&
+            c.show_header === false && c.show_connection !== true
+          ? html`<div class="hint">${this._title(titleDeviceId)}</div>` : nothing}
+      </ha-card>`;
+  }
+
+  private _compactGraphic(sides: PairedPane[]): TemplateResult {
+    const graphics = sides.map((pane) => this._graphicState(pane.bed));
+    const left = graphics[0];
+    const right = graphics[1];
+    const allKnown = graphics.length > 0 && graphics.every((graphic) => graphic !== undefined);
+    const description = sides.map((pane, i) => `${pane.label}: ${graphics[i]
+      ? this._positionSummary(graphics[i]!) : localize(this.hass, "compact.no_position")}`).join(". ");
+    const content = allKnown && left
+      ? right ? renderDualBedGraphic({ left, right })
+        : renderBedGraphic({ ...left, upper: { angle: left.upper.angle }, lower: { angle: left.lower.angle } })
+      : html`<div class="compact-no-position"><ha-icon icon="mdi:bed-outline"></ha-icon>
+          <span>${localize(this.hass, "compact.no_position")}</span></div>`;
+    return cardNavigationPath(this._config?.navigation_path)
+      ? html`<button class="compact-graphic" @click=${this._navigate}
+          aria-label="${localize(this.hass, "compact.open")}. ${description}">${content}</button>`
+      : html`<div class="compact-graphic" role="img" aria-label=${description}>${content}</div>`;
+  }
+
+  private _compactReadouts(sides: PairedPane[]): TemplateResult | typeof nothing {
+    const mode = this._config?.compact_labels ?? "angles";
+    // The graphic provides its own unknown-feedback fallback even when these
+    // optional text readouts are hidden.
+    if (mode === "none") return nothing;
+    return html`<div class="compact-readouts ${mode === "names" ? "compact-names" : ""}">
+      ${sides.map((pane) => html`<div class="side-${pane.graphicTone ?? "theme"}">
+        <span class="compact-side-name" title=${pane.label}>
+          <span class="dual-swatch" aria-hidden="true"></span>
+          <span aria-label=${pane.label}>${mode === "angles" && sides.length > 1
+            ? [...pane.label][0] : pane.label}</span>
+        </span>
+        ${mode === "angles" ? html`<span class="compact-position"
+          title=${pane.bed.motors.map((m) => `${this._motorName(m)} ${this._readout(m) ?? "?"}`).join(" · ")}
+        >${pane.bed.motors
+          .filter((m) => m.angle || m.position || m.cover)
+          .map((m) => this._readout(m) ?? "?").join(" / ") ||
+          localize(this.hass, "compact.no_position")}</span>` : nothing}
+      </div>`)}
+    </div>`;
+  }
+
+  private _available(entityId: string): boolean {
+    const state = this._state(entityId)?.state;
+    return state !== undefined && state !== "unavailable";
+  }
+
+  private _compactRecall(entityId: string, bed: BedEntities): void {
+    this._hold.abandon();
+    compactStopEntities(bed).forEach((id) => this._compactStopTargets.set(id, Symbol()));
+    this._press(entityId);
+    this.requestUpdate();
+  }
+
+  private _stopCompact(bed?: BedEntities): void {
+    this._hold.abandon();
+    for (const id of bed ? compactStopEntities(bed) : []) {
+      if (!this._compactStopTargets.has(id)) this._compactStopTargets.set(id, Symbol());
+    }
+    for (const id of this._compactStopTargets.keys()) this._stopCompactTarget(id);
+    if (this._compactStopTargets.size) this.requestUpdate();
+  }
+
+  private _stopCompactTarget(id: string, retainedTarget = id): void {
+    const movement = this._compactStopTargets.get(retainedTarget);
+    const cover = id.startsWith("cover.");
+    this.hass?.callService(cover ? "cover" : "button", cover ? "stop_cover" : "press", {
+      entity_id: id,
+    }).then(() => {
+      // A completed STOP must not forget movement started while it was pending.
+      if (movement !== undefined &&
+          this._compactStopTargets.get(retainedTarget) === movement) {
+        this._compactStopTargets.delete(retainedTarget);
+        this.requestUpdate();
+      }
+    }).catch(() => {
+      // Keep failed targets available for another Stop, even after switching sides.
+    });
+  }
+
+  private _navigate = (): void => {
+    const path = cardNavigationPath(this._config?.navigation_path);
+    if (!path) return;
+    this._hold.abandon();
+    history.pushState(null, "", path);
+    window.dispatchEvent(new CustomEvent("location-changed", { detail: { replace: false } }));
+  };
+
   private _selectPairedPane(key: string): void {
     if (this._activePairedPane === key) return;
+    this._hold.abandon();
     this._activePairedPane = key;
     // Save mode is intentionally local to the visible side. Leaving a side
     // cancels it so returning later can never expose a stale destructive mode.
@@ -796,14 +994,12 @@ export class AdjustableBedCard extends LitElement {
   // is passed in rather than read from card-wide state, which during a paired
   // render would point at the parent for every side. It also backs the
   // press-and-hold release, so a hold on one side stops that side.
-  private _motorRow(m: MotorEntity, stopId?: string): TemplateResult {
+  private _motorRow(m: MotorEntity, stopId?: string, compact = false): TemplateResult {
     const readout = this._readout(m);
-    const upId = m.cover ?? m.up;
-    const downId = m.cover ?? m.down;
     const canStop = !!m.cover || !!stopId;
     const label = html`
       <span>${this._motorName(m)}</span>
-      ${readout ? html`<span class="readout">${readout}</span>` : nothing}
+      ${readout && !compact ? html`<span class="readout">${readout}</span>` : nothing}
     `;
     return html`
       <div class="row">
@@ -815,45 +1011,37 @@ export class AdjustableBedCard extends LitElement {
             >${label}</button>`
           : html`<div class="row-label">${label}</div>`}
         <div class="control-group">
-          <button
-            class="cg-btn"
-            aria-label=${localize(this.hass, "action.up")}
-            @pointerdown=${(e: PointerEvent) => this._startHold(e, m, "up", stopId)}
-            @pointerup=${(e: PointerEvent) => this._endPointerHold(e, m)}
-            @pointercancel=${(e: PointerEvent) => this._endPointerHold(e, m)}
-            @keydown=${(e: KeyboardEvent) => this._startHold(e, m, "up", stopId)}
-            @keyup=${(e: KeyboardEvent) => this._endKeyHold(e, m)}
-            @blur=${() => this._endHold(m)}
-            @click=${(e: MouseEvent) => this._activateWithoutPointer(e, m, "up")}
-            ?disabled=${!upId}
-          >
-            <ha-icon icon="mdi:chevron-up"></ha-icon>
-          </button>
-          <button
+          ${compact ? this._motorDirection(m, "down", stopId) : nothing}
+          ${this._motorDirection(m, "up", stopId)}
+          ${compact ? nothing : html`<button
             class="cg-btn"
             aria-label=${localize(this.hass, "action.stop")}
             @click=${() => this._motorStop(m, stopId)}
             ?disabled=${!canStop}
           >
             <ha-icon icon="mdi:stop"></ha-icon>
-          </button>
-          <button
-            class="cg-btn"
-            aria-label=${localize(this.hass, "action.down")}
-            @pointerdown=${(e: PointerEvent) => this._startHold(e, m, "down", stopId)}
-            @pointerup=${(e: PointerEvent) => this._endPointerHold(e, m)}
-            @pointercancel=${(e: PointerEvent) => this._endPointerHold(e, m)}
-            @keydown=${(e: KeyboardEvent) => this._startHold(e, m, "down", stopId)}
-            @keyup=${(e: KeyboardEvent) => this._endKeyHold(e, m)}
-            @blur=${() => this._endHold(m)}
-            @click=${(e: MouseEvent) => this._activateWithoutPointer(e, m, "down")}
-            ?disabled=${!downId}
-          >
-            <ha-icon icon="mdi:chevron-down"></ha-icon>
-          </button>
+          </button>`}
+          ${compact ? nothing : this._motorDirection(m, "down", stopId)}
         </div>
       </div>
     `;
+  }
+
+  private _motorDirection(m: MotorEntity, direction: "up" | "down", stopId?: string): TemplateResult {
+    const entityId = m.cover ?? m[direction];
+    const canStop = !!m.cover || !!stopId;
+    return html`
+      <button class="cg-btn"
+        aria-label=${localize(this.hass, `action.${direction}`)}
+        @pointerdown=${(e: PointerEvent) => this._startHold(e, m, direction, stopId)}
+        @pointerup=${(e: PointerEvent) => this._endPointerHold(e, m)}
+        @pointercancel=${(e: PointerEvent) => this._endPointerHold(e, m)}
+        @keydown=${(e: KeyboardEvent) => this._startHold(e, m, direction, stopId)}
+        @keyup=${(e: KeyboardEvent) => this._endKeyHold(e, m)}
+        @blur=${() => this._endHold(m)}
+        @click=${(e: MouseEvent) => this._activateWithoutPointer(e, m, direction, stopId)}
+        ?disabled=${!entityId || (this._config?.layout === "compact" && (!canStop || !this._available(entityId)))}
+      ><ha-icon icon=${`mdi:chevron-${direction}`}></ha-icon></button>`;
   }
 
   private _presets(bed: BedEntities): typeof nothing | TemplateResult {
@@ -1255,6 +1443,11 @@ export class AdjustableBedCard extends LitElement {
       e.preventDefault();
       ownerPointerId = e.pointerId;
     }
+    if (this._config?.layout === "compact") {
+      if (stopId) this._compactStopTargets.set(stopId, Symbol());
+      else if (m.cover) this._compactStopTargets.set(m.cover, Symbol());
+      this.requestUpdate();
+    }
     this._hold.start(m, dir, ownerPointerId, stopId);
   }
 
@@ -1268,8 +1461,14 @@ export class AdjustableBedCard extends LitElement {
     e: MouseEvent,
     m: MotorEntity,
     dir: "up" | "down",
+    stopId?: string,
   ): void {
     if (e.detail !== 0 || this._hold.heldKey !== null) return;
+    if (this._config?.layout === "compact") {
+      if (stopId) this._compactStopTargets.set(stopId, Symbol());
+      else if (m.cover) this._compactStopTargets.set(m.cover, Symbol());
+      this.requestUpdate();
+    }
     if (m.cover) {
       this._cover(m.cover, dir === "up" ? "open_cover" : "close_cover");
       return;
@@ -1366,17 +1565,88 @@ export class AdjustableBedCard extends LitElement {
   }
 
   static override styles = css`
+    .compact-card { padding: 13px; }
+    .compact-header { display: grid; grid-template-columns: minmax(0, 1fr) 24px;
+      align-items: center; gap: 8px; min-height: 22px; padding: 0 2px 9px; }
+    .compact-header .title { font-size: 14px; line-height: 22px; font-weight: 700; }
+    .compact-open { display: grid; place-items: center; padding: 0; border: 0;
+      background: none; color: var(--secondary-text-color); cursor: pointer;
+      width: 24px; height: 22px; }
+    .compact-open ha-icon { --mdc-icon-size: 16px; }
+    .compact-card .compact-tabs { margin: 0; }
+    .compact-tabs .pane-tab {
+      min-height: 38px; height: auto; padding: 4px 5px; gap: 4px;
+      font-size: 11px;
+    }
+    .compact-tabs .dual-swatch, .compact-readouts .dual-swatch { width: 6px; height: 6px; }
+    .compact-tabs .compact-tab-label { min-width: 0; }
+    .compact-target { color: var(--secondary-text-color); font-size: .8rem; padding: 6px 0; }
+    .compact-graphic { display: block; box-sizing: border-box; width: 100%; padding: 0;
+      border: 0; border-radius: 8px; background: none; color: var(--primary-text-color); }
+    button.compact-graphic { cursor: pointer; }
+    .compact-graphic .bed-graphic { display: block; width: 100%; height: 132px; max-width: 300px; margin: auto; }
+    .compact-glance .compact-graphic .bed-graphic { height: 112px; }
+    .compact-no-position { min-height: 90px; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 8px; font-size: .75rem;
+      color: var(--secondary-text-color); }
+    .compact-no-position ha-icon { --mdc-icon-size: 36px; }
+    .compact-readouts { display: flex; justify-content: space-between; gap: 8px;
+      padding: 0 2px 12px; font-size: 11px; line-height: 17px; color: var(--secondary-text-color); }
+    .compact-readouts > div { min-width: 0; display: flex; align-items: center; gap: 5px; }
+    .compact-side-name { display: inline-flex; align-items: center; gap: 5px; }
+    .compact-names { justify-content: center; flex-wrap: wrap; gap: 19px; padding: 4px 0 3px; }
+    .compact-position { font-weight: 500; overflow-wrap: anywhere; }
+    .side-theme .dual-swatch { background: var(--primary-color); }
+    .compact-card .compact-actions { grid-template-columns: repeat(auto-fit, minmax(64px, 1fr)); gap: 7px; }
+    .compact-actions .tile { min-height: 54px; padding: 5px 4px; gap: 2px;
+      justify-content: center; }
+    .compact-actions .tile .icon, .compact-actions .tile ha-icon { --mdc-icon-size: 22px; }
+    .compact-actions .tile-label { font-size: 11px; line-height: 17px;
+      white-space: normal; overflow-wrap: anywhere; }
+    .compact-stop ha-icon { color: var(--error-color); }
+    .compact-actions .tile:disabled { opacity: .45; cursor: default; }
+    .compact-card .compact-motors { gap: 6px; margin: 0 0 10px; }
+    .compact-motors .row { padding: 0; border: 0; border-radius: 0; gap: 6px; }
+    .compact-motors .row-label { font-size: 12px; }
+    .compact-connections { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px;
+      font-size: .72rem; color: var(--secondary-text-color); }
+    .compact-connections > span { display: inline-flex; align-items: center; gap: 5px; }
+    .no-animation .bed-panel, .no-animation .dual-bed-panel { transition: none; }
+    button:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 2px; }
+    @container bed-card (max-width: 258px) {
+      .compact-card { padding: 10px; }
+      .compact-header { min-height: 19px; }
+      .compact-header .title { font-size: 12px; line-height: 19px; }
+      .compact-open { height: 19px; }
+      .compact-graphic .bed-graphic { height: 96px; }
+      .compact-readouts { font-size: 9px; line-height: 14px; gap: 3px; padding-bottom: 10px; }
+      .compact-tabs .pane-tab { min-height: 34px; font-size: 10px; }
+      .compact-actions .tile { min-height: 44px; padding: 2px 3px; }
+      .compact-actions .tile-label { font-size: 10px; line-height: 15px; }
+      .compact-actions .tile .icon, .compact-actions .tile ha-icon { --mdc-icon-size: 20px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      :host .bed-panel, :host .dual-bed-panel { transition: none; }
+    }
+
     :host {
+      display: block;
+      container: bed-card / inline-size;
       --ab-gap: 10px;
-      --ab-side-left-rgb: 75, 0, 255;
-      --ab-side-right-rgb: 234, 65, 65;
+      --ab-control-surface: color-mix(in srgb, var(--card-background-color) 94%, var(--primary-text-color));
+      --ab-control-border: color-mix(in srgb, var(--card-background-color) 85%, var(--primary-text-color));
+      --ab-side-left-rgb: 115, 182, 237;
+      --ab-side-right-rgb: 237, 144, 158;
     }
     ha-card {
       padding: 12px 12px 16px;
       overflow: hidden;
     }
     .header {
-      display: flex;
+      /* Reserve the optional Bluetooth action across paired tab changes. */
+      display: grid;
+      grid-template-columns: 22px minmax(0, 1fr) 32px;
+      min-height: 32px;
       align-items: center;
       gap: 10px;
       padding: 4px 4px 8px;
@@ -1386,8 +1656,8 @@ export class AdjustableBedCard extends LitElement {
       --mdc-icon-size: 22px;
     }
     .title {
-      font-size: 1.1rem;
-      font-weight: 500;
+      font-size: 1rem;
+      font-weight: 700;
       color: var(--primary-text-color);
       flex: 1;
       white-space: nowrap;
@@ -1395,6 +1665,11 @@ export class AdjustableBedCard extends LitElement {
       text-overflow: ellipsis;
     }
     .conn {
+      box-sizing: border-box;
+      width: 32px;
+      height: 32px;
+      align-items: center;
+      justify-content: center;
       border: none;
       background: none;
       cursor: pointer;
@@ -1426,49 +1701,38 @@ export class AdjustableBedCard extends LitElement {
     .pane-tabs {
       display: grid;
       grid-template-columns: repeat(var(--pane-count, 3), minmax(0, 1fr));
-      gap: 4px;
-      padding: 4px;
+      gap: 3px;
+      padding: 3px;
       margin: 0 0 6px;
-      border-radius: 14px;
-      background: var(--secondary-background-color);
+      border-radius: 9px;
+      background: color-mix(in srgb, var(--card-background-color) 45%,
+        var(--primary-background-color, var(--card-background-color)));
     }
     .pane-tab {
       min-width: 0;
-      height: 42px;
-      padding: 0 8px;
+      min-height: 44px;
+      padding: 4px 8px;
       border: 0;
-      border-radius: 11px;
+      border-radius: 6px;
       background: transparent;
-      color: var(--secondary-text-color);
+      color: var(--primary-text-color);
       cursor: pointer;
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 6px;
+      gap: 5px;
       font: inherit;
-      font-size: 0.82rem;
-      font-weight: 500;
-      transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
-      -webkit-user-select: none;
+      font-size: .8rem;
+      font-weight: 400;
+      transition: background .15s ease;
       user-select: none;
       touch-action: manipulation;
     }
-    .pane-tab ha-icon {
-      --mdc-icon-size: 19px;
-      flex: none;
-    }
-    .pane-tab span:not(.connection-dot) {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .pane-tab:hover {
-      color: var(--primary-text-color);
-    }
+    .pane-tab .dual-swatch { width: 6px; height: 6px; }
+    .pane-tab span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pane-tab:hover { background: var(--ab-control-surface); }
     .pane-tab.active {
-      color: var(--primary-text-color);
-      background: var(--card-background-color);
-      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.14);
+      background: color-mix(in srgb, var(--secondary-background-color), var(--primary-color) 12%);
     }
     .connection-dot {
       width: 6px;
@@ -1512,8 +1776,8 @@ export class AdjustableBedCard extends LitElement {
       display: inline-flex;
       align-items: center;
       gap: 5px;
-      border: 1px solid var(--divider-color);
-      background: var(--card-background-color);
+      border: 1px solid var(--ab-control-border);
+      background: var(--ab-control-surface);
       color: var(--primary-color);
       border-radius: 999px;
       padding: 4px 12px 4px 9px;
@@ -1570,7 +1834,7 @@ export class AdjustableBedCard extends LitElement {
       --ab-graphic-rgb: var(--ab-side-right-rgb);
     }
     .bed-graphic.is-moving {
-      animation: ab-pulse 2s ease-in-out infinite;
+      opacity: 0.95;
     }
     .bed-frame-stop {
       stop-color: var(--secondary-text-color);
@@ -1588,11 +1852,9 @@ export class AdjustableBedCard extends LitElement {
     }
     .bed-frame,
     .dual-bed-frame {
-      opacity: 0.78;
-      stroke: var(--primary-text-color);
-      stroke-opacity: 0.14;
-      stroke-width: 1px;
-      vector-effect: non-scaling-stroke;
+      fill: var(--secondary-text-color);
+      opacity: .55;
+      stroke: none;
     }
     .bed-side-layer {
       opacity: 0.86;
@@ -1604,10 +1866,11 @@ export class AdjustableBedCard extends LitElement {
     .bed-surface,
     .dual-bed-surface {
       stroke: var(--primary-text-color);
-      stroke-opacity: 0.1;
-      stroke-width: 1px;
+      stroke-opacity: .65;
+      stroke-width: .7px;
       vector-effect: non-scaling-stroke;
     }
+    .dual-bed-left-stop, .dual-bed-right-stop { stop-opacity: 1; }
     .bed-pillow,
     .dual-bed-pillow {
       opacity: 0.9;
@@ -1633,7 +1896,7 @@ export class AdjustableBedCard extends LitElement {
       transition: transform 0.55s cubic-bezier(0.2, 0.7, 0.2, 1);
     }
     .dual-bed-side.is-moving {
-      animation: ab-side-pulse 1.4s ease-in-out infinite;
+      stroke-width: 1.5;
     }
     .dual-readouts {
       display: grid;
@@ -1649,8 +1912,6 @@ export class AdjustableBedCard extends LitElement {
       align-items: center;
       gap: 3px;
       padding: 8px 10px;
-      border-radius: 10px;
-      background: var(--secondary-background-color);
       text-align: center;
     }
     .dual-side-name {
@@ -1690,9 +1951,9 @@ export class AdjustableBedCard extends LitElement {
       display: flex;
       align-items: center;
       gap: 8px;
-      border: 1px solid var(--divider-color);
+
       border-radius: 11px;
-      background: var(--card-background-color);
+
     }
     .dual-sync-row > ha-icon {
       flex: none;
@@ -1725,9 +1986,9 @@ export class AdjustableBedCard extends LitElement {
       align-items: center;
       justify-content: center;
       gap: 6px;
-      border: 1px solid var(--divider-color);
+      border: 1px solid var(--ab-control-border);
       border-radius: 9px;
-      background: var(--secondary-background-color);
+      background: var(--ab-control-surface);
       color: var(--primary-text-color);
       font: inherit;
       font-size: 0.74rem;
@@ -1755,7 +2016,7 @@ export class AdjustableBedCard extends LitElement {
     }
     .dual-sync-spinner {
       flex: none;
-      animation: ab-spin 0.8s linear infinite;
+      color: var(--primary-color);
       --mdc-icon-size: 15px;
     }
     .dual-sync-error {
@@ -1775,29 +2036,9 @@ export class AdjustableBedCard extends LitElement {
       flex: none;
       --mdc-icon-size: 16px;
     }
-    @keyframes ab-spin {
-      to {
-        transform: rotate(360deg);
-      }
-    }
-    @keyframes ab-pulse {
-      0%,
-      100% {
-        filter: drop-shadow(0 0 3px rgba(var(--ab-graphic-rgb), 0.25));
-      }
-      50% {
-        filter: drop-shadow(0 0 10px rgba(var(--ab-graphic-rgb), 0.55));
-      }
-    }
-    @keyframes ab-side-pulse {
-      0%,
-      100% {
-        opacity: 0.58;
-      }
-      50% {
-        opacity: 0.88;
-      }
-    }
+
+
+
     .rows {
       display: flex;
       flex-direction: column;
@@ -1808,10 +2049,7 @@ export class AdjustableBedCard extends LitElement {
       align-items: center;
       gap: 10px;
       flex-wrap: wrap;
-      background: var(--card-background-color);
-      border: 1px solid var(--divider-color);
-      border-radius: 12px;
-      padding: 8px 12px;
+      padding: 6px 0;
     }
     .row-label {
       display: flex;
@@ -1838,20 +2076,20 @@ export class AdjustableBedCard extends LitElement {
       text-decoration: underline dotted;
       text-underline-offset: 3px;
     }
-    .control-group {
-      display: inline-flex;
-      border-radius: 12px;
-      overflow: hidden;
-      border: 1px solid var(--divider-color);
-    }
+    .control-group { display: inline-flex; gap: 6px; }
     .cg-btn {
-      border: none;
-      background: var(--card-background-color);
+      box-sizing: border-box;
+      width: 44px;
+      height: 44px;
+      border: 1px solid var(--ab-control-border);
+      border-radius: 8px;
+      background: var(--ab-control-surface);
       color: var(--primary-color);
       cursor: pointer;
-      padding: 8px 14px;
+      padding: 0;
       display: inline-flex;
       align-items: center;
+      justify-content: center;
       --mdc-icon-size: 22px;
       transition: background 0.15s ease;
       /* Press-and-hold has to survive a slightly unsteady finger. Pointer
@@ -1859,9 +2097,6 @@ export class AdjustableBedCard extends LitElement {
          gesture arbitration, so without this a small vertical drag starts
          scrolling the page, fires pointercancel and cuts the hold short. */
       touch-action: none;
-    }
-    .cg-btn:not(:last-child) {
-      border-right: 1px solid var(--divider-color);
     }
     .cg-btn:hover {
       background: var(--secondary-background-color);
@@ -1881,10 +2116,10 @@ export class AdjustableBedCard extends LitElement {
       width: 100%;
       margin-top: var(--ab-gap);
       padding: 10px;
-      border-radius: 12px;
+      border-radius: 9px;
       cursor: pointer;
-      background: var(--card-background-color);
-      border: 1px solid var(--divider-color);
+      background: var(--ab-control-surface);
+      border: 1px solid var(--ab-control-border);
       color: var(--error-color);
       font-size: 0.9rem;
       font-weight: 500;
@@ -1906,11 +2141,13 @@ export class AdjustableBedCard extends LitElement {
       display: flex;
       flex-direction: column;
       align-items: center;
-      gap: 6px;
-      padding: 14px 6px 10px;
-      background: var(--card-background-color);
-      border: 1px solid var(--divider-color);
-      border-radius: 12px;
+      gap: 4px;
+      justify-content: center;
+      min-height: 64px;
+      padding: 8px 6px;
+      background: var(--ab-control-surface);
+      border: 1px solid var(--ab-control-border);
+      border-radius: 9px;
       cursor: pointer;
       color: var(--primary-text-color);
       transition: background 0.15s ease, border-color 0.15s ease;
@@ -1926,7 +2163,7 @@ export class AdjustableBedCard extends LitElement {
     }
     .tile .icon {
       color: var(--primary-color);
-      --mdc-icon-size: 24px;
+      --mdc-icon-size: 22px;
     }
     .tile.danger .icon {
       color: var(--error-color);
@@ -1944,9 +2181,9 @@ export class AdjustableBedCard extends LitElement {
       align-items: center;
       gap: 12px;
       padding: 8px 12px;
-      background: var(--card-background-color);
-      border: 1px solid var(--divider-color);
-      border-radius: 12px;
+      background: var(--ab-control-surface);
+      border: 1px solid var(--ab-control-border);
+      border-radius: 9px;
       cursor: pointer;
       margin-bottom: var(--ab-gap);
     }
@@ -2012,9 +2249,9 @@ export class AdjustableBedCard extends LitElement {
       align-items: center;
       gap: 10px;
       padding: 10px 12px;
-      border: 1px solid var(--divider-color);
-      border-radius: 12px;
-      background: var(--card-background-color);
+      border: 1px solid var(--ab-control-border);
+      border-radius: 9px;
+      background: var(--ab-control-surface);
       color: var(--primary-text-color);
       cursor: pointer;
       font: inherit;
