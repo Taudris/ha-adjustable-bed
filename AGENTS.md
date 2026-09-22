@@ -75,9 +75,17 @@ custom_components/adjustable_bed/
 ├── beds/                 # Bed controllers — one module per protocol
 │   ├── base.py           # Abstract base class (BedController)
 │   ├── diagnostic.py     # Debug controller for unsupported beds
+│   ├── leggett_okin_hold.py     # CU170 keycodes, frame encoder, writer, declarations
+│   ├── leggett_okin_evidence.py # CU170 credit gate, deficit guard, cue counter
 │   └── ...               # See the README "Supported Beds" table and docs/beds/
 ├── cover.py / button.py / sensor.py / switch.py / light.py / climate.py /
 │       select.py / number.py / binary_sensor.py   # HA entity platforms
+├── hold_roster.py        # Per-bed control declarations: actions, ttl max, marks
+├── hold_intent.py        # The values a hold intent travels as
+├── hold_capability.py    # HoldCapable — the contract a controller opts into
+├── hold_reconstructor.py # Held set from samples and direct submissions
+├── hold_streamer.py      # Paced frames, press floors, the release, staged operations
+├── hold_operation.py     # The stages a bed-side operation runs through
 ├── diagnostics.py        # HA diagnostics download support
 ├── ble_diagnostics.py    # BLE protocol capture for new bed support
 ├── bluetooth_transport.py # Which path (host adapter vs proxy) reaches a bed
@@ -254,6 +262,11 @@ with dedicated RMControl and Sleep Number handlers. Memory actions accept slots
 targets before executing the ordered movement. Control actions support paired
 side routing; support capture requires one physical target.
 
+`send_intents` takes `device_id`, `sender_id`, `seq`, and `samples`, and hands a
+client's complete set of active hold intents to a bed whose roster declares a
+hold control. No bed module declares one yet, so the action refuses every bed and
+stays out of the user-facing index.
+
 ## Critical Implementation Details
 
 **IMPORTANT: Protocol values are hardware-specific.** Timing values (repeat counts, delays), command bytes, and packet formats vary between bed types. Do NOT copy values from one bed's protocol documentation to another. Each bed type's parameters must come from actual device testing or reverse engineering - never guess or extrapolate from other implementations.
@@ -298,10 +311,27 @@ under `custom_components/adjustable_bed/frontend/`.
     `translation_key` into UI sections. This is what makes the card generic
     across all bed types; **when you add a new entity, give it a stable
     `translation_key`** and, if it belongs in the card, add it to a bucket here.
+    It also reads each entity's published `hold_control*` attributes, which is
+    how the card learns a bed takes hold intents.
   - `adjustable-bed-card.ts` — the card element (renders only sections that have
-    entities; all colour comes from HA theme CSS variables).
+    entities; all colour comes from HA theme CSS variables). It owns the event
+    wiring and routes each gesture to one of the two hold strategies.
+  - `hold.ts` — the pulse strategy: a press-and-hold loop of finite movement
+    commands with side-scoped release and STOP handling, which is what a bed
+    whose controller does not declare `HoldCapable` takes, and that is every
+    bed but the Leggett Okin CU170. It owns the gesture rules both strategies
+    follow: one control held at a time, ownership by key so a re-render cannot
+    orphan a hold, and only the owning pointer's primary release ends one.
+  - `intents.ts` — the sample strategy's wire protocol. `IntentSender` mints the
+    sender and intent ids, holds the active set, and re-sends the complete set
+    under an incrementing seq on its own refresh interval while anything is
+    held. Every sample carries a ttl, so a client that stops refreshing stops
+    the bed. The module's constants carry their derivations; this page states
+    none of them.
+  - `intent-hold.ts` — one gesture on the sample path: the control the finger
+    holds, and the sender handle for it, under the same ownership rules
+    `hold.ts` applies to a pulse.
   - `editor.ts` — visual editor (`ha-form` + device picker + section toggles).
-  - `hold.ts` — movement pulse repetition and side-scoped release/STOP handling.
   - `bed-graphic.ts` — theme-aware angle SVG. `localize.ts` + `translations/`
     hold the card's own strings (section headers / editor labels);
     entity names come from HA's localized `friendly_name`.
@@ -325,7 +355,8 @@ under `custom_components/adjustable_bed/frontend/`.
   cd custom_components/adjustable_bed/frontend
   bun install --frozen-lockfile
   bun run check   # tsc (TypeScript 7) typecheck + esbuild bundle
-  bun test        # discovery, paired-state, hold, gate, freshness and build-output behavior
+  bun test        # discovery, paired-state, hold, intents, intent-hold, gate,
+                  # freshness and build-output behavior
   ```
   The build writes two files, `frontend/dist/adjustable-bed-card.js` (the
   loader) and `frontend/dist/adjustable-bed-card-chunk.js` (the card), and both

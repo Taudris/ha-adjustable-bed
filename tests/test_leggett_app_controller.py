@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -10,6 +11,11 @@ import pytest
 from bleak.exc import BleakError
 
 from custom_components.adjustable_bed.beds.leggett_okin import LeggettOkinController
+from custom_components.adjustable_bed.beds.leggett_okin_hold import (
+    LATCH_MODE_ENABLE,
+    okin_dummy_program,
+    okin_mode_program,
+)
 from custom_components.adjustable_bed.const import (
     LEGGETT_OKIN_CHAR_UUID,
     LEGGETT_OKIN_NOTIFY_CHAR_UUID,
@@ -25,6 +31,9 @@ def make_controller(profile: str = "prodigy4", revision: int = 1) -> LeggettOkin
     coordinator.cancel_command = asyncio.Event()
     coordinator.motor_pulse_count = 3
     coordinator.motor_pulse_delay_ms = 100
+    # A real clock, because a status notification feeds the stream's evidence
+    # and those counters do arithmetic on the time they are given.
+    coordinator.hass.loop.time = time.monotonic
     uuids = [LEGGETT_OKIN_CHAR_UUID, LEGGETT_OKIN_NOTIFY_CHAR_UUID]
     if revision:
         uuids.append(LEGGETT_OKIN_REVISION_SELECTOR_CHAR_UUID)
@@ -135,13 +144,13 @@ async def test_useries_memory_and_store_are_held_not_prodigy_favorite_sequences(
     assert release.kwargs["repeat_count"] == 4
 
 
-async def test_prodigy_snore_has_distinct_recall_and_held_paths():
+async def test_prodigy_snore_has_distinct_intent_and_held_paths():
+    """The entity door submits the slot's control; the bounded service still streams."""
     controller = make_controller()
     await controller.preset_anti_snore()
-    controller.write_command.assert_awaited_once_with(
-        bytes.fromhex("040200004000"), repeat_count=10, repeat_delay_ms=100
-    )
-    controller.write_command.reset_mock()
+    controller.write_command.assert_not_awaited()
+    control, _ = controller._coordinator.hold_reconstructor.submit.call_args.args
+    assert control.name == "preset-3"
     await controller.hold_control("snore", 500)
     press = controller.write_command.await_args
     assert press.args[0] == bytes.fromhex("040200004000")
@@ -150,11 +159,12 @@ async def test_prodigy_snore_has_distinct_recall_and_held_paths():
 
 
 @pytest.mark.parametrize("interruption", ["cancel_event", "task_cancel", "write_failure"])
-async def test_interrupted_recall_releases_with_a_fresh_cancel_event(interruption):
+async def test_interrupted_special_burst_sends_proven_release_with_fresh_event(interruption):
+    """Driven through the sleep cancel, the one unterminated burst an entity still writes."""
     controller = make_controller()
 
     async def interrupt(packet, **kwargs):
-        if packet == bytes.fromhex("040200001000"):
+        if packet == bytes.fromhex("0402ff200000"):
             if interruption == "cancel_event":
                 controller._coordinator.cancel_command.set()
             elif interruption == "task_cancel":
@@ -164,12 +174,12 @@ async def test_interrupted_recall_releases_with_a_fresh_cancel_event(interruptio
 
     controller.write_command = AsyncMock(side_effect=interrupt)
     if interruption == "cancel_event":
-        await controller.preset_memory(1)
+        await controller.cancel_sleep_timer()
     else:
         with pytest.raises(asyncio.CancelledError if interruption == "task_cancel" else BleakError):
-            await controller.preset_memory(1)
-    # A cancelled recall still releases, so the zero frame cannot be riding the
-    # coordinator's cancel event.
+            await controller.cancel_sleep_timer()
+    # An interrupted burst still releases, so the zero frame cannot be riding
+    # the coordinator's cancel event.
     assert_released_once(controller)
 
 
@@ -325,37 +335,23 @@ async def test_initial_light_query_requires_ce_subscription_and_active_startup(r
     controller.write_command.assert_not_awaited()
 
 
-@pytest.mark.parametrize("revision", [0, 1])
-async def test_ce_stop_interrupts_latched_operation_even_after_cancellation(revision):
-    controller = make_controller(revision=revision)
+async def test_ce_stop_interrupts_latched_operation_even_after_cancellation():
+    """The interrupting press rides the streamer, so a cancelled command cannot suppress it."""
+    controller = make_controller()
+    controller._streamer = MagicMock(run_operation=AsyncMock())
     controller._coordinator.cancel_command.set()
     await controller.stop_all()
-    interrupt = controller.write_command.await_args
-    assert interrupt.args == (
-        bytes.fromhex("e5fe160004000002" if revision == 0 else "040200040000"),
-    )
-    assert not interrupt.kwargs["cancel_event"].is_set()
-    assert_released_once(controller, "e5fe160000000006" if revision == 0 else "040200000000")
+    controller._streamer.release_wire.assert_called_once_with()
+    controller._streamer.run_operation.assert_awaited_once_with(okin_dummy_program())
 
 
 @pytest.mark.parametrize("profile", ["prodigy2l", "prodigy2", "useries"])
 async def test_other_profiles_stop_with_release_only(profile):
     controller = make_controller(profile)
+    controller._streamer = MagicMock(run_operation=AsyncMock())
     await controller.stop_all()
-    assert controller.write_command.await_count == 1
-    release = controller.write_command.await_args
-    assert release.args == (bytes.fromhex("040200000000"),)
-    assert release.kwargs["repeat_count"] == 4
-    controller.client.write_gatt_char.assert_not_awaited()
-
-
-async def test_failed_ce_stop_still_releases_and_preserves_interrupt_error():
-    controller = make_controller()
-    controller.write_command.side_effect = BleakError("interrupt failed")
-    controller.client.write_gatt_char.side_effect = BleakError("release failed")
-    with pytest.raises(BleakError, match="interrupt failed"):
-        await controller.stop_all()
-    controller.client.write_gatt_char.assert_awaited_once()
+    controller._streamer.release_wire.assert_called_once_with()
+    controller._streamer.run_operation.assert_not_awaited()
 
 
 @pytest.mark.parametrize("profile", ["prodigy4", "useries"])
@@ -398,20 +394,9 @@ async def test_slow_transport_does_not_extend_held_refresh_past_deadline():
     assert release.kwargs["response"] is True
 
 
-async def test_control_mode_zero_waits_for_the_next_tick_after_55_attempts():
-    controller = make_controller("prodigy2")
-    started = asyncio.get_running_loop().time()
-    await controller.set_control_mode_press_and_hold()
-    deadline = controller._wait_hold_deadline.await_args.args[0]
-    assert 5.49 <= deadline - started <= 5.51
-    mode, release = controller.write_command.await_args_list
-    assert mode.kwargs == {"repeat_count": 55, "repeat_delay_ms": 100}
-    assert release.kwargs["repeat_count"] == 1
-    assert not release.kwargs["cancel_event"].is_set()
-
-
 @pytest.mark.parametrize("error", [BleakError("movement failed"), asyncio.CancelledError()])
 async def test_disconnect_cleanup_preserves_movement_error(error):
+    """Driven through the bounded hold, the one entity path that still writes frames."""
     controller = make_controller()
 
     async def disconnect(*args, **kwargs):
@@ -422,7 +407,7 @@ async def test_disconnect_cleanup_preserves_movement_error(error):
 
     controller.write_command.side_effect = disconnect
     with pytest.raises(type(error)) as raised:
-        await controller.move_head_up()
+        await controller.hold_control("flat", 500)
     assert raised.value is error
 
 
@@ -533,7 +518,7 @@ def test_css_channel_cannot_override_cu170_light_state():
 async def test_light_on_off_waits_for_spontaneous_state_and_is_idempotent():
     controller = make_controller()
     report_cu170(controller, 0)
-    controller._tap_keycode = AsyncMock()
+    controller._submit = MagicMock()
     task = asyncio.create_task(controller.lights_on())
     await asyncio.sleep(0)
     report_cu170(controller, 0)  # Old-state receipt is not confirmation.
@@ -542,13 +527,13 @@ async def test_light_on_off_waits_for_spontaneous_state_and_is_idempotent():
     report_cu170(controller, 0x20000)
     await task
     await controller.lights_on()
-    controller._tap_keycode.assert_awaited_once()
+    controller._submit.assert_called_once()
     task = asyncio.create_task(controller.lights_off())
     await asyncio.sleep(0)
     report_cu170(controller, 0)
     await task
     await controller.lights_off()
-    assert controller._tap_keycode.await_count == 2
+    assert controller._submit.call_count == 2
 
 
 async def test_lights_toggle_inverts_a_known_state_and_presses_blind_when_unknown():
@@ -570,13 +555,13 @@ async def test_an_unconfirmed_light_state_is_invalidated_without_a_retry_toggle(
 
     controller = make_controller()
     report_cu170(controller, 0)
-    controller._tap_keycode = AsyncMock()
+    controller._submit = MagicMock()
     with (
         patch("custom_components.adjustable_bed.beds.leggett_okin.LIGHT_STATE_TIMEOUT_S", 0),
         pytest.raises(HomeAssistantError, match="did not confirm"),
     ):
         await controller.lights_on()
-    controller._tap_keycode.assert_awaited_once()
+    controller._submit.assert_called_once()
     assert controller.get_light_state() == {"is_on": None}
 
 
@@ -678,48 +663,23 @@ async def test_tap_cancelled_while_holding_the_press_still_releases():
     assert_released_once(controller)
 
 
-async def test_light_confirmation_survives_the_receipt_anchored_tap():
-    """A receipt and a state change are distinct frames on the same channel.
-
-    The tap waits for the first; the light logic still has to see the second,
-    and neither wait may consume the other's notification.
-    """
-    controller = make_controller()
-    report_cu170(controller, 0)
-    released = asyncio.Event()
-
-    async def press(packet, **kwargs):
-        report_cu170(controller, 0)  # The receipt carries the pre-toggle state.
-
-    async def release(uuid, packet, **kwargs):
-        released.set()
-
-    controller.write_command.side_effect = press
-    controller.client.write_gatt_char.side_effect = release
-
-    task = asyncio.create_task(controller.lights_on())
-    async with asyncio.timeout(1):
-        await released.wait()
-        assert not task.done()
-        report_cu170(controller, 0x20000)
-        await task
-    assert controller.get_light_state() == {"is_on": True}
-
-
 async def test_cu170_reset_chord_is_not_exposed_and_cannot_be_sent():
     from homeassistant.exceptions import HomeAssistantError
 
     from custom_components.adjustable_bed.button import BUTTON_DESCRIPTIONS, _should_add_button
 
     controller = make_controller()
+    controller._streamer = MagicMock(run_operation=AsyncMock())
     descriptions = {item.key: item for item in BUTTON_DESCRIPTIONS}
     assert not _should_add_button(descriptions["control_mode_press_and_hold"], controller, True)
     assert _should_add_button(descriptions["control_mode_press_and_release"], controller, True)
     with pytest.raises(HomeAssistantError, match="factory-reset"):
         await controller.set_control_mode_press_and_hold()
-    controller.write_command.assert_not_awaited()
+    controller._streamer.run_operation.assert_not_awaited()
     await controller.set_control_mode_press_and_release()
-    assert controller.write_command.await_args_list[0].args[0] == bytes.fromhex("040201800000")
+    controller._streamer.run_operation.assert_awaited_once_with(
+        okin_mode_program(LATCH_MODE_ENABLE)
+    )
 
 
 @pytest.mark.parametrize("error", [None, BleakError("unsubscribe failed"), asyncio.CancelledError()])

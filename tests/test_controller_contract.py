@@ -24,6 +24,7 @@ from custom_components.adjustable_bed.const import (
     BED_TYPE_COOLBASE,
     BED_TYPE_KEESON,
     BED_TYPE_LEGGETT_LP_LEGACY,
+    BED_TYPE_LEGGETT_OKIN,
     BED_TYPE_LEGGETT_PLATT,
     BED_TYPE_OCTO,
     BED_TYPE_RICHMAT,
@@ -50,6 +51,8 @@ from custom_components.adjustable_bed.controller_factory import (
     _create_from_registry,
     create_controller,
 )
+from custom_components.adjustable_bed.hold_capability import HoldCapable
+from custom_components.adjustable_bed.hold_roster import ControlRoster
 
 SHARED_CAPABILITY_FLAGS: tuple[str, ...] = (
     "supports_memory_presets",
@@ -87,6 +90,14 @@ class _RecordingImportExecutor:
         return func(*args)
 
 
+def _connected_client() -> MagicMock:
+    """Return a connected BLE client double with no discovered services."""
+    client = MagicMock()
+    client.is_connected = True
+    client.services = None
+    return client
+
+
 class _FactoryCoordinator(SimpleNamespace):
     """Minimal coordinator stub used for controller factory tests."""
 
@@ -95,8 +106,13 @@ class _FactoryCoordinator(SimpleNamespace):
             hass=SimpleNamespace(
                 async_add_import_executor_job=_RecordingImportExecutor(),
                 async_add_executor_job=_RecordingImportExecutor(),
+                loop=SimpleNamespace(time=lambda: 0.0),
             ),
-            client=None,
+            # A connected client, because that is the only state a controller
+            # is built in: the coordinator creates one after a successful
+            # connect, and a hold-capable controller builds its link-bound
+            # writer at construction.
+            client=_connected_client(),
             entry=SimpleNamespace(
                 data={
                     const.CONF_LOGICDATA_APP_PROFILE: "phone",
@@ -119,6 +135,9 @@ class _FactoryCoordinator(SimpleNamespace):
             disable_angle_sensing=True,
             malouf_layout=MALOUF_LAYOUT_AUTO,
             malouf_memory_slots=MALOUF_MEMORY_SLOTS_AUTO,
+            # A hold-capable controller builds its streamer at construction, so
+            # it reads the roster the coordinator holds by then.
+            control_roster=ControlRoster.empty(),
         )
 
     async def async_execute_controller_command(self, *args: Any, **kwargs: Any) -> None:
@@ -274,6 +293,27 @@ def test_base_declares_shared_capability_flags() -> None:
     """Base controller should define all shared capability flags."""
     for flag in SHARED_CAPABILITY_FLAGS:
         assert hasattr(BedController, flag), f"Missing shared capability on base: {flag}"
+
+
+def test_hold_capability_is_declared_by_inheritance_alone() -> None:
+    """A controller is hold-capable only by inheriting HoldCapable.
+
+    The class relationship is the whole declaration, so a controller that does
+    not inherit it is not hold-capable and no capability flag answers the same
+    question a second way.
+    """
+    assert not issubclass(BedController, HoldCapable)
+    assert not isinstance(_ContractController(_FactoryCoordinator()), HoldCapable)
+    assert not any("hold" in flag for flag in SHARED_CAPABILITY_FLAGS)
+
+
+@pytest.mark.parametrize("bed_type", SUPPORTED_BED_TYPES)
+async def test_only_the_cu170_is_hold_capable(bed_type: str) -> None:
+    """The CU170 is this effort's only adopter; every other bed keeps its pulses."""
+    controller = await _create_controller_for_bed_type(bed_type)
+
+    expected = bed_type in (BED_TYPE_LEGGETT_OKIN, BED_TYPE_LEGGETT_PLATT)
+    assert isinstance(controller, HoldCapable) is expected
 
 
 @pytest.mark.parametrize("bed_type", SUPPORTED_BED_TYPES)

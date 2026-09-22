@@ -11,6 +11,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.adjustable_bed.const import (
     BED_TYPE_KAIDI,
+    BED_TYPE_LEGGETT_OKIN,
     BED_TYPE_LINAK,
     CONF_BED_TYPE,
     CONF_DISABLE_ANGLE_SENSING,
@@ -429,3 +430,80 @@ def test_nested_device_serial_is_redacted():
     assert (
         diagnostics["protocol_diagnostics"]["device_information"]["serial"] == "unique-bed-serial"
     )
+
+
+class TestHoldDiagnostics:
+    """rejection-surfacing: a refused hold surfaces as a counter and nothing else."""
+
+    @staticmethod
+    def _okin_entry(hass: HomeAssistant) -> MockConfigEntry:
+        """Return an added CU170 entry, the effort's one hold-capable bed."""
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            title="Leggett Okin Diagnostics Bed",
+            data={
+                CONF_ADDRESS: "AA:BB:CC:DD:EE:44",
+                CONF_NAME: "Leggett Okin Diagnostics Bed",
+                CONF_BED_TYPE: BED_TYPE_LEGGETT_OKIN,
+                CONF_MOTOR_COUNT: 4,
+                CONF_HAS_MASSAGE: False,
+                CONF_DISABLE_ANGLE_SENSING: True,
+                CONF_PREFERRED_ADAPTER: "auto",
+            },
+            unique_id="AA:BB:CC:DD:EE:44",
+            entry_id="hold_diagnostics_entry",
+        )
+        entry.add_to_hass(hass)
+        return entry
+
+    async def test_the_payload_carries_the_reconstructors_counters(
+        self,
+        hass: HomeAssistant,
+        mock_diagnostics_config_entry,
+        mock_coordinator_connected,  # noqa: ARG002
+        enable_custom_integrations,  # noqa: ARG002
+    ):
+        """rejection-surfacing: the three counters a refused message increments."""
+        from custom_components.adjustable_bed.coordinator import AdjustableBedCoordinator
+
+        coordinator = AdjustableBedCoordinator(hass, mock_diagnostics_config_entry)
+        hass.data.setdefault(DOMAIN, {})
+        hass.data[DOMAIN][mock_diagnostics_config_entry.entry_id] = coordinator
+
+        result = await async_get_config_entry_diagnostics(hass, mock_diagnostics_config_entry)
+
+        hold = result["hold"]
+        assert hold["held"] == []
+        assert hold["attached"] is False
+        assert hold["rejected_messages"] == 0
+        assert hold["dropped_renewals"] == 0
+        assert hold["rejected_submissions"] == 0
+
+    async def test_the_payload_carries_the_streamers_own_counters(
+        self,
+        hass: HomeAssistant,
+        mock_coordinator_connected,  # noqa: ARG002
+        enable_custom_integrations,  # noqa: ARG002
+    ):
+        """receipt-paced-write-commands: the credit, the deficit and the stalls are readable.
+
+        Read at a connect, which expresses nothing of its own: the stream is
+        idle, every counter stands at its start value, and the payload carries
+        all of them.
+        """
+        entry = self._okin_entry(hass)
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        result = await async_get_config_entry_diagnostics(hass, entry)
+
+        stream = result["controller"]["protocol_state"]["hold_stream"]
+        assert stream["expressed"] == []
+        assert stream["staging"] is False
+        assert stream["frames"] == 0
+        assert stream["releases"] == 0
+        assert stream["receipts"] == 0
+        assert stream["credit"] == 4
+        assert stream["deficit"] == 0
+        assert stream["stalls"] == 0
+        assert stream["benchmark"] is None

@@ -25,9 +25,11 @@ async def build_movement(move, stop, *, duration_ms=50):
         "custom_components.adjustable_bed.services._validation_controller",
         new=AsyncMock(return_value=controller),
     ):
-        movement, _, _, _ = await _timed_move_plan(
+        plan = await _timed_move_plan(
             coordinator, coordinator, [], "back", "up", duration_ms,
         )
+        assert plan is not None
+        movement, _, _, _ = plan
     return movement, controller
 
 

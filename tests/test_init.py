@@ -77,6 +77,10 @@ from custom_components.adjustable_bed.const import (
     MALOUF_LAYOUT_HILO,
     OCTO_VARIANT_STANDARD,
 )
+from custom_components.adjustable_bed.coordinator import AdjustableBedCoordinator
+from custom_components.adjustable_bed.hold_intent import Hold, HoldOutcome
+from custom_components.adjustable_bed.hold_reconstructor import HoldReconstructor
+from custom_components.adjustable_bed.hold_roster import Control
 from custom_components.adjustable_bed.pairing import is_paired
 
 
@@ -2475,7 +2479,11 @@ class TestServices:
         mock_coordinator_connected,
         enable_custom_integrations,
     ):
-        """CU170 timed_move should accept its exposed pillow actuator."""
+        """CU170 timed_move accepts its exposed pillow actuator, as a hold intent.
+
+        The bed is hold-capable, so the service submits one direct submission
+        for the requested duration instead of running the baseline pulse path.
+        """
         entry = MockConfigEntry(
             domain=DOMAIN,
             title="Leggett Okin Timed Move Bed",
@@ -2503,9 +2511,16 @@ class TestServices:
         assert len(devices) == 1
         device_id = devices[0].id
 
-        controller = hass.data[DOMAIN][entry.entry_id].controller
-        controller.move_pillow_up = AsyncMock()
-        controller.move_pillow_stop = AsyncMock()
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+        submissions: list[tuple] = []
+
+        def _submit(control, action):
+            submissions.append((control, action))
+            future: asyncio.Future = hass.loop.create_future()
+            future.set_result(HoldOutcome.COMPLETED)
+            return future
+
+        coordinator.hold_reconstructor.submit = _submit
 
         await hass.services.async_call(
             DOMAIN,
@@ -2519,5 +2534,73 @@ class TestServices:
             blocking=True,
         )
 
-        controller.move_pillow_up.assert_awaited_once()
-        controller.move_pillow_stop.assert_awaited_once()
+        assert submissions == [(Control("motor-pillow-up"), Hold(1000))]
+
+
+class TestHoldPiecesLifecycle:
+    """The entry's ownership of the roster and the reconstructor."""
+
+    async def test_setup_takes_the_roster_from_the_controller_it_connects(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry,
+        mock_coordinator_connected,
+        enable_custom_integrations,
+    ):
+        """roster-build-site: only a controller knows which controls its bed has."""
+        order: list[str] = []
+        original_connect = AdjustableBedCoordinator.async_connect
+
+        async def _connect(self, *args, **kwargs):
+            order.append("connect")
+            return await original_connect(self, *args, **kwargs)
+
+        def _adopt(self) -> None:
+            order.append("roster")
+
+        with (
+            patch.object(AdjustableBedCoordinator, "adopt_control_roster", _adopt),
+            patch.object(AdjustableBedCoordinator, "async_connect", _connect),
+        ):
+            await hass.config_entries.async_setup(mock_config_entry.entry_id)
+            await hass.async_block_till_done()
+
+        assert order[:2] == ["connect", "roster"]
+        coordinator = hass.data[DOMAIN][mock_config_entry.entry_id]
+        assert coordinator.control_roster.declares_hold is False
+        assert coordinator.hold_reconstructor.holds_anything is False
+
+    async def test_unload_closes_intake_then_quiesces_before_the_disconnect(
+        self,
+        hass: HomeAssistant,
+        mock_config_entry,
+        mock_coordinator_connected,
+        mock_bleak_client: MagicMock,
+        enable_custom_integrations,
+    ):
+        """The hass.data pop closes intake; the empty set then reaches a live link."""
+        del mock_bleak_client
+        await hass.config_entries.async_setup(mock_config_entry.entry_id)
+        await hass.async_block_till_done()
+        order: list[str] = []
+
+        original_quiesce = HoldReconstructor.quiesce
+        original_disconnect = AdjustableBedCoordinator.async_disconnect
+
+        def _quiesce(self) -> None:
+            order.append("quiesce")
+            original_quiesce(self)
+
+        async def _disconnect(self, *args, **kwargs) -> None:
+            order.append("disconnect")
+            await original_disconnect(self, *args, **kwargs)
+
+        with (
+            patch.object(HoldReconstructor, "quiesce", _quiesce),
+            patch.object(AdjustableBedCoordinator, "async_disconnect", _disconnect),
+        ):
+            await hass.config_entries.async_unload(mock_config_entry.entry_id)
+            await hass.async_block_till_done()
+
+        assert order[:2] == ["quiesce", "disconnect"]
+        assert mock_config_entry.entry_id not in hass.data[DOMAIN]

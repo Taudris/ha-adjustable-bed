@@ -1070,6 +1070,26 @@ class TestSideProxy:
         assert proxy.address == child.address
         assert proxy.name == "Left"
 
+    def test_the_beds_own_members_resolve_through_the_side(self):
+        # A side's entities read the roster and the reconstructor of the bed
+        # behind them, and every other member the bed publishes, without the
+        # view naming each one.
+        _, child, proxy = self._proxy()
+        child.control_roster = object()
+        child.hold_reconstructor = object()
+        child.hold_diagnostics = {"held": ["motor-head-up"]}
+
+        assert proxy.control_roster is child.control_roster
+        assert proxy.hold_reconstructor is child.hold_reconstructor
+        assert proxy.hold_diagnostics == {"held": ["motor-head-up"]}
+
+    def test_a_private_member_the_view_lacks_is_not_forwarded(self):
+        _, child, proxy = self._proxy()
+        child._pair_lock_depth = 3
+
+        with pytest.raises(AttributeError):
+            proxy._pair_lock_depth  # noqa: B018
+
     def test_entity_view_cannot_mutate_child_private_state(self):
         # Pulse overrides belong to scheduler operations, not entity views.
         _, child, proxy = self._proxy()

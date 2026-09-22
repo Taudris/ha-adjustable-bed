@@ -2332,8 +2332,12 @@
       "description": "Move bed to a saved memory position.",
       "fields": {
         "preset": {
-          "name": "Preset Number",
-          "description": "Memory slot number (1-4)."
+          "name": "Preset",
+          "description": "A memory slot number, or the name of a fixed position, such as flat. A bed accepts a name only when it declares that preset; every other bed takes slot numbers."
+        },
+        "duration_ms": {
+          "name": "Duration (ms)",
+          "description": "How long to hold the preset key, in milliseconds. Only beds that hold a preset key rather than pulsing it accept this; every other bed refuses the call."
         }
       }
     },
@@ -2657,6 +2661,28 @@
           "description": "Command-specific fields. Unknown fields and values are rejected. Parameter side cannot override the selected physical side."
         }
       }
+    },
+    "send_intents": {
+      "name": "Send Intents",
+      "description": "Send a client's complete set of active hold intents to one bed that supports them.",
+      "fields": {
+        "device_id": {
+          "name": "Device",
+          "description": "The one adjustable bed device this set of intents is for. A set names a single bed, and it applies whole or not at all."
+        },
+        "sender_id": {
+          "name": "Sender ID",
+          "description": "Identifies the client sending the set."
+        },
+        "seq": {
+          "name": "Sequence Number",
+          "description": "Increases with every message from this sender; an older message is discarded whole."
+        },
+        "samples": {
+          "name": "Samples",
+          "description": "The complete active set: one entry per intent, each with an intent ID, a control, and a tagged action, either a hold carrying its ttl or an activate."
+        }
+      }
     }
   },
   "exceptions": {
@@ -2713,6 +2739,30 @@
     },
     "bundle_needs_side_for_paired": {
       "message": "{device_name} is a paired bed; pick one side's device to generate a support bundle."
+    },
+    "hold_not_supported": {
+      "message": "Device \"{device_name}\" does not support hold intents."
+    },
+    "hold_control_unknown": {
+      "message": "Device \"{device_name}\" declares no control \"{control}\"."
+    },
+    "hold_action_unsupported": {
+      "message": "Control \"{control}\" on device \"{device_name}\" does not support the \"{action}\" action."
+    },
+    "hold_operation_control_sampled": {
+      "message": "Control \"{control}\" on device \"{device_name}\" is a staged operation and cannot be sent as an intent. Use its button entity instead."
+    },
+    "hold_multiple_devices_not_supported": {
+      "message": "A set of intents names one bed, so send_intents takes one device, not {count}. Send one message per bed."
+    },
+    "hold_sender_reserved": {
+      "message": "Sender id \"{sender_id}\" is reserved for the integration's own hold submissions. Choose a different sender_id."
+    },
+    "preset_name_not_supported": {
+      "message": "Device \"{device_name}\" has no \"{preset}\" preset. Use a memory slot number, or a preset name this bed declares."
+    },
+    "preset_duration_not_supported": {
+      "message": "Device \"{device_name}\" recalls a preset as a pulse, so it cannot hold one for a duration. Omit duration_ms."
     }
   },
   "issues": {

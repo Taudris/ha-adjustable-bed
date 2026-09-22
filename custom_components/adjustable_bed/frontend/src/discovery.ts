@@ -6,9 +6,11 @@
 import type {
   BedEntities,
   EntityRegistryDisplayEntry,
+  HoldControl,
   HomeAssistant,
   MemorySlot,
   MotorEntity,
+  PresetEntity,
 } from "./types";
 
 export const PLATFORM = "adjustable_bed";
@@ -68,6 +70,51 @@ export const PRESET_ORDER = [
 
 const domainOf = (entityId: string): string => entityId.split(".", 1)[0];
 
+// An entity on a bed that takes hold intents publishes the roster name of every
+// control it renders, and their ttl cap. The roster is the single author of a
+// control name — a card composing one would be a second — so these are read and
+// never derived from a translation_key. A bed publishing none is a bed whose
+// gestures keep the pulse path.
+const HOLD_CONTROL = "hold_control";
+const HOLD_CONTROL_UP = "hold_control_up";
+const HOLD_CONTROL_DOWN = "hold_control_down";
+const HOLD_TTL_MAX_MS = "hold_ttl_max_ms";
+
+// The state machine is a system boundary: an attribute may be absent, and on a
+// bed that publishes nothing every one of them is.
+function textAttribute(
+  hass: HomeAssistant,
+  entityId: string,
+  name: string,
+): string | undefined {
+  const value = hass.states?.[entityId]?.attributes?.[name];
+  return typeof value === "string" ? value : undefined;
+}
+
+function numberAttribute(
+  hass: HomeAssistant,
+  entityId: string,
+  name: string,
+): number | undefined {
+  const value = hass.states?.[entityId]?.attributes?.[name];
+  return typeof value === "number" ? value : undefined;
+}
+
+// The control an entity published under `nameAttribute`, with its cap. One
+// publisher writes both, so a half-published pair is a bed that published
+// nothing.
+function holdControl(
+  hass: HomeAssistant,
+  entityId: string,
+  nameAttribute: string,
+): HoldControl | undefined {
+  const control = textAttribute(hass, entityId, nameAttribute);
+  const ttlMaxMs = numberAttribute(hass, entityId, HOLD_TTL_MAX_MS);
+  return control === undefined || ttlMaxMs === undefined
+    ? undefined
+    : { control, ttlMaxMs };
+}
+
 // The translation_key the integration assigned, falling back to the registry
 // display name slug only if a key is somehow absent.
 const keyOf = (entry: EntityRegistryDisplayEntry): string =>
@@ -106,7 +153,7 @@ export function bedEntitiesForDevice(
     }
     return m;
   };
-  const presetMap = new Map<string, string>();
+  const presetMap = new Map<string, PresetEntity>();
   const memoryMap = new Map<number, MemorySlot>();
   const memory = (slot: number): MemorySlot => {
     let s = memoryMap.get(slot);
@@ -140,9 +187,13 @@ export function bedEntitiesForDevice(
     let match: RegExpMatchArray | null;
 
     switch (domain) {
-      case "cover":
-        motor(key).cover = id;
+      case "cover": {
+        const m = motor(key);
+        m.cover = id;
+        m.holdUp = holdControl(hass, id, HOLD_CONTROL_UP);
+        m.holdDown = holdControl(hass, id, HOLD_CONTROL_DOWN);
         break;
+      }
 
       case "sensor":
         if (key.endsWith("_angle")) motor(key.slice(0, -6)).angle = id;
@@ -160,10 +211,19 @@ export function bedEntitiesForDevice(
 
       case "button":
         if (PRESET_ORDER.includes(key) || key.startsWith("preset_")) {
-          if ((match = key.match(/^preset_memory_(\d+)$/)))
-            memory(Number(match[1])).goto = id;
-          else presetMap.set(key, id);
+          if ((match = key.match(/^preset_memory_(\d+)$/))) {
+            const s = memory(Number(match[1]));
+            s.goto = id;
+            s.gotoHold = holdControl(hass, id, HOLD_CONTROL);
+          } else {
+            presetMap.set(key, {
+              id,
+              hold: holdControl(hass, id, HOLD_CONTROL),
+            });
+          }
         } else if ((match = key.match(/^program_memory_(\d+)$/))) {
+          // A save button publishes no control: storing is a staged operation
+          // and reaches the bed through the command path alone.
           memory(Number(match[1])).save = id;
         } else if (key === "stop" || key === "stop_both") {
           // stop_both is the paired parent device's combined STOP.
@@ -191,7 +251,8 @@ export function bedEntitiesForDevice(
         } else if (key.startsWith("massage_")) {
           bed.massage.buttons.push(id);
         } else if ((match = key.match(/^(.+)_(up|down)$/))) {
-          motor(match[1])[match[2] as "up" | "down"] = id;
+          const m = motor(match[1]);
+          m[match[2] as "up" | "down"] = id;
         }
         break;
 

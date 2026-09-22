@@ -268,6 +268,10 @@ async def async_get_config_entry_diagnostics(
             "command_timing": coordinator.command_timing,
         },
         "pairing": coordinator.pairing_diagnostics,
+        # What the reconstructor holds, and what it refused. The streamer's own
+        # counters ride the controller's protocol_state instead: they exist only
+        # while a link does.
+        "hold": coordinator.hold_diagnostics,
         "ble": ble_info,
         "gatt_summary": get_gatt_summary(coordinator),
         "advertisement": advertisement_info,

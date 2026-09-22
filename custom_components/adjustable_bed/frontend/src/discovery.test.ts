@@ -8,7 +8,12 @@ import {
   pairedChildDeviceIds,
   resolvePairedParentId,
 } from "./discovery";
-import type { EntityRegistryDisplayEntry, HomeAssistant } from "./types";
+import type {
+  EntityRegistryDisplayEntry,
+  HassEntity,
+  HassEntityAttributes,
+  HomeAssistant,
+} from "./types";
 
 function entry(
   entity_id: string,
@@ -19,13 +24,26 @@ function entry(
   return { entity_id, translation_key, device_id, platform };
 }
 
-function hassWith(entries: EntityRegistryDisplayEntry[]): HomeAssistant {
+function hassWith(
+  entries: EntityRegistryDisplayEntry[],
+  attributes: Record<string, HassEntityAttributes> = {},
+): HomeAssistant {
   const entities: Record<string, EntityRegistryDisplayEntry> = {};
   for (const e of entries) entities[e.entity_id] = e;
+  const states: Record<string, HassEntity> = {};
+  for (const [entity_id, attrs] of Object.entries(attributes)) {
+    states[entity_id] = {
+      entity_id,
+      state: "unknown",
+      attributes: attrs,
+      last_changed: "",
+      last_updated: "",
+    };
+  }
   return {
     connection: { sendMessagePromise: async () => ({}), addEventListener: () => {} },
     entities,
-    states: {},
+    states,
     devices: {},
     locale: { language: "en" },
     language: "en",
@@ -54,7 +72,10 @@ test("2-motor bed with light switch and no massage/climate", () => {
   expect(bed.motors.map((m) => m.key)).toEqual(["back", "legs"]);
   expect(bed.motors[0].cover).toBe("cover.seng_back");
   expect(bed.motors[0].position).toBe("number.seng_back_position");
-  expect(bed.presets).toEqual(["button.seng_flat", "button.seng_zero_g"]);
+  expect(bed.presets.map((p) => p.id)).toEqual([
+    "button.seng_flat",
+    "button.seng_zero_g",
+  ]);
   expect(bed.stop).toBe("button.seng_stop");
   expect(bed.connect).toBe("button.seng_connect");
   expect(bed.disconnect).toBe("button.seng_disconnect");
@@ -127,9 +148,9 @@ test("single-address paired entities split by bed_side on one device", () => {
   expect(bedEntitiesForDevice(hass, "dev1", "right").motors[0].cover).toBe(
     "cover.b_back_right",
   );
-  expect(bedEntitiesForDevice(hass, "dev1", "both").presets).toEqual([
-    "button.b_flat_both",
-  ]);
+  expect(
+    bedEntitiesForDevice(hass, "dev1", "both").presets.map((p) => p.id),
+  ).toEqual(["button.b_flat_both"]);
 });
 
 test("side-suffixed translation keys remain a supported fallback", () => {
@@ -353,6 +374,70 @@ test("presence-only device is treated as empty (no presence section)", () => {
 test("empty for unknown device", () => {
   const hass = hassWith([entry("cover.b_back", "back", "dev1")]);
   expect(bedIsEmpty(bedEntitiesForDevice(hass, "nope"))).toBe(true);
+});
+
+test("a bed publishing hold controls carries them on its covers, presets and memory tiles", () => {
+  const hass = hassWith(
+    [
+      entry("cover.okin_head", "head"),
+      entry("button.okin_flat", "preset_flat"),
+      entry("button.okin_goto3", "preset_memory_3"),
+      entry("button.okin_save3", "program_memory_3"),
+    ],
+    {
+      "cover.okin_head": {
+        hold_control_up: "motor-head-up",
+        hold_control_down: "motor-head-down",
+        hold_ttl_max_ms: 30000,
+      },
+      "button.okin_flat": { hold_control: "preset-flat", hold_ttl_max_ms: 30000 },
+      "button.okin_goto3": { hold_control: "preset-3", hold_ttl_max_ms: 30000 },
+    },
+  );
+  const bed = bedEntitiesForDevice(hass, "dev1");
+
+  expect(bed.motors[0]).toMatchObject({
+    cover: "cover.okin_head",
+    holdUp: { control: "motor-head-up", ttlMaxMs: 30000 },
+    holdDown: { control: "motor-head-down", ttlMaxMs: 30000 },
+  });
+  expect(bed.presets).toEqual([
+    {
+      id: "button.okin_flat",
+      hold: { control: "preset-flat", ttlMaxMs: 30000 },
+    },
+  ]);
+  expect(bed.memory[0]).toMatchObject({
+    slot: 3,
+    goto: "button.okin_goto3",
+    gotoHold: { control: "preset-3", ttlMaxMs: 30000 },
+  });
+});
+
+test("operation-controls-command-path-only: a save-only memory slot carries no control", () => {
+  const hass = hassWith([entry("button.okin_save1", "program_memory_1")], {
+    "button.okin_save1": { hold_control: "store-preset-1" },
+  });
+  const bed = bedEntitiesForDevice(hass, "dev1");
+
+  // Storing is a staged operation and reaches the bed through the command path
+  // alone, so a save button's tile never becomes a hold tile.
+  expect(bed.memory).toEqual([{ slot: 1, save: "button.okin_save1" }]);
+});
+
+test("presets-hold-only: a bed publishing nothing keeps its preset tiles on button.press", () => {
+  const hass = hassWith([
+    entry("cover.seng_back", "back"),
+    entry("button.seng_flat", "preset_flat"),
+    entry("button.seng_goto1", "preset_memory_1"),
+  ]);
+  const bed = bedEntitiesForDevice(hass, "dev1");
+
+  expect(bed.motors[0].holdUp).toBeUndefined();
+  expect(bed.motors[0].holdDown).toBeUndefined();
+  expect(bed.presets[0].hold).toBeUndefined();
+  expect(bed.memory[0].gotoHold).toBeUndefined();
+  expect(bedIsEmpty(bed)).toBe(false);
 });
 
 test("pairedChildDeviceIds returns sided children ordered by name", () => {

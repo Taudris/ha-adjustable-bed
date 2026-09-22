@@ -303,12 +303,12 @@ async def test_cu170_light_uses_live_state_and_removes_redundant_toggle_button(
 
     # A known-state toggle must fail rather than retain stale telemetry.
     with (
-        patch.object(controller, "_tap_keycode", new=AsyncMock()) as toggle,
+        patch.object(controller, "_submit") as toggle,
         patch("custom_components.adjustable_bed.beds.leggett_okin.LIGHT_STATE_TIMEOUT_S", 0),
         pytest.raises(HomeAssistantError, match="did not confirm"),
     ):
         await hass.services.async_call("light", "toggle", {"entity_id": light_id}, blocking=True)
-    toggle.assert_awaited_once()
+    toggle.assert_called_once()
     assert hass.states.get(light_id).state == "unknown"
     # An explicit toggle remains usable before state is known, and waits for the
     # bed's report exactly as an on or off action does.
@@ -352,7 +352,9 @@ async def test_cu170_light_uses_live_state_and_removes_redundant_toggle_button(
     assert hass.states.get(light_id).state == "on"
     coordinator._on_disconnect(coordinator.client)
     assert hass.states.get(light_id).state == "unknown"
-    # A new connection must not revive the old coordinator telemetry cache.
+    # A new connection must not revive the old coordinator telemetry cache. The
+    # link comes back first, because a hold-capable controller is built on one.
+    coordinator._client = app_ble
     coordinator._controller = LeggettOkinController(coordinator)
     coordinator._notify_connection_state_change(True)
     coordinator.handle_controller_state_updates({"unrelated": 1})
