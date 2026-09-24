@@ -597,15 +597,13 @@ class TestLeggettOkinController:
         assert controller._streamer.calls == ["release_wire", "run_operation"]
         assert controller._streamer.operations == [okin_dummy_program()]
 
-    async def test_a_receipt_blackout_pays_one_barrier_per_cycle_and_never_trips(
+    async def test_a_receipt_blackout_pays_one_barrier_per_credit_window(
         self, hass: HomeAssistant, streaming_okin
     ):
-        """deficit-trip-barrier: a box that stops answering gets confirmed writes, not an end.
+        """receipt-paced-write-commands: a box that stops answering gets confirmed writes, not an end.
 
-        No receipt arrives, so the credit gate stalls every eight frames. Each
-        stall's completion refills credit and clears the deficit, so the guard,
-        which trips later than the gate stalls, is never reached while writes
-        complete.
+        No receipt arrives, so the credit gate stalls every eight frames, and
+        each stall's completion refills credit.
         """
         controller, coordinator = streaming_okin
         head_up = bytes.fromhex("040200000001")
@@ -618,14 +616,13 @@ class TestLeggettOkinController:
         assert _written(coordinator) == cycle * 3
         stream = controller.protocol_diagnostics["hold_stream"]
         assert stream["stalls"] == 3
-        assert stream["trips"] == 0
         assert stream["sick"] is False
         coordinator.async_disconnect.assert_not_called()
 
     async def test_a_barrier_a_stop_abandoned_does_not_shut_the_next_hold_out(
         self, hass: HomeAssistant, streaming_okin
     ):
-        """deficit-trip-barrier: the stop retires the barrier whose completion it cancelled.
+        """receipt-paced-write-commands: the stop retires the barrier whose completion it cancelled.
 
         The stop cancels the pump awaiting the barrier, so that completion never
         reaches the feedback, and the release behind it fails. No confirmed
@@ -667,11 +664,65 @@ class TestLeggettOkinController:
         ]
         assert controller.protocol_diagnostics["hold_stream"]["sick"] is False
 
+    async def test_a_release_sent_before_a_barrier_does_not_clear_it(
+        self, hass: HomeAssistant, streaming_okin
+    ):
+        """release-is-a-write-request: a completion clears a barrier only when its write went after it.
+
+        A stop lands during a credit barrier, and the next hold opens with a new
+        barrier queued on the BLE lock behind the stop's release. The release's
+        completion proves the frames before it, not that barrier, which stays
+        outstanding until its own completion.
+        """
+        controller, coordinator = streaming_okin
+        feet_up = bytes.fromhex("040200000004")
+        completions: list[asyncio.Future[None]] = []
+        holding = True
+
+        async def hold_confirmed_writes(uuid: str, frame: bytes, *, response: bool) -> None:
+            del uuid, frame
+            if response and holding:
+                completion = asyncio.get_running_loop().create_future()
+                completions.append(completion)
+                await completion
+
+        def stream() -> dict:
+            return controller.protocol_diagnostics["hold_stream"]
+
+        coordinator.client.write_gatt_char.side_effect = hold_confirmed_writes
+        controller.hold({Control("motor-head-up"): hass.loop.time() + 30})
+        await _settle_stream()
+        await _wake_until(hass, lambda: len(completions) == 1)
+        controller.release_wire()
+        await _settle_stream()
+        controller.hold({Control("motor-feet-up"): hass.loop.time() + 30})
+        await _settle_stream()
+        _, release = completions
+
+        release.set_result(None)
+        await _settle_stream()
+
+        assert stream()["releases"] == 1
+        assert stream()["barrier_outstanding"] is True
+        assert stream()["clears"] == 0
+
+        holding = False
+        _, _, barrier = completions
+        barrier.set_result(None)
+        await _wake_until(hass, lambda: _written(coordinator)[-1] == (feet_up, False))
+
+        assert stream()["barrier_outstanding"] is False
+        assert stream()["clears"] == 1
+
     async def test_a_failed_barrier_write_releases_and_disconnects(
         self, hass: HomeAssistant, streaming_okin, caplog: pytest.LogCaptureFixture
     ):
-        """stop-on-lost-evidence: the one stream path that still ends the link."""
+        """stop-on-lost-evidence: the one stream path that still ends the link.
+
+        A disconnect that ends the link leaves nothing to warn about.
+        """
         controller, coordinator = streaming_okin
+        coordinator.async_disconnect = AsyncMock(return_value=True)
 
         async def refuse_confirmed_writes(uuid: str, frame: bytes, *, response: bool) -> None:
             del uuid, frame
@@ -684,6 +735,7 @@ class TestLeggettOkinController:
             controller.hold({Control("motor-head-up"): hass.loop.time() + 30})
             await _settle_stream()
             await _wake_until(hass, lambda: coordinator.async_disconnect.await_count == 1)
+            await _settle_stream()
 
         assert _written(coordinator)[-2:] == [
             (bytes.fromhex("040200000001"), True),
@@ -691,6 +743,7 @@ class TestLeggettOkinController:
         ]
         assert controller.protocol_diagnostics["hold_stream"]["sick"] is True
         assert "failed a confirmed stream write; disconnecting" in caplog.text
+        assert "its hold stream stays stopped until the link ends" not in caplog.text
 
     @pytest.mark.parametrize(
         "disconnect",

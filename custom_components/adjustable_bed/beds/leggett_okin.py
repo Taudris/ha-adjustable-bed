@@ -72,7 +72,7 @@ from .base import (
     ControllerStateSensorSpec,
     MotorControlSpec,
 )
-from .leggett_okin_evidence import DEFAULT_DEFICIT_TRIP, OkinStreamFeedback
+from .leggett_okin_evidence import OkinStreamFeedback
 from .leggett_okin_hold import (
     CU170_STREAM_PROFILE,
     FACTORY_RESET,
@@ -277,7 +277,7 @@ class LeggettOkinController(BedController, HoldCapable):
         client = self.client
         if client is None:
             raise ConnectionError("A hold-capable controller is built on a connected link")
-        self._feedback = OkinStreamFeedback(coordinator.address, self._read_deficit_trip)
+        self._feedback = OkinStreamFeedback(coordinator.address)
         self._streamer = HoldStreamer(
             name=coordinator.address,
             press_floor=self._press_floor,
@@ -359,15 +359,6 @@ class LeggettOkinController(BedController, HoldCapable):
     def link_lost(self) -> None:
         """End the stream and any staged operation, writing nothing."""
         self._streamer.link_lost()
-
-    def _read_deficit_trip(self) -> int:
-        """Return the deficit trip one wire lifecycle runs under.
-
-        The entry exposes no such option today, so this is the guard's own
-        default; the read still happens per lifecycle, which is where a future
-        option has to land.
-        """
-        return DEFAULT_DEFICIT_TRIP
 
     def _record_stream_trace(self, frame: bytes) -> None:
         """File one command-trace entry for a wire lifecycle's first frame.
@@ -991,9 +982,7 @@ class LeggettOkinController(BedController, HoldCapable):
                     "under_bed_lights_on": bool(status_mask & CU170_LIGHT_MASK),
                 }
             )
-            self._feedback.note_notification(
-                status_mask, self._coordinator.hass.loop.time()
-            )
+            self._feedback.note_notification(status_mask)
             return
         parsed = parse_leggett_okin_feedback(payload)
         if parsed is None:
@@ -1011,9 +1000,7 @@ class LeggettOkinController(BedController, HoldCapable):
                 }
             )
         if on_main_channel:
-            self._feedback.note_notification(
-                self._notification_led_mask or 0, self._coordinator.hass.loop.time()
-            )
+            self._feedback.note_notification(self._notification_led_mask or 0)
 
     async def stop_notify(self) -> None:
         """Stop subscriptions and discard feedback, including on failed shutdown."""
