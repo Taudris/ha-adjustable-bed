@@ -30,8 +30,8 @@ CREDIT_WINDOW: Final = 8
 # Every Kth receipt returns one extra credit, so sustained pace survives receipt
 # loss up to 1/(K+1) = 10 %, about twice the measured 2.5-4.5 % band.
 CREDIT_EXTRA_EVERY: Final = 9
-# The deficit leaks one per second. At the trip the next frame is a barrier,
-# whose completion clears the deficit.
+# The deficit leaks one per second. At the trip the next frame is a barrier, and
+# any confirmed write's completion lowers the deficit to the frames sent after it.
 DEFICIT_LEAK_S: Final = 1.0
 DEFAULT_DEFICIT_TRIP: Final = 10
 # The box flashes the under-bed light as feedback, and publishes each change of
@@ -50,16 +50,15 @@ class ReceiptCreditGate:
     """Bounds how far the stream runs ahead of the box's receipts.
 
     A send spends one credit and a receipt returns one; every Kth receipt
-    returns an extra, and credit never rises above W. At credit 0 the next frame
-    goes as a Write Request - the barrier - and nothing further leaves until its
-    completion, which proves every earlier frame reached the box's ATT layer.
+    returns an extra, and credit never rises above W. At credit 0 the gate calls
+    for the barrier: the next frame goes as a Write Request, whose completion
+    proves every earlier frame reached the box's ATT layer.
     """
 
     def __init__(self) -> None:
         """Initialize the gate for one link."""
         self._credit = CREDIT_WINDOW
         self._receipts = 0
-        self._barrier_outstanding = False
         self._stall_began: float | None = None
         self._stalled = False
         self._stalls = 0
@@ -67,12 +66,10 @@ class ReceiptCreditGate:
         self._last_clear_s = 0.0
 
     def before_send(self, now: float) -> SendVerdict:
-        """Return whether this wake may write, and how."""
-        if self._barrier_outstanding:
-            return SendVerdict.WITHHOLD
+        """Return a Write Command while credit lasts, and the barrier at zero."""
         if self._credit > 0:
             return SendVerdict.WRITE_COMMAND
-        self._open_barrier(now)
+        self._begin_stall(now)
         return SendVerdict.WRITE_REQUEST_BARRIER
 
     def after_send(self, now: float, *, confirmed: bool) -> None:
@@ -85,13 +82,13 @@ class ReceiptCreditGate:
 
         ATT delivers a link's PDUs in order, so the completion means every frame
         before it reached the box. Credit rises to the window less what has gone
-        since the write was submitted, and never falls.
+        since the write was submitted, and never falls. The first completion
+        after a stall also times it.
         """
         self._credit = max(self._credit, CREDIT_WINDOW - sent_since)
-        if self._barrier_outstanding:
-            self._barrier_outstanding = False
+        if self._stall_began is not None:
             self._clears += 1
-            self._last_clear_s = now - (self._stall_began or now)
+            self._last_clear_s = now - self._stall_began
             self._stall_began = None
 
     def take_first_stall(self) -> bool:
@@ -117,15 +114,13 @@ class ReceiptCreditGate:
         return {
             "credit": self._credit,
             "receipts": self._receipts,
-            "barrier_outstanding": self._barrier_outstanding,
             "stalls": self._stalls,
             "clears": self._clears,
             "last_clear_ms": round(self._last_clear_s * 1000, 1),
         }
 
-    def _open_barrier(self, now: float) -> None:
-        """Start a stall: the next frame is the barrier, and nothing follows it."""
-        self._barrier_outstanding = True
+    def _begin_stall(self, now: float) -> None:
+        """Count a stall and start timing it."""
         self._stalls += 1
         self._stalled = self._stalls == 1
         self._stall_began = now
@@ -136,9 +131,10 @@ class ReceiptDeficitGuard:
 
     Every submitted frame adds one and every receipt clears one; one leaks per
     second, so a healthy stream's transient never accumulates. At the trip the
-    next frame goes as a Write Request and nothing follows it until its
-    completion, which proves every earlier frame reached the box's ATT layer and
-    so clears the deficit. The stream goes on: a trip is flow control.
+    guard calls for the barrier: the next frame goes as a Write Request. Any
+    confirmed write's completion proves every earlier frame reached the box's
+    ATT layer, so it lowers the deficit to the frames sent after that write.
+    The stream goes on: a trip is flow control.
     """
 
     def __init__(self) -> None:
@@ -146,7 +142,6 @@ class ReceiptDeficitGuard:
         self._deficit = 0
         self._trip = DEFAULT_DEFICIT_TRIP
         self._last_leak: float | None = None
-        self._barrier_outstanding = False
         self._trips = 0
 
     def use_trip(self, trip: int) -> None:
@@ -154,13 +149,10 @@ class ReceiptDeficitGuard:
         self._trip = trip
 
     def before_send(self, now: float) -> SendVerdict:
-        """Return whether this wake may write, and how."""
-        if self._barrier_outstanding:
-            return SendVerdict.WITHHOLD
+        """Return a Write Command below the trip, and the barrier at it."""
         self._leak(now)
         if self._deficit < self._trip:
             return SendVerdict.WRITE_COMMAND
-        self._barrier_outstanding = True
         self._trips += 1
         return SendVerdict.WRITE_REQUEST_BARRIER
 
@@ -175,15 +167,14 @@ class ReceiptDeficitGuard:
         self._deficit = max(0, self._deficit - 1)
 
     def after_confirmation(self, now: float, *, sent_since: int) -> None:
-        """Clear the deficit a trip's barrier proved delivered.
+        """Lower the deficit to what a confirmed write's completion left unproven.
 
-        Only the frames sent since the write was submitted stay unproven. A
-        completion the guard did not ask for clears nothing.
+        Only the frames sent since the write was submitted stay unproven. Which
+        write completed does not matter: a credit barrier, a trip barrier and
+        the release each prove the same.
         """
         self._leak(now)
-        if self._barrier_outstanding:
-            self._barrier_outstanding = False
-            self._deficit = min(self._deficit, sent_since)
+        self._deficit = min(self._deficit, sent_since)
 
     @property
     def diagnostics(self) -> dict[str, Any]:
@@ -242,9 +233,11 @@ class LightPulseCounter:
 class OkinStreamFeedback:
     """The CU170's reading of its own notification channel.
 
-    Owns nothing of its own: it puts the credit gate, the deficit guard and the
-    pulse counter behind the streamer's contract and lets the controller feed
-    all three from one notification.
+    It puts the credit gate, the deficit guard and the pulse counter behind the
+    streamer's contract and lets the controller feed all three from one
+    notification. It owns one fact of its own, the barrier both counts call
+    for: once either does, nothing further leaves until a confirmed write
+    completes or the streamer abandons the barrier's completion.
     """
 
     def __init__(
@@ -263,6 +256,7 @@ class OkinStreamFeedback:
         self._deficit = ReceiptDeficitGuard()
         self._pulses = LightPulseCounter()
         self._read_trip = read_trip
+        self._barrier_outstanding = False
 
     def note_notification(self, led_mask: int, now: float) -> None:
         """Take one status notification: a receipt, and the light bit it carries."""
@@ -277,11 +271,23 @@ class OkinStreamFeedback:
     def before_send(self, now: float) -> SendVerdict:
         """Return whether this wake may write, and how.
 
-        The credit gate answers first; a Write Command it allows goes as the
-        barrier instead once the deficit guard has tripped. The first stall on
-        a bed device is worth a warning; every later one is a diagnostics
-        counter. The gate counts them and this owner, which knows the address,
-        decides what to say about them.
+        While a barrier is outstanding every wake is withheld. Otherwise the
+        credit gate answers first, and a Write Command it allows goes as the
+        barrier instead once the deficit guard has tripped.
+        """
+        if self._barrier_outstanding:
+            return SendVerdict.WITHHOLD
+        verdict = self._credit_verdict(now)
+        if verdict is SendVerdict.WRITE_COMMAND:
+            verdict = self._deficit_verdict(now)
+        self._barrier_outstanding = verdict is SendVerdict.WRITE_REQUEST_BARRIER
+        return verdict
+
+    def _credit_verdict(self, now: float) -> SendVerdict:
+        """Return the gate's verdict, warning at the first stall on a bed device.
+
+        Every later stall is a diagnostics counter. The gate counts them and
+        this owner, which knows the address, decides what to say about them.
         """
         verdict = self._credit.before_send(now)
         if self._credit.take_first_stall() and self._address not in _WARNED_ADDRESSES:
@@ -292,8 +298,6 @@ class OkinStreamFeedback:
                 "carrying the motion cadence",
                 self._address,
             )
-        if verdict is SendVerdict.WRITE_COMMAND:
-            return self._deficit_verdict(now)
         return verdict
 
     def _deficit_verdict(self, now: float) -> SendVerdict:
@@ -317,9 +321,24 @@ class OkinStreamFeedback:
         self._deficit.note_frame(now)
 
     def after_confirmation(self, now: float, *, sent_since: int) -> None:
-        """Account for a confirmed write completing, sent_since frames later."""
+        """Account for a confirmed write completing, sent_since frames later.
+
+        Any completion retires the barrier, whichever count called for it and
+        whichever write completed: each proves every earlier frame reached the
+        box, which is all a barrier waits for.
+        """
         self._credit.after_confirmation(now, sent_since=sent_since)
         self._deficit.after_confirmation(now, sent_since=sent_since)
+        self._barrier_outstanding = False
+
+    def abandon_barrier(self) -> None:
+        """Retire the barrier whose completion the streamer stopped awaiting.
+
+        An abandoned completion proves nothing, so neither count moves: the
+        next wake asks both afresh, and a count still at its limit calls for a
+        new barrier.
+        """
+        self._barrier_outstanding = False
 
     def begin_cue(self, cue: CueRequest) -> None:
         """Start counting toward a stage's cue."""
@@ -331,9 +350,10 @@ class OkinStreamFeedback:
 
     @property
     def diagnostics(self) -> dict[str, Any]:
-        """Return every counter behind this feedback."""
+        """Return the barrier state and every counter behind this feedback."""
         return {
             **self._credit.diagnostics,
+            "barrier_outstanding": self._barrier_outstanding,
             **self._deficit.diagnostics,
             **self._pulses.diagnostics,
         }

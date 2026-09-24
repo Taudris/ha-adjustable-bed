@@ -310,16 +310,13 @@ class TestReceiptCreditGate:
 
         assert gate.diagnostics["credit"] == 2
 
-    def test_exhausted_credit_sends_the_barrier_and_then_nothing(self):
-        """receipt-paced-write-commands: one Write Request, then the stream waits."""
+    def test_exhausted_credit_calls_for_the_barrier(self):
+        """receipt-paced-write-commands: at credit 0 the next frame is a Write Request."""
         gate = ReceiptCreditGate()
         for _ in range(CREDIT_WINDOW):
             gate.after_send(0.0, confirmed=False)
 
         assert gate.before_send(1.0) == SEND_BARRIER
-        gate.after_send(1.0, confirmed=True)
-
-        assert gate.before_send(1.1) is SendVerdict.WITHHOLD
         assert gate.diagnostics["stalls"] == 1
 
     def test_the_barriers_completion_resets_credit_and_times_the_clear(self):
@@ -407,12 +404,6 @@ class TestReceiptDeficitGuard:
         assert guard.before_send(0.0) == SEND_BARRIER
         assert guard.diagnostics["trips"] == 1
 
-    def test_nothing_follows_the_barrier_until_it_completes(self):
-        """deficit-trip-barrier: one Write Request, then the stream waits."""
-        guard = _tripped_guard()
-
-        assert guard.before_send(0.1) is SendVerdict.WITHHOLD
-
     def test_the_barriers_completion_clears_the_deficit(self):
         """deficit-trip-barrier: the completion proves every earlier frame arrived."""
         guard = _tripped_guard()
@@ -423,16 +414,16 @@ class TestReceiptDeficitGuard:
         assert guard.before_send(0.3) == SEND_UNCONFIRMED
         assert guard.diagnostics["trips"] == 1
 
-    def test_a_completion_the_guard_did_not_ask_for_clears_nothing(self):
-        """deficit-trip-barrier: a credit barrier or a release leaves the count standing."""
+    def test_any_completion_lowers_the_deficit_to_what_went_after_it(self):
+        """deficit-trip-barrier: a credit barrier or a release proves what a trip's would."""
         guard = ReceiptDeficitGuard()
         guard.use_trip(5)
         for _ in range(4):
             guard.note_frame(0.0)
 
-        guard.after_confirmation(0.0, sent_since=0)
+        guard.after_confirmation(0.0, sent_since=1)
 
-        assert guard.diagnostics["deficit"] == 4
+        assert guard.diagnostics["deficit"] == 1
 
     def test_receipts_and_the_leak_keep_a_healthy_stream_clear(self):
         """deficit-trip-barrier: a healthy transient never accumulates."""
@@ -599,6 +590,51 @@ class TestOkinStreamFeedback:
 
         assert feedback.diagnostics["deficit"] == 0
         assert feedback.diagnostics["credit"] == CREDIT_WINDOW
+        assert feedback.before_send(0.3) == SEND_UNCONFIRMED
+
+    def test_a_stalls_completion_clears_the_deficit_too(self):
+        """deficit-trip-barrier: one barrier state, so a stall leaves no trip behind it.
+
+        With no receipt, credit runs out before the deficit reaches its trip.
+        The stall's completion proves what a trip's would, so the stream pays
+        one barrier per credit window rather than a stall and a trip.
+        """
+        feedback = OkinStreamFeedback("AA:BB")
+        feedback.begin_lifecycle()
+        for _ in range(CREDIT_WINDOW):
+            feedback.after_send(0.0, confirmed=False)
+        assert feedback.before_send(0.0) == SEND_BARRIER
+        feedback.after_send(0.0, confirmed=True)
+
+        assert feedback.before_send(0.1) is SendVerdict.WITHHOLD
+
+        feedback.after_confirmation(0.2, sent_since=0)
+
+        assert feedback.diagnostics["deficit"] == 0
+        assert feedback.before_send(0.3) == SEND_UNCONFIRMED
+        assert feedback.diagnostics["trips"] == 0
+
+    def test_a_release_completing_under_a_trip_barrier_retires_it(self):
+        """deficit-trip-barrier: any confirmed completion retires the one barrier state.
+
+        A stop cancels the pump awaiting a trip's barrier, and the release is
+        the next write to complete. Its completion proves what the barrier's
+        would have, so the count clears and the next wake writes.
+        """
+        feedback = OkinStreamFeedback("AA:BB", lambda: 5)
+        feedback.begin_lifecycle()
+        for _ in range(5):
+            feedback.after_send(0.0, confirmed=False)
+        assert feedback.before_send(0.0) == SEND_BARRIER
+        feedback.after_send(0.0, confirmed=True)
+
+        assert feedback.before_send(0.1) is SendVerdict.WITHHOLD
+        assert feedback.diagnostics["barrier_outstanding"] is True
+
+        feedback.after_confirmation(0.2, sent_since=0)
+
+        assert feedback.diagnostics["barrier_outstanding"] is False
+        assert feedback.diagnostics["deficit"] == 0
         assert feedback.before_send(0.3) == SEND_UNCONFIRMED
 
 
