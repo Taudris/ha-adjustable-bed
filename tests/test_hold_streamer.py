@@ -170,11 +170,6 @@ class _Feedback:
         self.sends: list[bool] = []
         self.confirmations: list[int] = []
         self.abandoned = 0
-        self.lifecycles = 0
-
-    def begin_lifecycle(self) -> None:
-        """Count one lifecycle edge."""
-        self.lifecycles += 1
 
     def before_send(self, now: float) -> SendVerdict:
         """Return the scripted verdict."""
@@ -370,12 +365,58 @@ class TestHaApiOnly:
         assert bench.feedback.abandoned == 1
         assert bench.feedback.confirmations == []
 
-    async def test_no_path_cancels_a_submitted_frame(self, bench: _Bench):
-        """ha-api-only: a submitted frame is irrevocable, so no member withdraws one."""
-        assert not hasattr(bench.streamer, "cancel")
-        assert not any(
-            hasattr(future, "revoke") for future in bench.writer.pending
-        )
+    async def test_a_stop_cancels_the_completion_the_pump_awaits_and_no_other(
+        self, bench: _Bench
+    ):
+        """ha-api-only: the stop reaches a submitted frame only through the barrier's wait.
+
+        The pump awaits the writer's own completion, so cancelling the pump
+        cancels it, and what that does to the frame is the writer's. The
+        release the stop writes is not awaited, so it stays submitted.
+        """
+        assert bench.feedback is not None
+        bench.writer.hold_completions = True
+        bench.hold(HEAD_UP)
+        await bench.start()
+        bench.feedback.verdict = SendVerdict.WRITE_REQUEST_BARRIER
+        await bench.tick()
+
+        bench.streamer.release_wire()
+        await _settle()
+
+        barrier, release = bench.writer.pending
+        assert barrier.cancelled()
+        assert bench.frames[-1] == RELEASE.decode()
+        assert not release.done()
+
+    async def test_a_release_completion_counts_the_frames_after_its_own_submission(
+        self, bench: _Bench
+    ):
+        """release-is-a-write-request: a later release does not shorten what an earlier one proved.
+
+        Two frames, a release, two frames, a second release, two frames: the
+        first release's completion reports the four frames sent after it, not
+        the two sent after the second release.
+        """
+        assert bench.feedback is not None
+        bench.writer.hold_completions = True
+        for control in (HEAD_UP, FEET_UP):
+            bench.hold(control)
+            await bench.start()
+            await bench.tick()
+            bench.streamer.release_wire()
+        bench.clock.now += 1.0
+        bench.hold(HEAD_UP)
+        await bench.start()
+        await bench.tick()
+        first, second = bench.writer.pending
+
+        first.set_result(None)
+        await _settle()
+        second.set_result(None)
+        await _settle()
+
+        assert bench.feedback.confirmations == [4, 2]
 
 
 class TestPressRegistrationFloors:
@@ -601,7 +642,7 @@ class TestLostEvidenceEndsTheStream:
         """stop-on-lost-evidence: the completion that clears the gate never comes.
 
         Without the exit the gate stays shut for the rest of the lifecycle, so
-        a held motor stops at the box's watchdog with no frame and no trip.
+        a held motor stops at the box's watchdog with no frame.
         """
         feedback = bench.feedback
         assert feedback is not None
@@ -669,6 +710,7 @@ class TestLostEvidenceEndsTheStream:
         await bench.ticks(3)
 
         assert bench.frames == frames_at_exit
+        assert bench.streamer.diagnostics["failure"] == "the link refused the write"
 
 
 class TestLinkLostTeardown:
@@ -906,30 +948,6 @@ class TestClearFloorSpacing:
             await bench.tick()
 
         assert bench.frames[-1] == "light-toggle"
-
-
-class TestOptionsLatchPerLifecycle:
-    """options-latch-per-lifecycle: the edge the feedback latches at."""
-
-    async def test_one_lifecycle_edge_per_wire_lifecycle(self, bench: _Bench):
-        """options-latch-per-lifecycle: signalled once, at the lifecycle's first frame.
-
-        What a feedback reads at the edge is its own; the streamer's part is
-        that the edge arrives exactly once per lifecycle, so nothing a bed
-        latches can change under a press that is already running.
-        """
-        feedback = bench.feedback
-        assert feedback is not None
-        bench.hold(HEAD_UP, ttl_s=0.25)
-        await bench.start()
-        await bench.ticks(3)
-
-        assert feedback.lifecycles == 1
-
-        bench.hold(HEAD_UP, ttl_s=0.5)
-        await bench.run_until(lambda: feedback.lifecycles == 2)
-
-        assert feedback.lifecycles == 2
 
 
 class TestCueOrCeiling:

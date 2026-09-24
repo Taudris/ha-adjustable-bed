@@ -76,7 +76,7 @@ custom_components/adjustable_bed/
 │   ├── base.py           # Abstract base class (BedController)
 │   ├── diagnostic.py     # Debug controller for unsupported beds
 │   ├── leggett_okin_hold.py     # CU170 keycodes, frame encoder, writer, declarations
-│   ├── leggett_okin_evidence.py # CU170 credit gate, deficit guard, cue counter
+│   ├── leggett_okin_evidence.py # CU170 credit gate, cue counter
 │   └── ...               # See the README "Supported Beds" table and docs/beds/
 ├── cover.py / button.py / sensor.py / switch.py / light.py / climate.py /
 │       select.py / number.py / binary_sensor.py   # HA entity platforms
