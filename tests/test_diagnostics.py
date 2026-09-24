@@ -485,7 +485,7 @@ class TestHoldDiagnostics:
         mock_coordinator_connected,  # noqa: ARG002
         enable_custom_integrations,  # noqa: ARG002
     ):
-        """receipt-paced-write-commands: the credit, the deficit and the stalls are readable.
+        """receipt-paced-write-commands: the credit, barrier, deficit, stalls and trips are readable.
 
         Read at a connect, which expresses nothing of its own: the stream is
         idle, every counter stands at its start value, and the payload carries
@@ -503,7 +503,9 @@ class TestHoldDiagnostics:
         assert stream["frames"] == 0
         assert stream["releases"] == 0
         assert stream["receipts"] == 0
-        assert stream["credit"] == 4
+        assert stream["credit"] == 8
+        assert stream["barrier_outstanding"] is False
         assert stream["deficit"] == 0
         assert stream["stalls"] == 0
+        assert stream["trips"] == 0
         assert stream["benchmark"] is None

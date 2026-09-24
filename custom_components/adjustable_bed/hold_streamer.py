@@ -227,8 +227,8 @@ class StreamFeedback(Protocol):
         """Account for a confirmed write completing, sent_since frames later."""
         ...
 
-    def is_sick(self, now: float) -> bool:
-        """Return True when the link's own evidence says the stream must stop."""
+    def abandon_barrier(self) -> None:
+        """Retire the barrier whose completion the streamer stopped awaiting."""
         ...
 
     def begin_cue(self, cue: CueRequest) -> None:
@@ -262,10 +262,8 @@ class _ConfirmedWrites:
     def after_confirmation(self, now: float, *, sent_since: int) -> None:
         """Account for nothing."""
 
-    def is_sick(self, now: float) -> bool:
-        """Return False: absence of evidence drives no decision here."""
-        del now
-        return False
+    def abandon_barrier(self) -> None:
+        """Retire nothing: every barrier here is the pump's own await."""
 
     def begin_cue(self, cue: CueRequest) -> None:
         """Start no cue: a bed reporting nothing acknowledges nothing."""
@@ -303,9 +301,9 @@ class HoldStreamer:
         is the one thing here a user has to read about and one Home Assistant
         can carry several beds.
 
-        ``on_sick`` is what the controller does once the link's own evidence
-        has ended the stream - on this bed, order the disconnect. It runs
-        behind the release, and at most once per link.
+        ``on_sick`` is what the controller does once a failed barrier write has
+        ended the stream - on this bed, order the disconnect. It runs behind
+        the release, and at most once per link.
 
         ``on_lifecycle_open`` takes the frame that opened a wire lifecycle, for
         a controller that traces one entry per lifecycle rather than per frame.
@@ -342,7 +340,10 @@ class HoldStreamer:
 
         Synchronous and idempotent: the push replaces the set and returns, so a
         stop can end its intents and reach the wire with no suspension point
-        between the two. The frame carrying the change is the next wake's.
+        between the two. The frame carrying the change is the next wake's,
+        unless a failure has ended this link's stream - a pump that could not
+        run, or a failed barrier write. Then the push only replaces the set: no
+        wake follows, and no frame leaves until the link ends.
         """
         self._target = dict(held)
         self._start_pump()
@@ -412,9 +413,10 @@ class HoldStreamer:
             ValueError: Thrown when a stage names a control this bed does not
                 declare, which is the bed module's own program disagreeing with
                 its own declarations.
-            Exception: Thrown when an earlier pump failure ended this link's
-                stream; it is the failure itself, because nothing this link can
-                stage runs after it.
+            Exception: Thrown at once when an earlier failure ended this link's
+                stream - a pump that could not run, or a failed barrier write;
+                it is the failure itself, because nothing this link can stage
+                runs after it and no wake would ever answer the operation.
         """
         self._refuse_an_unrunnable_program(program)
         preempted = self._operation
@@ -443,7 +445,7 @@ class HoldStreamer:
 
         Raises:
             ValueError: Thrown when a stage names an undeclared control.
-            Exception: Thrown when an earlier pump failure ended the stream.
+            Exception: Thrown when an earlier failure ended the stream.
         """
         if self._failure is not None:
             raise self._failure
@@ -476,17 +478,17 @@ class HoldStreamer:
         """Stage the operation and wait for how it ended."""
         return await self.stage(program)
 
-    def _note_sick(self) -> None:
-        """End the lifecycle because the link's own evidence says to.
+    def _note_sick(self, err: Exception) -> None:
+        """End the stream because a failed barrier write lost the link's evidence.
 
+        The write's error becomes the stream's failure, which fences it the way
+        a pump failure does: no push restarts the pump, a staged operation is
+        refused at once, and no frame follows the release before the link ends.
         The release goes out first, then the controller's exit: only the
         controller owns the link, so ordering the disconnect is its call, and
-        the bed sees the button up while the link is still whole. Once per
-        link - the evidence stays past the trip until it leaks, so a later wake
-        must not order a second disconnect.
+        the bed sees the button up while the link is still whole.
         """
-        if self._sick:
-            return
+        self._failure = err
         self._sick = True
         self.release_wire()
         self._on_sick()
@@ -509,11 +511,13 @@ class HoldStreamer:
         }
 
     def _start_pump(self) -> None:
-        """Run the pump, unless one is already running or one has failed.
+        """Run the pump, unless one is already running or this link's stream ended.
 
         A pump that could not compose or submit a frame could not compose the
         next one either, so a later push starts no second pump: one failure per
         link, one log line, and every push after it a no-op until the link ends.
+        A failed barrier write ends the stream the same way, because its release
+        has gone out and the controller is ending the link.
         """
         if self._failure is not None:
             return
@@ -604,8 +608,6 @@ class HoldStreamer:
         self._record(plan, frame, sent_at)
         if future is not None:
             await self._settle_write(future, self._frames, barrier=barrier)
-        if self._feedback.is_sick(self._clock()):
-            self._note_sick()
         return sent_at
 
     async def _settle_write(
@@ -616,13 +618,21 @@ class HoldStreamer:
         A failed barrier is lost evidence, and lost evidence stops the stream
         (``stop-on-lost-evidence``): the completion that would have cleared the
         gate never arrives, so every later wake is withheld and a held motor
-        stops at the box's watchdog with no frame and no trip. The failure of
-        any other confirmed write - the benchmark's - costs only that
-        measurement.
+        stops at the box's watchdog with no frame. The failure of any other
+        confirmed write - the benchmark's - costs only that measurement.
+
+        A barrier the pump stops awaiting - a stop cancels the pump - is
+        abandoned to the feedback: its completion can no longer reach the
+        feedback, and a barrier nothing retires would withhold every later wake
+        on this link.
         """
         sent_before = self._sent_since_release
         try:
             await future
+        except asyncio.CancelledError:
+            if barrier:
+                self._feedback.abandon_barrier()
+            raise
         except Exception as err:  # noqa: BLE001 - the error type belongs to the writer
             _LOGGER.debug("Hold stream write failed: %s", err)
             if barrier:
@@ -630,7 +640,7 @@ class HoldStreamer:
                     "Hold stream barrier write failed, so the link's evidence is lost: %s",
                     err,
                 )
-                self._note_sick()
+                self._note_sick(err)
             return
         now = self._clock()
         self._feedback.after_confirmation(now, sent_since=self._sent_since_release - sent_before)
@@ -649,7 +659,7 @@ class HoldStreamer:
         future.add_done_callback(self._release_completed)
 
     def _release_completed(self, future: Future[None]) -> None:
-        """Raise credit by what the release proved, ignoring a completion that failed.
+        """Hand the feedback what the release proved, ignoring a completion that failed.
 
         The counter rises here rather than at submission, so the diagnostics
         number reads as the releases that reached the box rather than the ones

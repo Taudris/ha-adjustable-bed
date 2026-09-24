@@ -388,16 +388,35 @@ class LeggettOkinController(BedController, HoldCapable):
         )
 
     def _on_stream_sick(self) -> None:
-        """Order the disconnect a receipt blackout calls for.
+        """Order the disconnect a failed barrier write calls for.
 
         The streamer has already released the wire; only this class owns the
         link, so ending it is here.
         """
         _LOGGER.warning(
-            "Leggett Okin at %s stopped acknowledging frames; disconnecting",
+            "Leggett Okin at %s failed a confirmed stream write; disconnecting",
             self._coordinator.address,
         )
-        self._coordinator.hass.async_create_task(self._coordinator.async_disconnect())
+        self._coordinator.hass.async_create_task(self._disconnect_sick_link())
+
+    async def _disconnect_sick_link(self) -> None:
+        """Disconnect, and warn once when the link outlives the attempt.
+
+        Nothing retries: the streamer stays fenced for the rest of the link, so
+        a link the disconnect did not end sends no stream frame until it ends
+        some other way.
+        """
+        try:
+            ended = await self._coordinator.async_disconnect()
+        except Exception as err:  # noqa: BLE001 - a raise leaves the link as a False does
+            _LOGGER.debug("Disconnecting %s raised: %s", self._coordinator.address, err)
+            ended = False
+        if not ended:
+            _LOGGER.warning(
+                "Leggett Okin at %s did not disconnect after a failed confirmed stream "
+                "write; its hold stream stays stopped until the link ends",
+                self._coordinator.address,
+            )
 
     def _submit(self, control: Control) -> None:
         """Submit one press of the control as an intent, and return.

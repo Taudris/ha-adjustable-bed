@@ -167,9 +167,9 @@ class _Feedback:
         self.cue: CueRequest | None = None
         self.cues_begun: list[CueRequest] = []
         self.cue_is_met = False
-        self.sick = False
         self.sends: list[bool] = []
         self.confirmations: list[int] = []
+        self.abandoned = 0
         self.lifecycles = 0
 
     def begin_lifecycle(self) -> None:
@@ -191,10 +191,9 @@ class _Feedback:
         del now
         self.confirmations.append(sent_since)
 
-    def is_sick(self, now: float) -> bool:
-        """Return the scripted sickness."""
-        del now
-        return self.sick
+    def abandon_barrier(self) -> None:
+        """Count one barrier whose completion the streamer stopped awaiting."""
+        self.abandoned += 1
 
     def begin_cue(self, cue: CueRequest) -> None:
         """Start a cue, forgetting whatever the previous stage saw."""
@@ -354,6 +353,22 @@ class TestHaApiOnly:
         await _settle()
 
         assert len(bench.feedback.confirmations) == 2
+
+    async def test_a_barrier_the_stop_cancels_is_abandoned_to_the_feedback(
+        self, bench: _Bench
+    ):
+        """ha-api-only: a completion the pump stops awaiting can never reach the feedback."""
+        assert bench.feedback is not None
+        bench.feedback.verdict = SendVerdict.WRITE_REQUEST_BARRIER
+        bench.writer.hold_completions = True
+        bench.hold(HEAD_UP)
+        await bench.start()
+
+        bench.streamer.release_wire()
+        await _settle()
+
+        assert bench.feedback.abandoned == 1
+        assert bench.feedback.confirmations == []
 
     async def test_no_path_cancels_a_submitted_frame(self, bench: _Bench):
         """ha-api-only: a submitted frame is irrevocable, so no member withdraws one."""
@@ -579,8 +594,8 @@ class TestFrameIsTheOr:
         assert bench.streamer.diagnostics["lifecycle_open"] is True
 
 
-class TestDeficitStopsTheStream:
-    """deficit-stops-the-stream: the release, then the controller's own exit."""
+class TestLostEvidenceEndsTheStream:
+    """stop-on-lost-evidence: the release, then the controller's own exit."""
 
     async def test_a_failed_barrier_takes_the_sickness_exit(self, bench: _Bench):
         """stop-on-lost-evidence: the completion that clears the gate never comes.
@@ -615,22 +630,45 @@ class TestDeficitStopsTheStream:
     async def test_a_sick_stream_releases_and_then_tells_the_controller(
         self, bench: _Bench
     ):
-        """deficit-stops-the-stream: one exit, behind the release, once per link."""
-        feedback = bench.feedback
-        assert feedback is not None
-        bench.hold(HEAD_UP)
-        await bench.start()
-
-        feedback.sick = True
-        await bench.tick()
+        """stop-on-lost-evidence: one exit, behind the release."""
+        await _fail_a_barrier_mid_hold(bench)
 
         assert bench.sick_exits == 1
         assert bench.exit_frames[-1] == RELEASE.decode()
 
+    async def test_a_push_after_the_exit_sends_nothing_until_the_link_ends(
+        self, bench: _Bench
+    ):
+        """stop-on-lost-evidence: the sick flag fences the pump for the rest of the link.
+
+        The card refreshes its held set every 250 ms while the controller's
+        disconnect runs, and a frame carrying the held key after the release
+        would open a lifecycle that ends with the link rather than a release.
+        """
+        await _fail_a_barrier_mid_hold(bench)
+        frames_at_exit = list(bench.frames)
+
         bench.hold(HEAD_UP)
         await bench.ticks(3)
 
+        assert bench.frames == frames_at_exit
         assert bench.sick_exits == 1
+
+    async def test_a_stage_after_the_exit_is_refused_at_once(self, bench: _Bench):
+        """stop-on-lost-evidence: a fenced stream answers the caller rather than holding it.
+
+        Nothing on this link runs the operation, and the controller's disconnect
+        can leave the link up, so an outcome left to that disconnect could hold a
+        stop's disarming press, and the command lock under it, indefinitely.
+        """
+        await _fail_a_barrier_mid_hold(bench)
+        frames_at_exit = list(bench.frames)
+
+        with pytest.raises(ConnectionError, match="refused the write"):
+            bench.streamer.stage(_store_program())
+        await bench.ticks(3)
+
+        assert bench.frames == frames_at_exit
 
 
 class TestLinkLostTeardown:
@@ -1185,6 +1223,18 @@ def _store_program(ceiling_ms: int = 500) -> OperationProgram:
 def _names(controls: Iterable[Control]) -> list[str]:
     """Return control names, sorted, the way a frame reads."""
     return sorted(control.name for control in controls)
+
+
+async def _fail_a_barrier_mid_hold(bench: _Bench) -> None:
+    """Hold head-up, then fail the next wake's barrier write."""
+    feedback = bench.feedback
+    assert feedback is not None
+    bench.hold(HEAD_UP)
+    await bench.start()
+
+    feedback.verdict = SendVerdict.WRITE_REQUEST_BARRIER
+    bench.writer.fail_completions = True
+    await bench.tick()
 
 
 async def test_a_completed_operation_owes_no_recovery():

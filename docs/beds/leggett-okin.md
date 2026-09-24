@@ -138,11 +138,12 @@ stop opcode; the release frame is an ordinary frame carrying zero.
 
 CU170 hardware testing measured a 217-218 ms motion watchdog: the box carries a
 key that long past the frame asserting it, and a wider gap is a release. The
-stream's frames are unconfirmed writes, paced from the start of each write, so
-no BLE round trip rides in the gap. Awaiting a confirmed write and then sleeping
-100 ms repeatedly crosses the watchdog over a WiFi Bluetooth proxy and makes the
-motor stop and restart. The one confirmed write is the release, whose completion
-nothing waits on.
+stream's frames are Write Commands, unconfirmed and paced from the start of each
+write, so no BLE round trip rides in the gap. Awaiting a confirmed write and then
+sleeping 100 ms repeatedly crosses the watchdog over a WiFi Bluetooth proxy and
+makes the motor stop and restart. The exceptions are the barriers, described
+later in this section, and the release: each goes as a confirmed write, and
+nothing waits on the release's completion.
 
 Explicit **Stop all** drops every bit, writes that one release, and then presses
 the keycode `0x00040000` that has no function of its own. That press is what
@@ -153,11 +154,14 @@ confirmed it on a CU170.
 
 How far the stream may run ahead of the box is the box's own answer: it
 acknowledges each frame it receives with a status notification, and the
-integration spends one of four credits per frame and takes one back per
-acknowledgement. At zero credit the next frame goes as a confirmed write and
-nothing follows until it completes. Acknowledgements are positive evidence only:
-their absence advances nothing, and a sustained absence ends the stream and the
-link.
+integration spends one of eight credits per frame and takes one back per
+acknowledgement. At zero credit the next frame goes as a barrier: a confirmed
+write that nothing follows until it completes. Acknowledgements are positive
+evidence only: their absence advances nothing. When ten frames stand
+unacknowledged, net of one forgiven per second, the next frame also goes as a
+barrier. Any confirmed write's completion, a barrier's or the release's, proves
+every earlier frame reached the box, so credit refills, the unacknowledged count
+clears, and the stream goes on. If a barrier fails, the stream and the link end.
 
 **A preset is a held key too**, not a burst. In hold mode the box travels while
 the key is down and stops at the release; in latch mode the box latches the

@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Callable
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from homeassistant.const import CONF_ADDRESS, CONF_NAME
 from homeassistant.core import HomeAssistant
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+)
 
 from custom_components.adjustable_bed.beds.leggett_gen2 import (
     LeggettGen2Commands,
@@ -23,6 +30,7 @@ from custom_components.adjustable_bed.beds.leggett_okin import (
     okin_store_program,
     parse_leggett_okin_feedback,
 )
+from custom_components.adjustable_bed.beds.leggett_okin_evidence import CREDIT_WINDOW
 from custom_components.adjustable_bed.beds.leggett_okin_hold import LeggettOkinCommands
 from custom_components.adjustable_bed.button import BUTTON_DESCRIPTIONS, _should_add_button
 from custom_components.adjustable_bed.const import (
@@ -126,6 +134,67 @@ def _hold_coordinator(
     )
     coordinator.hold_reconstructor = MagicMock()
     return coordinator
+
+
+def _streaming_coordinator(hass: HomeAssistant) -> MagicMock:
+    """Return a coordinator double a controller's own streamer can run on.
+
+    It carries the real hass, so the stream's clock is the loop's and a pump
+    sleep fires when a test fires the time, and a revision-1 link whose writes
+    a test reads back.
+    """
+    coordinator = _hold_coordinator()
+    coordinator.hass = hass
+    coordinator.address = "AA:BB:CC:DD:EE:FF"
+    coordinator.async_disconnect = AsyncMock()
+    coordinator.client = SimpleNamespace(
+        is_connected=True,
+        services=[
+            SimpleNamespace(
+                uuid=LEGGETT_OKIN_SERVICE_UUID,
+                characteristics=[
+                    SimpleNamespace(uuid=LEGGETT_OKIN_CHAR_UUID),
+                    SimpleNamespace(uuid=LEGGETT_OKIN_REVISION_SELECTOR_CHAR_UUID),
+                ],
+            )
+        ],
+        write_gatt_char=AsyncMock(),
+    )
+    return coordinator
+
+
+def _written(coordinator: MagicMock) -> list[tuple[bytes, bool]]:
+    """Return every frame the link was handed, with whether it was confirmed."""
+    return [
+        (written.args[1], written.kwargs["response"])
+        for written in coordinator.client.write_gatt_char.await_args_list
+    ]
+
+
+async def _settle_stream() -> None:
+    """Let the pump and the write tasks it started run to the next sleep."""
+    for _ in range(16):
+        await asyncio.sleep(0)
+
+
+async def _wake_until(hass: HomeAssistant, reached: Callable[[], bool]) -> None:
+    """Fire the pump's wakes one at a time until reached() answers, or give up loudly."""
+    for _ in range(30):
+        if reached():
+            return
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=1))
+        await _settle_stream()
+    raise AssertionError("the stream did not get there in 30 wakes")
+
+
+@pytest.fixture
+async def streaming_okin(hass: HomeAssistant):
+    """Return an Okin controller streaming on a coordinator double, released at the end."""
+    coordinator = _streaming_coordinator(hass)
+    controller = LeggettOkinController(coordinator)
+    yield controller, coordinator
+    controller.release_wire()
+    await _settle_stream()
 
 
 @pytest.fixture
@@ -527,6 +596,134 @@ class TestLeggettOkinController:
 
         assert controller._streamer.calls == ["release_wire", "run_operation"]
         assert controller._streamer.operations == [okin_dummy_program()]
+
+    async def test_a_receipt_blackout_pays_one_barrier_per_cycle_and_never_trips(
+        self, hass: HomeAssistant, streaming_okin
+    ):
+        """deficit-trip-barrier: a box that stops answering gets confirmed writes, not an end.
+
+        No receipt arrives, so the credit gate stalls every eight frames. Each
+        stall's completion refills credit and clears the deficit, so the guard,
+        which trips later than the gate stalls, is never reached while writes
+        complete.
+        """
+        controller, coordinator = streaming_okin
+        head_up = bytes.fromhex("040200000001")
+        cycle = [(head_up, False)] * CREDIT_WINDOW + [(head_up, True)]
+
+        controller.hold({Control("motor-head-up"): hass.loop.time() + 30})
+        await _settle_stream()
+        await _wake_until(hass, lambda: len(_written(coordinator)) == 3 * len(cycle))
+
+        assert _written(coordinator) == cycle * 3
+        stream = controller.protocol_diagnostics["hold_stream"]
+        assert stream["stalls"] == 3
+        assert stream["trips"] == 0
+        assert stream["sick"] is False
+        coordinator.async_disconnect.assert_not_called()
+
+    async def test_a_barrier_a_stop_abandoned_does_not_shut_the_next_hold_out(
+        self, hass: HomeAssistant, streaming_okin
+    ):
+        """deficit-trip-barrier: the stop retires the barrier whose completion it cancelled.
+
+        The stop cancels the pump awaiting the barrier, so that completion never
+        reaches the feedback, and the release behind it fails. No confirmed
+        write completes, yet the next hold still reaches the wire, opening with a
+        barrier because the abandoned one proved nothing. It holds another motor
+        so that no clear floor stands between the stop and its first frame.
+        """
+        controller, coordinator = streaming_okin
+        feet_up = bytes.fromhex("040200000004")
+        confirmed_writes = "hang"
+
+        async def script_confirmed_writes(uuid: str, frame: bytes, *, response: bool) -> None:
+            del uuid, frame
+            if response and confirmed_writes == "hang":
+                await asyncio.get_running_loop().create_future()
+            if response and confirmed_writes == "refuse":
+                raise ConnectionError("the link refused the write")
+
+        coordinator.client.write_gatt_char.side_effect = script_confirmed_writes
+        controller.hold({Control("motor-head-up"): hass.loop.time() + 30})
+        await _settle_stream()
+        await _wake_until(hass, lambda: len(_written(coordinator)) == CREDIT_WINDOW + 1)
+
+        confirmed_writes = "refuse"
+        controller.release_wire()
+        await _settle_stream()
+        written_after_stop = len(_written(coordinator))
+        confirmed_writes = "complete"
+        controller.hold({Control("motor-feet-up"): hass.loop.time() + 30})
+        await _settle_stream()
+        await _wake_until(
+            hass, lambda: len(_written(coordinator)) == written_after_stop + 2
+        )
+
+        assert _written(coordinator)[written_after_stop - 1 :] == [
+            (bytes.fromhex("040200000000"), True),
+            (feet_up, True),
+            (feet_up, False),
+        ]
+        assert controller.protocol_diagnostics["hold_stream"]["sick"] is False
+
+    async def test_a_failed_barrier_write_releases_and_disconnects(
+        self, hass: HomeAssistant, streaming_okin, caplog: pytest.LogCaptureFixture
+    ):
+        """stop-on-lost-evidence: the one stream path that still ends the link."""
+        controller, coordinator = streaming_okin
+
+        async def refuse_confirmed_writes(uuid: str, frame: bytes, *, response: bool) -> None:
+            del uuid, frame
+            if response:
+                raise ConnectionError("the link refused the write")
+
+        coordinator.client.write_gatt_char.side_effect = refuse_confirmed_writes
+
+        with caplog.at_level(logging.WARNING):
+            controller.hold({Control("motor-head-up"): hass.loop.time() + 30})
+            await _settle_stream()
+            await _wake_until(hass, lambda: coordinator.async_disconnect.await_count == 1)
+
+        assert _written(coordinator)[-2:] == [
+            (bytes.fromhex("040200000001"), True),
+            (bytes.fromhex("040200000000"), True),
+        ]
+        assert controller.protocol_diagnostics["hold_stream"]["sick"] is True
+        assert "failed a confirmed stream write; disconnecting" in caplog.text
+
+    @pytest.mark.parametrize(
+        "disconnect",
+        [{"return_value": False}, {"side_effect": RuntimeError("the proxy dropped it")}],
+        ids=["link-stays-up", "disconnect-raises"],
+    )
+    async def test_a_disconnect_that_leaves_the_link_up_warns_once_and_retries_nothing(
+        self,
+        hass: HomeAssistant,
+        streaming_okin,
+        caplog: pytest.LogCaptureFixture,
+        disconnect: dict,
+    ):
+        """stop-on-lost-evidence: the stream stays fenced until the link ends, and says so."""
+        controller, coordinator = streaming_okin
+        coordinator.async_disconnect = AsyncMock(**disconnect)
+        fenced = "its hold stream stays stopped until the link ends"
+
+        async def refuse_confirmed_writes(uuid: str, frame: bytes, *, response: bool) -> None:
+            del uuid, frame
+            if response:
+                raise ConnectionError("the link refused the write")
+
+        coordinator.client.write_gatt_char.side_effect = refuse_confirmed_writes
+
+        with caplog.at_level(logging.WARNING):
+            controller.hold({Control("motor-head-up"): hass.loop.time() + 30})
+            await _settle_stream()
+            await _wake_until(hass, lambda: fenced in caplog.text)
+            await _settle_stream()
+
+        assert coordinator.async_disconnect.await_count == 1
+        assert caplog.text.count(fenced) == 1
 
     async def test_a_status_notification_is_a_receipt_and_a_cue_transition(self):
         """receipts-positive-only: only the main status channel answers frames."""
