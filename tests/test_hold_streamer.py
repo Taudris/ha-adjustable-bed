@@ -169,6 +169,7 @@ class _Feedback:
         self.cue_is_met = False
         self.sends: list[bool] = []
         self.confirmations: list[int] = []
+        self.abandoned = 0
         self.lifecycles = 0
 
     def begin_lifecycle(self) -> None:
@@ -189,6 +190,10 @@ class _Feedback:
         """Record one completion."""
         del now
         self.confirmations.append(sent_since)
+
+    def abandon_barrier(self) -> None:
+        """Count one barrier whose completion the streamer stopped awaiting."""
+        self.abandoned += 1
 
     def begin_cue(self, cue: CueRequest) -> None:
         """Start a cue, forgetting whatever the previous stage saw."""
@@ -348,6 +353,22 @@ class TestHaApiOnly:
         await _settle()
 
         assert len(bench.feedback.confirmations) == 2
+
+    async def test_a_barrier_the_stop_cancels_is_abandoned_to_the_feedback(
+        self, bench: _Bench
+    ):
+        """ha-api-only: a completion the pump stops awaiting can never reach the feedback."""
+        assert bench.feedback is not None
+        bench.feedback.verdict = SendVerdict.WRITE_REQUEST_BARRIER
+        bench.writer.hold_completions = True
+        bench.hold(HEAD_UP)
+        await bench.start()
+
+        bench.streamer.release_wire()
+        await _settle()
+
+        assert bench.feedback.abandoned == 1
+        assert bench.feedback.confirmations == []
 
     async def test_no_path_cancels_a_submitted_frame(self, bench: _Bench):
         """ha-api-only: a submitted frame is irrevocable, so no member withdraws one."""
@@ -632,6 +653,22 @@ class TestLostEvidenceEndsTheStream:
 
         assert bench.frames == frames_at_exit
         assert bench.sick_exits == 1
+
+    async def test_a_stage_after_the_exit_is_refused_at_once(self, bench: _Bench):
+        """stop-on-lost-evidence: a fenced stream answers the caller rather than holding it.
+
+        Nothing on this link runs the operation, and the controller's disconnect
+        can leave the link up, so an outcome left to that disconnect could hold a
+        stop's disarming press, and the command lock under it, indefinitely.
+        """
+        await _fail_a_barrier_mid_hold(bench)
+        frames_at_exit = list(bench.frames)
+
+        with pytest.raises(ConnectionError, match="refused the write"):
+            bench.streamer.stage(_store_program())
+        await bench.ticks(3)
+
+        assert bench.frames == frames_at_exit
 
 
 class TestLinkLostTeardown:
