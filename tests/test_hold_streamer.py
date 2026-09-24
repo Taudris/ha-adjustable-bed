@@ -167,7 +167,6 @@ class _Feedback:
         self.cue: CueRequest | None = None
         self.cues_begun: list[CueRequest] = []
         self.cue_is_met = False
-        self.sick = False
         self.sends: list[bool] = []
         self.confirmations: list[int] = []
         self.lifecycles = 0
@@ -190,11 +189,6 @@ class _Feedback:
         """Record one completion."""
         del now
         self.confirmations.append(sent_since)
-
-    def is_sick(self, now: float) -> bool:
-        """Return the scripted sickness."""
-        del now
-        return self.sick
 
     def begin_cue(self, cue: CueRequest) -> None:
         """Start a cue, forgetting whatever the previous stage saw."""
@@ -579,8 +573,8 @@ class TestFrameIsTheOr:
         assert bench.streamer.diagnostics["lifecycle_open"] is True
 
 
-class TestDeficitStopsTheStream:
-    """deficit-stops-the-stream: the release, then the controller's own exit."""
+class TestLostEvidenceEndsTheStream:
+    """stop-on-lost-evidence: the release, then the controller's own exit."""
 
     async def test_a_failed_barrier_takes_the_sickness_exit(self, bench: _Bench):
         """stop-on-lost-evidence: the completion that clears the gate never comes.
@@ -615,21 +609,28 @@ class TestDeficitStopsTheStream:
     async def test_a_sick_stream_releases_and_then_tells_the_controller(
         self, bench: _Bench
     ):
-        """deficit-stops-the-stream: one exit, behind the release, once per link."""
-        feedback = bench.feedback
-        assert feedback is not None
-        bench.hold(HEAD_UP)
-        await bench.start()
-
-        feedback.sick = True
-        await bench.tick()
+        """stop-on-lost-evidence: one exit, behind the release."""
+        await _fail_a_barrier_mid_hold(bench)
 
         assert bench.sick_exits == 1
         assert bench.exit_frames[-1] == RELEASE.decode()
 
+    async def test_a_push_after_the_exit_sends_nothing_until_the_link_ends(
+        self, bench: _Bench
+    ):
+        """stop-on-lost-evidence: the sick flag fences the pump for the rest of the link.
+
+        The card refreshes its held set every 250 ms while the controller's
+        disconnect runs, and a frame carrying the held key after the release
+        would open a lifecycle that ends with the link rather than a release.
+        """
+        await _fail_a_barrier_mid_hold(bench)
+        frames_at_exit = list(bench.frames)
+
         bench.hold(HEAD_UP)
         await bench.ticks(3)
 
+        assert bench.frames == frames_at_exit
         assert bench.sick_exits == 1
 
 
@@ -1185,6 +1186,18 @@ def _store_program(ceiling_ms: int = 500) -> OperationProgram:
 def _names(controls: Iterable[Control]) -> list[str]:
     """Return control names, sorted, the way a frame reads."""
     return sorted(control.name for control in controls)
+
+
+async def _fail_a_barrier_mid_hold(bench: _Bench) -> None:
+    """Hold head-up, then fail the next wake's barrier write."""
+    feedback = bench.feedback
+    assert feedback is not None
+    bench.hold(HEAD_UP)
+    await bench.start()
+
+    feedback.verdict = SendVerdict.WRITE_REQUEST_BARRIER
+    bench.writer.fail_completions = True
+    await bench.tick()
 
 
 async def test_a_completed_operation_owes_no_recovery():

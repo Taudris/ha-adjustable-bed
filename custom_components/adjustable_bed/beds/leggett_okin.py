@@ -351,13 +351,13 @@ class LeggettOkinController(BedController, HoldCapable):
         )
 
     def _on_stream_sick(self) -> None:
-        """Order the disconnect a receipt blackout calls for.
+        """Order the disconnect a failed barrier write calls for.
 
         The streamer has already released the wire; only this class owns the
         link, so ending it is here.
         """
         _LOGGER.warning(
-            "Leggett Okin at %s stopped acknowledging frames; disconnecting",
+            "Leggett Okin at %s failed a confirmed stream write; disconnecting",
             self._coordinator.address,
         )
         self._coordinator.hass.async_create_task(self._coordinator.async_disconnect())

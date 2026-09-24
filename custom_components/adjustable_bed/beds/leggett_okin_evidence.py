@@ -2,10 +2,11 @@
 
 The box answers each frame it receives with a status notification. That receipt
 proves delivery and its absence proves nothing, so it drives exactly three
-things: how deep the stream may run ahead of itself (the credit gate), when a
-silent box must stop the stream (the deficit guard), and when a staged gesture
-has been acknowledged (the light-pulse counter). Nothing else reads a receipt,
-and no elapsed time returns credit.
+things: how deep the stream may run ahead of itself (the credit gate), when
+unacknowledged frames call for a confirmed write that proves the queue drained
+(the deficit guard), and when a staged gesture has been acknowledged (the
+light-pulse counter). Nothing else reads a receipt, and no elapsed time returns
+credit.
 
 ``OkinStreamFeedback`` puts the three behind the streamer's contract; the
 controller feeds it from its notification handler.
@@ -22,15 +23,17 @@ from ..hold_streamer import SendVerdict
 
 _LOGGER = logging.getLogger(__name__)
 
-# Credit never exceeds W, so in-flight depth does not either; W covers the
-# healthy receipt-spacing p99 of 200-310 ms at the 100 ms emission floor.
-CREDIT_WINDOW: Final = 4
+# Credit never exceeds W, so in-flight depth does not either. At the 100 ms
+# emission floor W spans 800 ms of receipt spacing against a healthy p99 of
+# 200-310 ms; a window of 4 is marginal under the measured receipt loss.
+CREDIT_WINDOW: Final = 8
 # Every Kth receipt returns one extra credit, so sustained pace survives receipt
 # loss up to 1/(K+1) = 10 %, about twice the measured 2.5-4.5 % band.
 CREDIT_EXTRA_EVERY: Final = 9
-# The deficit leaks one per second and trips at the entry's configured value.
+# The deficit leaks one per second. At the trip the next frame is a barrier,
+# whose completion clears the deficit.
 DEFICIT_LEAK_S: Final = 1.0
-DEFAULT_DEFICIT_TRIP: Final = 5
+DEFAULT_DEFICIT_TRIP: Final = 10
 # The box flashes the under-bed light as feedback, and publishes each change of
 # this bit as its own notification. A pulse is two transitions of it.
 LIGHT_STATE_BIT: Final = 0x00020000
@@ -129,11 +132,13 @@ class ReceiptCreditGate:
 
 
 class ReceiptDeficitGuard:
-    """Counts what the box has not acknowledged, and trips when it stops.
+    """Counts what the box has not acknowledged, and trips into a barrier.
 
     Every submitted frame adds one and every receipt clears one; one leaks per
-    second, so a healthy stream's transient never accumulates. Past the trip the
-    stream is over: the streamer releases and the controller disconnects.
+    second, so a healthy stream's transient never accumulates. At the trip the
+    next frame goes as a Write Request and nothing follows it until its
+    completion, which proves every earlier frame reached the box's ATT layer and
+    so clears the deficit. The stream goes on: a trip is flow control.
     """
 
     def __init__(self) -> None:
@@ -141,10 +146,23 @@ class ReceiptDeficitGuard:
         self._deficit = 0
         self._trip = DEFAULT_DEFICIT_TRIP
         self._last_leak: float | None = None
+        self._barrier_outstanding = False
+        self._trips = 0
 
     def use_trip(self, trip: int) -> None:
         """Adopt the trip the streamer latched for this wire lifecycle."""
         self._trip = trip
+
+    def before_send(self, now: float) -> SendVerdict:
+        """Return whether this wake may write, and how."""
+        if self._barrier_outstanding:
+            return SendVerdict.WITHHOLD
+        self._leak(now)
+        if self._deficit < self._trip:
+            return SendVerdict.WRITE_COMMAND
+        self._barrier_outstanding = True
+        self._trips += 1
+        return SendVerdict.WRITE_REQUEST_BARRIER
 
     def note_frame(self, now: float) -> None:
         """Count one frame the box has yet to acknowledge."""
@@ -156,15 +174,21 @@ class ReceiptDeficitGuard:
         self._leak(now)
         self._deficit = max(0, self._deficit - 1)
 
-    def is_sick(self, now: float) -> bool:
-        """Return True once the unacknowledged count passes the trip."""
+    def after_confirmation(self, now: float, *, sent_since: int) -> None:
+        """Clear the deficit a trip's barrier proved delivered.
+
+        Only the frames sent since the write was submitted stay unproven. A
+        completion the guard did not ask for clears nothing.
+        """
         self._leak(now)
-        return self._deficit >= self._trip
+        if self._barrier_outstanding:
+            self._barrier_outstanding = False
+            self._deficit = min(self._deficit, sent_since)
 
     @property
     def diagnostics(self) -> dict[str, Any]:
-        """Return the guard's state for the diagnostics download."""
-        return {"deficit": self._deficit, "trip": self._trip}
+        """Return the guard's state and trip counter for the diagnostics download."""
+        return {"deficit": self._deficit, "trip": self._trip, "trips": self._trips}
 
     def _leak(self, now: float) -> None:
         """Forgive one frame per elapsed second."""
@@ -253,9 +277,11 @@ class OkinStreamFeedback:
     def before_send(self, now: float) -> SendVerdict:
         """Return whether this wake may write, and how.
 
-        The first stall on a bed device is worth a warning; every later one is
-        a diagnostics counter. The gate counts them and this owner, which knows
-        the address, decides what to say about them.
+        The credit gate answers first; a Write Command it allows goes as the
+        barrier instead once the deficit guard has tripped. The first stall on
+        a bed device is worth a warning; every later one is a diagnostics
+        counter. The gate counts them and this owner, which knows the address,
+        decides what to say about them.
         """
         verdict = self._credit.before_send(now)
         if self._credit.take_first_stall() and self._address not in _WARNED_ADDRESSES:
@@ -264,6 +290,23 @@ class OkinStreamFeedback:
                 "Leggett Okin stream ran out of receipt credit on %s; the frame stream "
                 "pauses for one confirmed write. Repeated stalls mean the link is not "
                 "carrying the motion cadence",
+                self._address,
+            )
+        if verdict is SendVerdict.WRITE_COMMAND:
+            return self._deficit_verdict(now)
+        return verdict
+
+    def _deficit_verdict(self, now: float) -> SendVerdict:
+        """Return the guard's verdict, logging a trip at debug.
+
+        A trip is routine flow control, so it is a diagnostics counter and a
+        debug line, never a warning.
+        """
+        verdict = self._deficit.before_send(now)
+        if verdict is SendVerdict.WRITE_REQUEST_BARRIER:
+            _LOGGER.debug(
+                "Leggett Okin stream on %s reached its deficit trip; this frame goes as "
+                "a confirmed write, whose completion clears the deficit",
                 self._address,
             )
         return verdict
@@ -276,15 +319,7 @@ class OkinStreamFeedback:
     def after_confirmation(self, now: float, *, sent_since: int) -> None:
         """Account for a confirmed write completing, sent_since frames later."""
         self._credit.after_confirmation(now, sent_since=sent_since)
-
-    def is_sick(self, now: float) -> bool:
-        """Return True once the box has gone silent under a live stream.
-
-        A pure predicate: what a sick stream costs - the release, and the
-        disconnect the controller orders behind it - is the streamer's to
-        sequence, so nothing here reaches back into the controller.
-        """
-        return self._deficit.is_sick(now)
+        self._deficit.after_confirmation(now, sent_since=sent_since)
 
     def begin_cue(self, cue: CueRequest) -> None:
         """Start counting toward a stage's cue."""
