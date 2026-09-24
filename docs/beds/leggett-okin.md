@@ -155,13 +155,14 @@ confirmed it on a CU170.
 How far the stream may run ahead of the box is the box's own answer: it
 acknowledges each frame it receives with a status notification, and the
 integration spends one of eight credits per frame and takes one back per
-acknowledgement. At zero credit the next frame goes as a barrier: a confirmed
-write that nothing follows until it completes. Acknowledgements are positive
-evidence only: their absence advances nothing. When ten frames stand
-unacknowledged, net of one forgiven per second, the next frame also goes as a
-barrier. Any confirmed write's completion, a barrier's or the release's, proves
-every earlier frame reached the box, so credit refills, the unacknowledged count
-clears, and the stream goes on. If a barrier fails, the stream and the link end.
+acknowledgement. Acknowledgements are positive evidence only: their absence
+advances nothing. At zero credit the next frame goes as a barrier: a confirmed
+write that nothing follows until it completes. A confirmed write's completion, a
+barrier's or the release's, proves that write and every frame before it reached
+the box, so credit rises to eight less the frames sent after that write. The
+completion of the barrier, or of a write sent after it, clears the barrier and
+the stream goes on. If a barrier fails, the integration writes the release,
+stops the stream until the link ends, and disconnects.
 
 **A preset is a held key too**, not a burst. In hold mode the box travels while
 the key is down and stops at the release; in latch mode the box latches the

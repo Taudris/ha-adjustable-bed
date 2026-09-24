@@ -360,7 +360,11 @@ class OkinFrameWriter:
         task.add_done_callback(_log_unconfirmed_failure)
 
     def submit_confirmed(self, frame: bytes) -> Future[None]:
-        """Send frame as a Write Request, returning its completion."""
+        """Send frame as a Write Request, returning its completion.
+
+        The completion is the write's own task, so cancelling it drops a frame
+        still queued on the BLE lock and interrupts one being written.
+        """
         return self._start(frame, confirmed=True)
 
     def _start(self, frame: bytes, *, confirmed: bool) -> Task[None]:

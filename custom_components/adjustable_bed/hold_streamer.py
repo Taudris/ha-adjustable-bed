@@ -7,10 +7,8 @@ paced frames while anything is expressed, the press and clear floors, the
 deadlines, the staged operations, and the single release that ends it.
 
 A *wire lifecycle* runs from the first frame after an idle stream to the release
-frame that empties it. Everything latched at that edge - the streamer's press
-bookkeeping, and whatever the bed's feedback reads for itself - belongs to one
-lifecycle, so a change lands at the next one rather than under a press that is
-already running.
+frame that empties it, and the streamer's press bookkeeping belongs to one
+lifecycle.
 
 The streamer never reaches back into its controller: it holds one press-floor
 lookup, an encoder, a writer, a profile value, a clock and a feedback, and it
@@ -33,6 +31,7 @@ from asyncio import Future
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
+from functools import partial
 from typing import Any, Protocol
 
 from .hold_intent import Deadline
@@ -203,17 +202,14 @@ class FrameWriter(Protocol):
         """Send frame as a confirmed write, returning its completion.
 
         The streamer awaits that completion for the barrier and the benchmark,
-        and attaches a callback to the release's, which nothing waits on.
+        and attaches a callback to the release's, which nothing waits on. A
+        stop cancels the pump, and with it the completion the pump awaits.
         """
         ...
 
 
 class StreamFeedback(Protocol):
     """A bed's reading of its own notification channel."""
-
-    def begin_lifecycle(self) -> None:
-        """Take up a new wire lifecycle, latching whatever this feedback reads."""
-        ...
 
     def before_send(self, now: float) -> SendVerdict:
         """Return whether this wake may write, and how."""
@@ -224,7 +220,12 @@ class StreamFeedback(Protocol):
         ...
 
     def after_confirmation(self, now: float, *, sent_since: int) -> None:
-        """Account for a confirmed write completing, sent_since frames later."""
+        """Account for a confirmed write completing.
+
+        ``sent_since`` counts the frames ``after_send`` reported after that
+        write was submitted, whichever write it is: a barrier, a benchmark
+        frame or a release.
+        """
         ...
 
     def abandon_barrier(self) -> None:
@@ -247,9 +248,6 @@ class _ConfirmedWrites:
     round trip is the depth bound, and no stage advances on a cue the bed never
     reports.
     """
-
-    def begin_lifecycle(self) -> None:
-        """Latch nothing: this feedback reads no option."""
 
     def before_send(self, now: float) -> SendVerdict:
         """Let every wake write, confirmed, one at a time."""
@@ -330,7 +328,6 @@ class HoldStreamer:
         self._open = False
         self._sick = False
         self._frames = 0
-        self._sent_since_release = 0
         self._releases = 0
         self._withheld = 0
         self._outcomes: dict[str, int] = dict.fromkeys(OperationOutcome, 0)
@@ -611,9 +608,12 @@ class HoldStreamer:
         return sent_at
 
     async def _settle_write(
-        self, future: Future[None], key: int, *, barrier: bool
+        self, future: Future[None], frame_number: int, *, barrier: bool
     ) -> None:
         """Wait out a confirmed write, taking the sickness exit if it fails.
+
+        ``frame_number`` is the write's place in this link's frame count, which
+        is how its completion tells the feedback what went after it.
 
         A failed barrier is lost evidence, and lost evidence stops the stream
         (``stop-on-lost-evidence``): the completion that would have cleared the
@@ -626,7 +626,6 @@ class HoldStreamer:
         feedback, and a barrier nothing retires would withhold every later wake
         on this link.
         """
-        sent_before = self._sent_since_release
         try:
             await future
         except asyncio.CancelledError:
@@ -643,23 +642,26 @@ class HoldStreamer:
                 self._note_sick(err)
             return
         now = self._clock()
-        self._feedback.after_confirmation(now, sent_since=self._sent_since_release - sent_before)
+        self._feedback.after_confirmation(now, sent_since=self._frames - frame_number)
         if self._benchmark is not None:
-            self._benchmark.note_completion(key, now)
+            self._benchmark.note_completion(frame_number, now)
 
     def _write_release(self, now: float) -> None:
         """Write the one zero frame that ends a wire lifecycle."""
         future = self._writer.submit_confirmed(self._encoder.encode(frozenset()))
         self._open = False
-        self._sent_since_release = 0
         for control in self._presses:
             self._cleared_at[control] = now
         self._presses.clear()
         self._end_benchmark(now, "released")
-        future.add_done_callback(self._release_completed)
+        future.add_done_callback(partial(self._release_completed, self._frames))
 
-    def _release_completed(self, future: Future[None]) -> None:
+    def _release_completed(self, frames_before: int, future: Future[None]) -> None:
         """Hand the feedback what the release proved, ignoring a completion that failed.
+
+        ``frames_before`` is the frame count at the release's submission, so a
+        completion that arrives after a later release still counts every frame
+        sent after its own.
 
         The counter rises here rather than at submission, so the diagnostics
         number reads as the releases that reached the box rather than the ones
@@ -668,7 +670,7 @@ class HoldStreamer:
         if future.cancelled() or future.exception() is not None:
             return
         self._releases += 1
-        self._feedback.after_confirmation(self._clock(), sent_since=self._sent_since_release)
+        self._feedback.after_confirmation(self._clock(), sent_since=self._frames - frames_before)
 
     def _plan(self, now: float) -> FramePlan:
         """Return what this wake expresses, before anything is written."""
@@ -718,7 +720,6 @@ class HoldStreamer:
         """Book one submitted frame against the presses it carried."""
         if not self._open:
             self._open_lifecycle(frame)
-        self._sent_since_release += 1
         for control in plan.controls:
             press = self._presses.get(control)
             if press is None:
@@ -737,11 +738,9 @@ class HoldStreamer:
     def _open_lifecycle(self, frame: bytes) -> None:
         """Signal the lifecycle edge, and mark it open.
 
-        The streamer owns the edge; what a feedback latches at it - an option
-        it reads for itself, a counter it resets - is the feedback's own, and
-        what a controller records of it is the controller's.
+        The streamer owns the edge; what a controller records of it is the
+        controller's.
         """
-        self._feedback.begin_lifecycle()
         self._on_lifecycle_open(frame)
         self._open = True
 

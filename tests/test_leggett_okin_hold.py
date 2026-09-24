@@ -1,14 +1,15 @@
 """Tests for the CU170's hold surface.
 
-Its encoder and link-bound writer, and the three counters that read the box's
-own notifications: the receipt credit gate, the deficit guard and the light
-pulse counter behind a staged gesture's cue.
+Its encoder and link-bound writer, and the two counters that read the box's
+own notifications: the receipt credit gate and the light pulse counter behind a
+staged gesture's cue.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -17,12 +18,10 @@ from custom_components.adjustable_bed.beds.leggett_okin_evidence import (
     _WARNED_ADDRESSES,
     CREDIT_EXTRA_EVERY,
     CREDIT_WINDOW,
-    DEFAULT_DEFICIT_TRIP,
     LIGHT_STATE_BIT,
     LightPulseCounter,
     OkinStreamFeedback,
     ReceiptCreditGate,
-    ReceiptDeficitGuard,
 )
 from custom_components.adjustable_bed.beds.leggett_okin_hold import (
     CU170_STREAM_PROFILE,
@@ -58,7 +57,6 @@ FEET_UP = Control("motor-feet-up")
 LIGHT = Control("light-toggle")
 PING = Control("ping")
 RELEASE = bytes.fromhex("040200000000")
-EVIDENCE_LOGGER = "custom_components.adjustable_bed.beds.leggett_okin_evidence"
 
 SEND_UNCONFIRMED = SendVerdict.WRITE_COMMAND
 SEND_BARRIER = SendVerdict.WRITE_REQUEST_BARRIER
@@ -112,12 +110,11 @@ class TestCu170Constants:
 
 
 class TestReceiptEvidenceConstants:
-    """The window and the trip the receipt evidence runs under."""
+    """The window the receipt evidence runs under."""
 
-    def test_the_credit_window_is_eight_and_the_deficit_trip_ten(self):
-        """deficit-trip-barrier: moving either figure is a decision, so both are pinned."""
+    def test_the_credit_window_is_eight(self):
+        """receipt-paced-write-commands: moving the window is a decision, so it is pinned."""
         assert CREDIT_WINDOW == 8
-        assert DEFAULT_DEFICIT_TRIP == 10
 
 
 class TestOkinFrameEncoder:
@@ -234,6 +231,60 @@ class TestOkinFrameWriter:
         with pytest.raises(ConnectionError):
             await writer.submit_confirmed(RELEASE)
 
+    async def test_a_stop_drops_a_barrier_still_queued_on_the_lock(self):
+        """ha-api-only: a stop withdraws the barrier the pump awaits, and the release follows.
+
+        The pump awaits the write's own task, so cancelling the pump cancels a
+        barrier that has not reached the link yet. That barrier carries the same
+        keys as the frame before it, and the release queues directly behind it.
+        """
+        client = _client()
+        lock = asyncio.Lock()
+        streamer = _light_toggle_streamer(
+            OkinFrameWriter(
+                client=client, ble_lock=lock, characteristic_uuid=LEGGETT_OKIN_CHAR_UUID
+            )
+        )
+        await lock.acquire()
+        streamer.hold({LIGHT_TOGGLE: 10.0})
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        streamer.release_wire()
+        lock.release()
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        client.write_gatt_char.assert_awaited_once_with(
+            LEGGETT_OKIN_CHAR_UUID, RELEASE, response=True
+        )
+
+
+def _light_toggle_streamer(
+    writer: OkinFrameWriter, on_lifecycle_open: Callable[[bytes], None] = lambda frame: None
+) -> HoldStreamer:
+    """Return a revision-1 streamer over writer whose roster declares the light toggle.
+
+    It carries no feedback, so every frame it streams is a Write Request.
+    """
+    return HoldStreamer(
+        name="AA:BB",
+        press_floor=ControlRoster(
+            (
+                ControlDeclaration(
+                    control=LIGHT_TOGGLE,
+                    press_floor=PressFloor(frames=1, ms=0),
+                    hold=HoldSupport(ttl_max_ms=30000),
+                ),
+            )
+        ).press_floor,
+        encoder=OkinFrameEncoder(1),
+        writer=writer,
+        profile=CU170_STREAM_PROFILE,
+        clock=lambda: 0.0,
+        on_lifecycle_open=on_lifecycle_open,
+    )
+
 
 class TestStreamTraceEdge:
     """One command-trace entry per wire lifecycle, filed at the edge the streamer owns."""
@@ -241,23 +292,7 @@ class TestStreamTraceEdge:
     async def test_the_trace_records_the_frame_that_opened_the_lifecycle(self):
         """A per-frame trace would empty the coordinator's trace deque in ten seconds."""
         opened: list[bytes] = []
-        streamer = HoldStreamer(
-            name="AA:BB",
-            press_floor=ControlRoster(
-                (
-                    ControlDeclaration(
-                        control=LIGHT_TOGGLE,
-                        press_floor=PressFloor(frames=1, ms=0),
-                        hold=HoldSupport(ttl_max_ms=30000),
-                    ),
-                )
-            ).press_floor,
-            encoder=OkinFrameEncoder(1),
-            writer=_writer(_client()),
-            profile=CU170_STREAM_PROFILE,
-            clock=lambda: 0.0,
-            on_lifecycle_open=opened.append,
-        )
+        streamer = _light_toggle_streamer(_writer(_client()), on_lifecycle_open=opened.append)
 
         streamer.hold({LIGHT_TOGGLE: 10.0})
         await asyncio.sleep(0)
@@ -319,6 +354,62 @@ class TestReceiptCreditGate:
         assert gate.before_send(1.0) == SEND_BARRIER
         assert gate.diagnostics["stalls"] == 1
 
+    def test_nothing_leaves_under_the_barrier_until_it_completes(self):
+        """receipt-paced-write-commands: the barrier withholds every wake behind it."""
+        gate = ReceiptCreditGate()
+        for _ in range(CREDIT_WINDOW):
+            gate.after_send(0.0, confirmed=False)
+        assert gate.before_send(0.0) == SEND_BARRIER
+        gate.after_send(0.0, confirmed=True)
+
+        assert gate.before_send(0.1) is SendVerdict.WITHHOLD
+        assert gate.diagnostics["barrier_outstanding"] is True
+
+        gate.after_confirmation(0.2, sent_since=0)
+
+        assert gate.diagnostics["barrier_outstanding"] is False
+        assert gate.before_send(0.3) == SEND_UNCONFIRMED
+
+    def test_a_completion_from_before_the_barrier_leaves_it_standing(self):
+        """release-is-a-write-request: a completion proves its own write and what went before.
+
+        A stop wrote a release after seven frames, and the next hold sent one
+        more before it stalled. The release's completion proves the seven, so
+        credit rises to the window less the two frames sent after it, but it
+        proves nothing about the barrier that is one of those two.
+        """
+        gate = ReceiptCreditGate()
+        for _ in range(CREDIT_WINDOW):
+            gate.after_send(0.0, confirmed=False)
+        gate.before_send(1.0)
+        gate.after_send(1.0, confirmed=True)
+
+        gate.after_confirmation(1.1, sent_since=2)
+
+        assert gate.diagnostics["credit"] == CREDIT_WINDOW - 2
+        assert gate.diagnostics["barrier_outstanding"] is True
+        assert gate.diagnostics["clears"] == 0
+        assert gate.before_send(1.2) is SendVerdict.WITHHOLD
+
+    def test_an_abandoned_barrier_moves_no_count(self):
+        """receipt-paced-write-commands: a completion nobody awaits proves nothing.
+
+        The next wake asks afresh, and credit still at zero calls for a new
+        barrier.
+        """
+        gate = ReceiptCreditGate()
+        for _ in range(CREDIT_WINDOW):
+            gate.after_send(0.0, confirmed=False)
+        gate.before_send(1.0)
+        gate.after_send(1.0, confirmed=True)
+
+        gate.abandon_barrier()
+
+        assert gate.diagnostics["barrier_outstanding"] is False
+        assert gate.diagnostics["clears"] == 0
+        assert gate.before_send(1.1) == SEND_BARRIER
+        assert gate.diagnostics["stalls"] == 2
+
     def test_the_barriers_completion_resets_credit_and_times_the_clear(self):
         """receipt-paced-write-commands: the clear and its duration reach diagnostics."""
         gate = ReceiptCreditGate()
@@ -368,96 +459,13 @@ class TestReceiptCreditGate:
         assert gate.take_first_stall() is True
         assert gate.take_first_stall() is False
 
+        gate.after_send(1.0, confirmed=True)
         gate.after_confirmation(1.1, sent_since=0)
         for _ in range(CREDIT_WINDOW):
             gate.after_send(1.2, confirmed=False)
         gate.before_send(1.3)
 
         assert gate.take_first_stall() is False
-
-
-def _tripped_guard() -> ReceiptDeficitGuard:
-    """Return a guard at a trip of 5 whose barrier has just been submitted."""
-    guard = ReceiptDeficitGuard()
-    guard.use_trip(5)
-    for _ in range(5):
-        guard.note_frame(0.0)
-    assert guard.before_send(0.0) == SEND_BARRIER
-    guard.note_frame(0.0)
-    return guard
-
-
-class TestReceiptDeficitGuard:
-    """deficit-trip-barrier: receipt absence asks for a confirmed write, never an end."""
-
-    def test_a_silent_box_trips_the_guard_into_a_barrier(self):
-        """deficit-trip-barrier: the wake at the trip sends its frame as a Write Request."""
-        guard = ReceiptDeficitGuard()
-        guard.use_trip(5)
-
-        for _ in range(4):
-            guard.note_frame(0.0)
-        assert guard.before_send(0.0) == SEND_UNCONFIRMED
-
-        guard.note_frame(0.0)
-
-        assert guard.before_send(0.0) == SEND_BARRIER
-        assert guard.diagnostics["trips"] == 1
-
-    def test_the_barriers_completion_clears_the_deficit(self):
-        """deficit-trip-barrier: the completion proves every earlier frame arrived."""
-        guard = _tripped_guard()
-
-        guard.after_confirmation(0.2, sent_since=0)
-
-        assert guard.diagnostics["deficit"] == 0
-        assert guard.before_send(0.3) == SEND_UNCONFIRMED
-        assert guard.diagnostics["trips"] == 1
-
-    def test_any_completion_lowers_the_deficit_to_what_went_after_it(self):
-        """deficit-trip-barrier: a credit barrier or a release proves what a trip's would."""
-        guard = ReceiptDeficitGuard()
-        guard.use_trip(5)
-        for _ in range(4):
-            guard.note_frame(0.0)
-
-        guard.after_confirmation(0.0, sent_since=1)
-
-        assert guard.diagnostics["deficit"] == 1
-
-    def test_receipts_and_the_leak_keep_a_healthy_stream_clear(self):
-        """deficit-trip-barrier: a healthy transient never accumulates."""
-        guard = ReceiptDeficitGuard()
-        guard.use_trip(5)
-
-        now = 0.0
-        for _ in range(40):
-            guard.note_frame(now)
-            guard.note_receipt(now)
-            now += 0.1
-
-        assert guard.before_send(now) == SEND_UNCONFIRMED
-        assert guard.diagnostics["deficit"] == 0
-
-    def test_one_frame_leaks_per_second(self):
-        """deficit-guard: the leak is a design constant, not a receipt."""
-        guard = ReceiptDeficitGuard()
-        guard.use_trip(5)
-        for _ in range(4):
-            guard.note_frame(0.0)
-
-        assert guard.before_send(2.0) == SEND_UNCONFIRMED
-        assert guard.diagnostics["deficit"] == 2
-
-    def test_the_trip_is_the_latched_option(self):
-        """options-latch-per-lifecycle: the guard tests against what was latched."""
-        guard = ReceiptDeficitGuard()
-        guard.use_trip(15)
-
-        for _ in range(14):
-            guard.note_frame(0.0)
-
-        assert guard.before_send(0.0) == SEND_UNCONFIRMED
 
 
 class TestLightPulseCounter:
@@ -511,13 +519,13 @@ class TestLightPulseCounter:
 
 
 class TestOkinStreamFeedback:
-    """One notification feeds all three counters, and the owner decides what to say."""
+    """One notification feeds both counters, and the owner decides what to say."""
 
     def test_the_first_stall_per_bed_device_warns(self, caplog):
         """receipt-paced-write-commands: one warning per bed device per HA start."""
         with caplog.at_level(logging.WARNING):
             for _ in range(2):
-                feedback = OkinStreamFeedback("AA:BB", lambda: 5)
+                feedback = OkinStreamFeedback("AA:BB")
                 for _ in range(CREDIT_WINDOW):
                     feedback.after_send(0.0, confirmed=False)
                 feedback.before_send(1.0)
@@ -527,115 +535,17 @@ class TestOkinStreamFeedback:
 
     def test_a_notification_is_a_receipt_and_a_cue_transition(self):
         """receipts-positive-only: presence is what the box's answer proves."""
-        feedback = OkinStreamFeedback("AA:BB", lambda: 5)
-        feedback.begin_lifecycle()
+        feedback = OkinStreamFeedback("AA:BB")
         feedback.after_send(0.0, confirmed=False)
         feedback.begin_cue(CueRequest(1))
 
-        feedback.note_notification(0, 0.0)
-        feedback.note_notification(LIGHT_STATE_BIT, 0.0)
-        feedback.note_notification(0, 0.0)
+        feedback.note_notification(0)
+        feedback.note_notification(LIGHT_STATE_BIT)
+        feedback.note_notification(0)
 
         assert feedback.cue_met() is True
-        assert feedback.diagnostics["deficit"] == 0
-        assert feedback.diagnostics["receipts"] == 3
-
-    def test_a_running_lifecycle_keeps_the_value_it_read(self):
-        """options-latch-per-lifecycle: the feedback reads its own option at the edge."""
-        trip = 5
-        feedback = OkinStreamFeedback("AA:BB", lambda: trip)
-        feedback.begin_lifecycle()
-        trip = 12
-
-        for _ in range(5):
-            feedback.after_send(0.0, confirmed=False)
-
-        assert feedback.before_send(0.0) == SEND_BARRIER
-        assert feedback.diagnostics["trip"] == 5
-
-        feedback.begin_lifecycle()
-
-        assert feedback.diagnostics["trip"] == 12
-
-    def test_a_trip_is_a_barrier_a_counter_and_a_debug_line(self, caplog):
-        """deficit-trip-barrier: routine flow control, so nothing warns.
-
-        Credit still stands at the trip, so the barrier is the guard's alone
-        and no stall is counted beside it.
-        """
-        feedback = OkinStreamFeedback("AA:BB", lambda: 5)
-        feedback.begin_lifecycle()
-        for _ in range(5):
-            feedback.after_send(0.0, confirmed=False)
-
-        with caplog.at_level(logging.DEBUG, logger=EVIDENCE_LOGGER):
-            verdict = feedback.before_send(0.0)
-
-        assert verdict == SEND_BARRIER
-        assert feedback.diagnostics["trips"] == 1
-        assert feedback.diagnostics["stalls"] == 0
-        levels = [record.levelno for record in caplog.records if record.name == EVIDENCE_LOGGER]
-        assert levels == [logging.DEBUG]
-
-    def test_the_trips_completion_clears_the_deficit_and_refills_credit(self):
-        """deficit-trip-barrier: credit follows the completion rule it always had."""
-        feedback = OkinStreamFeedback("AA:BB", lambda: 5)
-        feedback.begin_lifecycle()
-        for _ in range(5):
-            feedback.after_send(0.0, confirmed=False)
-        feedback.before_send(0.0)
-        feedback.after_send(0.0, confirmed=True)
-
-        feedback.after_confirmation(0.2, sent_since=0)
-
-        assert feedback.diagnostics["deficit"] == 0
         assert feedback.diagnostics["credit"] == CREDIT_WINDOW
-        assert feedback.before_send(0.3) == SEND_UNCONFIRMED
-
-    def test_a_stalls_completion_clears_the_deficit_too(self):
-        """deficit-trip-barrier: one barrier state, so a stall leaves no trip behind it.
-
-        With no receipt, credit runs out before the deficit reaches its trip.
-        The stall's completion proves what a trip's would, so the stream pays
-        one barrier per credit window rather than a stall and a trip.
-        """
-        feedback = OkinStreamFeedback("AA:BB")
-        feedback.begin_lifecycle()
-        for _ in range(CREDIT_WINDOW):
-            feedback.after_send(0.0, confirmed=False)
-        assert feedback.before_send(0.0) == SEND_BARRIER
-        feedback.after_send(0.0, confirmed=True)
-
-        assert feedback.before_send(0.1) is SendVerdict.WITHHOLD
-
-        feedback.after_confirmation(0.2, sent_since=0)
-
-        assert feedback.diagnostics["deficit"] == 0
-        assert feedback.before_send(0.3) == SEND_UNCONFIRMED
-        assert feedback.diagnostics["trips"] == 0
-
-    def test_a_release_completing_under_a_trip_barrier_retires_it(self):
-        """deficit-trip-barrier: any confirmed completion retires the one barrier state.
-
-        A stop cancels the pump awaiting a trip's barrier, and the release is
-        the next write to complete. Its completion proves what the barrier's
-        would have, so the count clears and the next wake writes.
-        """
-        feedback = OkinStreamFeedback("AA:BB", lambda: 5)
-        feedback.begin_lifecycle()
-        for _ in range(5):
-            feedback.after_send(0.0, confirmed=False)
-        assert feedback.before_send(0.0) == SEND_BARRIER
-        feedback.after_send(0.0, confirmed=True)
-
-        assert feedback.before_send(0.1) is SendVerdict.WITHHOLD
-        assert feedback.diagnostics["barrier_outstanding"] is True
-
-        feedback.after_confirmation(0.2, sent_since=0)
-
-        assert feedback.diagnostics["barrier_outstanding"] is False
-        assert feedback.diagnostics["deficit"] == 0
-        assert feedback.before_send(0.3) == SEND_UNCONFIRMED
+        assert feedback.diagnostics["receipts"] == 3
 
 
 class TestOkinStageLists:
