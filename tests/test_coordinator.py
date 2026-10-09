@@ -7613,6 +7613,12 @@ class _HoldingController(HoldCapable):
         """Stand in for the controller teardown the disconnect path runs."""
         self.calls.append("stop_notify")
 
+    def on_disconnect(self) -> None:
+        """Stand in for the hook the drop callback runs on every controller."""
+
+    def invalidate_diagnostics(self) -> None:
+        """Stand in for the hook the disconnect path runs on every controller."""
+
 
 def _disconnect_after_command_entry(hass: HomeAssistant, entry_id: str) -> MockConfigEntry:
     """Return an added entry that disconnects as soon as a command finishes."""
