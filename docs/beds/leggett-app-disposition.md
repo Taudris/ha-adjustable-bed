@@ -58,7 +58,7 @@ checks in `tests/test_leggett.py::TestLeggettOkinController` demonstrate:
   `test_revision_one_framing_selected_when_selector_is_present`: normal R0/R1
   bytes and characteristic-presence selection.
 - `test_motor_surface_matches_cu170_actuators`,
-  `test_motor_streams_then_sends_four_release_frames`, and
+  `test_motor_streams_then_sends_one_confirmed_release`, and
   `test_motor_stream_uses_the_proven_pulse_delay`: CE actuator commands and
   normal 100 ms held/release cadence.
 - `test_favorites_match_the_prodigy_ce_model` and
@@ -69,7 +69,7 @@ checks in `tests/test_leggett.py::TestLeggettOkinController` demonstrate:
 - `test_feedback_parser_matches_frozen_apk_vectors` and
   `test_status_channels_are_subscribed_and_settings_initialized`: existing
   LED/status transforms and optional settings initialization bytes.
-- `test_light_and_massage_taps_end_with_a_release_burst` and
+- `test_light_and_massage_taps_end_with_a_release_frame` and
   `test_massage_wave_mode_is_advertised_and_sends_release`: existing CE light,
   power, intensity and wave commands with release cleanup.
 
@@ -324,9 +324,11 @@ anti-snore button can use that special favorite path while the bounded service
 covers the separately reachable held Snore control.
 
 A successful favorite recall does not acquire a new zero tail from ordinary
-idle. The four-zero normal release is nevertheless the proven stop value for
-canceling or failing a partial movement. Cleanup uses a fresh cancellation
-event and completes while the coordinator still owns the command lock.
+idle. The zero release is nevertheless the proven stop value for canceling or
+failing a partial movement: four frames on the profiles that keep the app's
+shape, and one confirmed frame on Prodigy CE / CU170. Cleanup uses a fresh
+cancellation event and completes while the coordinator still owns the command
+lock.
 
 ### Narrow post-freeze clarification: Prodigy sleep bounds
 

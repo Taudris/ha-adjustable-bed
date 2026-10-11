@@ -39,11 +39,19 @@ def make_controller(profile: str = "prodigy4", revision: int = 1) -> LeggettOkin
         start_notify=AsyncMock(),
         stop_notify=AsyncMock(),
         read_gatt_char=AsyncMock(),
+        write_gatt_char=AsyncMock(),
     )
     controller = LeggettOkinController(coordinator, app_profile=profile)
     controller.write_command = AsyncMock()
     controller._wait_hold_deadline = AsyncMock()
     return controller
+
+
+def assert_released_once(controller: LeggettOkinController, frame: str = "040200000000") -> None:
+    """Assert the command ended with exactly one zero frame, written as a request."""
+    controller.client.write_gatt_char.assert_awaited_once_with(
+        LEGGETT_OKIN_CHAR_UUID, bytes.fromhex(frame), response=True
+    )
 
 
 @pytest.mark.parametrize(
@@ -135,14 +143,14 @@ async def test_prodigy_snore_has_distinct_recall_and_held_paths():
     )
     controller.write_command.reset_mock()
     await controller.hold_control("snore", 500)
-    press, release = controller.write_command.await_args_list
+    press = controller.write_command.await_args
     assert press.args[0] == bytes.fromhex("040200004000")
     assert press.kwargs["repeat_count"] == 5
-    assert release.kwargs["repeat_count"] == 4
+    assert_released_once(controller)
 
 
 @pytest.mark.parametrize("interruption", ["cancel_event", "task_cancel", "write_failure"])
-async def test_interrupted_recall_sends_proven_release_with_fresh_event(interruption):
+async def test_interrupted_recall_releases_with_a_fresh_cancel_event(interruption):
     controller = make_controller()
 
     async def interrupt(packet, **kwargs):
@@ -160,10 +168,9 @@ async def test_interrupted_recall_sends_proven_release_with_fresh_event(interrup
     else:
         with pytest.raises(asyncio.CancelledError if interruption == "task_cancel" else BleakError):
             await controller.preset_memory(1)
-    release = controller.write_command.await_args_list[-1]
-    assert release.args[0] == bytes.fromhex("040200000000")
-    assert release.kwargs["repeat_count"] == 4
-    assert not release.kwargs["cancel_event"].is_set()
+    # A cancelled recall still releases, so the zero frame cannot be riding the
+    # coordinator's cancel event.
+    assert_released_once(controller)
 
 
 async def test_invalid_held_controls_and_durations_never_write():
@@ -237,6 +244,7 @@ async def test_hold_waits_until_requested_release_time(duration_ms):
         times.append(asyncio.get_running_loop().time())
 
     controller.write_command = AsyncMock(side_effect=record_write)
+    controller.client.write_gatt_char = AsyncMock(side_effect=record_write)
     started = asyncio.get_running_loop().time()
     await controller.hold_control("snore", duration_ms)
     assert times[-1] - started >= duration_ms / 1000 - 0.01
@@ -249,7 +257,8 @@ async def test_hold_deadline_is_cancellable():
     controller._coordinator.cancel_command.set()
     async with asyncio.timeout(0.2):
         await controller.hold_control("snore", 60000)
-    assert not controller.write_command.await_args_list[-1].kwargs["cancel_event"].is_set()
+    # The cancelled hold still releases, so the zero frame carries its own event.
+    assert_released_once(controller)
 
 
 async def test_cancelled_settings_initialization_is_retried_after_cancellation_clears():
@@ -321,16 +330,12 @@ async def test_ce_stop_interrupts_latched_operation_even_after_cancellation(revi
     controller = make_controller(revision=revision)
     controller._coordinator.cancel_command.set()
     await controller.stop_all()
-    interrupt, release = controller.write_command.await_args_list
+    interrupt = controller.write_command.await_args
     assert interrupt.args == (
         bytes.fromhex("e5fe160004000002" if revision == 0 else "040200040000"),
     )
     assert not interrupt.kwargs["cancel_event"].is_set()
-    assert release.args == (
-        bytes.fromhex("e5fe160000000006" if revision == 0 else "040200000000"),
-    )
-    assert release.kwargs["repeat_count"] == 4
-    assert not release.kwargs["cancel_event"].is_set()
+    assert_released_once(controller, "e5fe160000000006" if revision == 0 else "040200000000")
 
 
 @pytest.mark.parametrize("profile", ["prodigy2l", "prodigy2", "useries"])
@@ -338,15 +343,19 @@ async def test_other_profiles_stop_with_release_only(profile):
     controller = make_controller(profile)
     await controller.stop_all()
     assert controller.write_command.await_count == 1
-    assert controller.write_command.await_args.args == (bytes.fromhex("040200000000"),)
+    release = controller.write_command.await_args
+    assert release.args == (bytes.fromhex("040200000000"),)
+    assert release.kwargs["repeat_count"] == 4
+    controller.client.write_gatt_char.assert_not_awaited()
 
 
 async def test_failed_ce_stop_still_releases_and_preserves_interrupt_error():
     controller = make_controller()
-    controller.write_command.side_effect = [BleakError("interrupt failed"), BleakError("release failed")]
+    controller.write_command.side_effect = BleakError("interrupt failed")
+    controller.client.write_gatt_char.side_effect = BleakError("release failed")
     with pytest.raises(BleakError, match="interrupt failed"):
         await controller.stop_all()
-    assert controller.write_command.await_count == 2
+    controller.client.write_gatt_char.assert_awaited_once()
 
 
 @pytest.mark.parametrize("profile", ["prodigy4", "useries"])
@@ -386,7 +395,7 @@ async def test_slow_transport_does_not_extend_held_refresh_past_deadline():
     assert all(instant < started + 0.3 for instant in timestamps)
     release = controller._write_gatt_with_retry.await_args_list[-1]
     assert release.args[1] == bytes.fromhex("040200000000")
-    assert release.kwargs["repeat_count"] == 4
+    assert release.kwargs["response"] is True
 
 
 async def test_control_mode_zero_waits_for_the_next_tick_after_55_attempts():
@@ -666,11 +675,7 @@ async def test_tap_cancelled_while_holding_the_press_still_releases():
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert controller.write_command.await_count == 2
-    release = controller.write_command.await_args_list[-1]
-    assert release.args[0] == bytes.fromhex("040200000000")
-    assert release.kwargs["repeat_count"] == 4
-    assert not release.kwargs["cancel_event"].is_set()
+    assert_released_once(controller)
 
 
 async def test_light_confirmation_survives_the_receipt_anchored_tap():
@@ -684,12 +689,13 @@ async def test_light_confirmation_survives_the_receipt_anchored_tap():
     released = asyncio.Event()
 
     async def press(packet, **kwargs):
-        if packet == bytes.fromhex("040200000000"):
-            released.set()
-            return
         report_cu170(controller, 0)  # The receipt carries the pre-toggle state.
 
+    async def release(uuid, packet, **kwargs):
+        released.set()
+
     controller.write_command.side_effect = press
+    controller.client.write_gatt_char.side_effect = release
 
     task = asyncio.create_task(controller.lights_on())
     async with asyncio.timeout(1):
