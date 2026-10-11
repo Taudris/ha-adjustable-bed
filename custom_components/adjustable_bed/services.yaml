@@ -78,10 +78,7 @@ goto_preset:
     preset:
       required: true
       selector:
-        number:
-          min: 1
-          max: 8
-          mode: box
+        text:
     duration:
       required: false
       selector:
@@ -2022,3 +2019,27 @@ sleeptracker_relaxation:
       selector:
         select:
           options: [wind_down_1, wind_down_2, local_animation]
+
+send_intents:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: adjustable_bed
+          multiple: false
+    sender_id:
+      required: true
+      selector:
+        text:
+    seq:
+      required: true
+      selector:
+        number:
+          min: 0
+          mode: box
+    samples:
+      required: true
+      example: "[{\"intent_id\": \"c0ffee\", \"control\": \"motor-head-up\", \"action\": {\"kind\": \"hold\", \"ttl_ms\": 800}}, {\"intent_id\": \"decaf\", \"control\": \"light-toggle\", \"action\": {\"kind\": \"activate\"}}]"
+      selector:
+        object:

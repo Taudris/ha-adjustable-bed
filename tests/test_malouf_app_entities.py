@@ -16,6 +16,7 @@ from custom_components.adjustable_bed.const import (
     DOMAIN,
 )
 from custom_components.adjustable_bed.cover import _cover_entities_for
+from custom_components.adjustable_bed.hold_roster import ControlRoster
 from custom_components.adjustable_bed.light import _light_entities_for
 from custom_components.adjustable_bed.sensor import _sensor_entities_for
 
@@ -32,6 +33,8 @@ def configure_entity_runtime(
     entry.add_to_hass(hass)
     coordinator = MagicMock()
     coordinator.entry = entry
+    # What a real coordinator of a bed that declares no hold control carries.
+    coordinator.control_roster = ControlRoster.empty()
     coordinator.capability_controller = controller
     coordinator.controller = controller
     coordinator.has_massage = True

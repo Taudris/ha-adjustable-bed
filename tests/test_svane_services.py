@@ -18,6 +18,7 @@ from custom_components.adjustable_bed.const import (
     SIDE_RIGHT,
 )
 from custom_components.adjustable_bed.coordinator import AdjustableBedCoordinator
+from custom_components.adjustable_bed.hold_roster import ControlRoster
 from custom_components.adjustable_bed.paired_coordinator import PairedBedCoordinator
 from custom_components.adjustable_bed.services import async_register_services
 from tests.test_paired_coordinator import RecordingChild
@@ -30,6 +31,8 @@ def target(profile="multi", bed_type=BED_TYPE_SVANE):
     coordinator.name = "Svane"
     coordinator.bed_type = bed_type
     coordinator.entry = SimpleNamespace(data={})
+    # What a real coordinator of a bed that declares no hold control carries.
+    coordinator.control_roster = ControlRoster.empty()
     coordinator.controller = coordinator.capability_controller = controller
 
     async def execute(command, **kwargs):

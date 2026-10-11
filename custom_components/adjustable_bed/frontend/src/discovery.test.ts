@@ -9,7 +9,12 @@ import {
   pairedChildDeviceIds,
   resolvePairedParentId,
 } from "./discovery";
-import type { EntityRegistryDisplayEntry, HomeAssistant } from "./types";
+import type {
+  EntityRegistryDisplayEntry,
+  HassEntity,
+  HassEntityAttributes,
+  HomeAssistant,
+} from "./types";
 
 function entry(
   entity_id: string,
@@ -20,13 +25,26 @@ function entry(
   return { entity_id, translation_key, device_id, platform };
 }
 
-function hassWith(entries: EntityRegistryDisplayEntry[]): HomeAssistant {
+function hassWith(
+  entries: EntityRegistryDisplayEntry[],
+  attributes: Record<string, HassEntityAttributes> = {},
+): HomeAssistant {
   const entities: Record<string, EntityRegistryDisplayEntry> = {};
   for (const e of entries) entities[e.entity_id] = e;
+  const states: Record<string, HassEntity> = {};
+  for (const [entity_id, attrs] of Object.entries(attributes)) {
+    states[entity_id] = {
+      entity_id,
+      state: "unknown",
+      attributes: attrs,
+      last_changed: "",
+      last_updated: "",
+    };
+  }
   return {
     connection: { sendMessagePromise: async () => ({}), addEventListener: () => {} },
     entities,
-    states: {},
+    states,
     devices: {},
     locale: { language: "en" },
     language: "en",
@@ -88,7 +106,10 @@ test("2-motor bed with light switch and no massage/climate", () => {
   expect(bed.motors.map((m) => m.key)).toEqual(["back", "legs"]);
   expect(bed.motors[0].cover).toBe("cover.seng_back");
   expect(bed.motors[0].position).toBe("number.seng_back_position");
-  expect(bed.presets).toEqual(["button.seng_flat", "button.seng_zero_g"]);
+  expect(bed.presets.map((p) => p.id)).toEqual([
+    "button.seng_flat",
+    "button.seng_zero_g",
+  ]);
   expect(bed.stop).toBe("button.seng_stop");
   expect(bed.connect).toBe("button.seng_connect");
   expect(bed.disconnect).toBe("button.seng_disconnect");
@@ -269,7 +290,7 @@ test("two-address profile controls keep independent child state and parent actio
   expect(hass.states[left.lights.mood!.selects[0]].state).toBe("palette_3");
   expect(hass.states[right.lights.timerMinutes!].state).toBe("45");
   expect(parent.stop).toBe("button.stop");
-  expect(parent.presets).toEqual(["button.flat"]);
+  expect(parent.presets.map((p) => p.id)).toEqual(["button.flat"]);
   expect(parent.lights).toEqual({});
   expect(parent.massage.selects).toBeUndefined();
 });
@@ -324,9 +345,9 @@ test("single-address paired entities split by bed_side on one device", () => {
   expect(bedEntitiesForDevice(hass, "dev1", "right").motors[0].cover).toBe(
     "cover.b_back_right",
   );
-  expect(bedEntitiesForDevice(hass, "dev1", "both").presets).toEqual([
-    "button.b_flat_both",
-  ]);
+  expect(
+    bedEntitiesForDevice(hass, "dev1", "both").presets.map((p) => p.id),
+  ).toEqual(["button.b_flat_both"]);
 });
 
 test("side-suffixed translation keys remain a supported fallback", () => {
@@ -559,6 +580,70 @@ test("empty for unknown device", () => {
   expect(bedIsEmpty(bedEntitiesForDevice(hass, "nope"))).toBe(true);
 });
 
+test("a bed publishing hold controls carries them on its covers, presets and memory tiles", () => {
+  const hass = hassWith(
+    [
+      entry("cover.okin_head", "head"),
+      entry("button.okin_flat", "preset_flat"),
+      entry("button.okin_goto3", "preset_memory_3"),
+      entry("button.okin_save3", "program_memory_3"),
+    ],
+    {
+      "cover.okin_head": {
+        hold_control_up: "motor-head-up",
+        hold_control_down: "motor-head-down",
+        hold_ttl_max_ms: 30000,
+      },
+      "button.okin_flat": { hold_control: "preset-flat", hold_ttl_max_ms: 30000 },
+      "button.okin_goto3": { hold_control: "preset-3", hold_ttl_max_ms: 30000 },
+    },
+  );
+  const bed = bedEntitiesForDevice(hass, "dev1");
+
+  expect(bed.motors[0]).toMatchObject({
+    cover: "cover.okin_head",
+    holdUp: { control: "motor-head-up", ttlMaxMs: 30000 },
+    holdDown: { control: "motor-head-down", ttlMaxMs: 30000 },
+  });
+  expect(bed.presets).toEqual([
+    {
+      id: "button.okin_flat",
+      hold: { control: "preset-flat", ttlMaxMs: 30000 },
+    },
+  ]);
+  expect(bed.memory[0]).toMatchObject({
+    slot: 3,
+    goto: "button.okin_goto3",
+    gotoHold: { control: "preset-3", ttlMaxMs: 30000 },
+  });
+});
+
+test("operation-controls-command-path-only: a save-only memory slot carries no control", () => {
+  const hass = hassWith([entry("button.okin_save1", "program_memory_1")], {
+    "button.okin_save1": { hold_control: "store-preset-1" },
+  });
+  const bed = bedEntitiesForDevice(hass, "dev1");
+
+  // Storing is a staged operation and reaches the bed through the command path
+  // alone, so a save button's tile never becomes a hold tile.
+  expect(bed.memory).toEqual([{ slot: 1, save: "button.okin_save1" }]);
+});
+
+test("presets-hold-only: a bed publishing nothing keeps its preset tiles on button.press", () => {
+  const hass = hassWith([
+    entry("cover.seng_back", "back"),
+    entry("button.seng_flat", "preset_flat"),
+    entry("button.seng_goto1", "preset_memory_1"),
+  ]);
+  const bed = bedEntitiesForDevice(hass, "dev1");
+
+  expect(bed.motors[0].holdUp).toBeUndefined();
+  expect(bed.motors[0].holdDown).toBeUndefined();
+  expect(bed.presets[0].hold).toBeUndefined();
+  expect(bed.memory[0].gotoHold).toBeUndefined();
+  expect(bedIsEmpty(bed)).toBe(false);
+});
+
 test("pairedChildDeviceIds returns sided children ordered by name", () => {
   const hass = hassWith([]);
   hass.devices = {
@@ -636,7 +721,7 @@ test("separate-address children keep side words that name the control", () => {
   ] as [string, string, string, BedSide][]));
   for (const side of ["left", "right"]) {
     const bed = bedEntitiesForDevice(hass, side);
-    expect(bed.presets).toEqual([`button.${side}_inclined_left`, `button.${side}_inclined_right`]);
+    expect(bed.presets.map((p) => p.id)).toEqual([`button.${side}_inclined_left`, `button.${side}_inclined_right`]);
     expect(bed.motors.map((m) => [m.key, m.cover])).toEqual([
       ["split_back_left", `cover.${side}_split_left`],
       ["split_back_right", `cover.${side}_split_right`],
@@ -659,7 +744,7 @@ test("single-address children strip only their own side suffix", () => {
     const bed = bedEntitiesForDevice(hass, side);
     expect(bed.motors.map((m) => [m.key, m.cover])).toEqual([["back", `cover.${side}_back`]]);
     expect(bed.connectivity).toBe(`binary_sensor.${side}_ble`);
-    expect([...bed.presets].sort()).toEqual([`button.${side}_inclined_left`, `button.${side}_inclined_right`]);
+    expect(bed.presets.map((p) => p.id).sort()).toEqual([`button.${side}_inclined_left`, `button.${side}_inclined_right`]);
   }
 });
 
@@ -828,7 +913,7 @@ test("Restonic BT remote B maps its combined cover, light and ZZZ button", () =>
   ]);
   const bed = bedEntitiesForDevice(hass, "dev1");
   expect(bed.motors.map((m) => m.key)).toEqual(["back_legs", "head", "feet"]);
-  expect(bed.presets).toEqual(["button.r_flat", "button.r_zero_g"]);
+  expect(bed.presets.map((p) => p.id)).toEqual(["button.r_flat", "button.r_zero_g"]);
   expect(bed.lights.toggle).toBe("button.r_light");
   expect(bed.utility).toEqual(["button.r_zzz"]);
   expect(bed.memory).toEqual([]);
@@ -844,7 +929,7 @@ test("SIMMONS inclined controls join presets and clock/alarm actions land in uti
     entry("button.s_alarms", "simmons_refresh_alarms"),
   ]);
   const bed = bedEntitiesForDevice(hass, "dev1");
-  expect(bed.presets).toEqual(["button.s_flat", "button.s_left", "button.s_middle", "button.s_right"]);
+  expect(bed.presets.map((p) => p.id)).toEqual(["button.s_flat", "button.s_left", "button.s_middle", "button.s_right"]);
   expect(bed.utility).toEqual(["button.s_clock", "button.s_alarms"]);
 });
 
@@ -907,7 +992,7 @@ test("Richmat MH app-labelled buttons, sliders and selectors land in their secti
     entry("light.led", "light"),
   ]);
   const bed = bedEntitiesForDevice(hass, "dev1");
-  expect(bed.presets).toEqual(["button.flat", "button.read", "button.relax"]);
+  expect(bed.presets.map((p) => p.id)).toEqual(["button.flat", "button.read", "button.relax"]);
   expect(bed.massage.buttons).toEqual(["button.wave"]);
   expect(bed.massage.numbers).toEqual(["number.head"]);
   expect(bed.massage.selects).toEqual(["select.waist", "select.waist_left_heat"]);
@@ -953,7 +1038,7 @@ test("Okin app Home joins presets and Heal Every Night settings are utility sele
     entry("select.heal_timer", "massage_timer"),
   ]);
   const bed = bedEntitiesForDevice(hass, "dev1");
-  expect(bed.presets).toEqual(["button.seat_home"]);
+  expect(bed.presets.map((p) => p.id)).toEqual(["button.seat_home"]);
   expect(bed.utilitySelects).toEqual(["select.heal_install", "select.heal_act_1", "select.heal_act_2"]);
   expect(bed.massage.numbers).toEqual(["number.heal_wave"]);
   expect(bed.massage.timer).toBe("select.heal_timer");

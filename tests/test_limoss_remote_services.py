@@ -9,6 +9,7 @@ from homeassistant.exceptions import ServiceValidationError
 
 from custom_components.adjustable_bed.const import BED_TYPE_LIMOSS_REMOTE, DOMAIN, SIDE_BOTH
 from custom_components.adjustable_bed.coordinator import AdjustableBedCoordinator
+from custom_components.adjustable_bed.hold_roster import ControlRoster
 from custom_components.adjustable_bed.limoss_remote_state import LimossRemoteMemory
 from custom_components.adjustable_bed.services import async_register_services
 from tests.test_limoss_remote import make_controller
@@ -20,6 +21,8 @@ def target(*, memory=8):
     coordinator.name = "App target"
     coordinator.bed_type = BED_TYPE_LIMOSS_REMOTE
     coordinator.entry = SimpleNamespace(data={})
+    # What a real coordinator of a bed that declares no hold control carries.
+    coordinator.control_roster = ControlRoster.empty()
     coordinator.capability_controller = controller
 
     async def execute(command, **kwargs):

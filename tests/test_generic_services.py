@@ -19,6 +19,7 @@ from custom_components.adjustable_bed.const import (
     SIDE_BOTH,
 )
 from custom_components.adjustable_bed.coordinator import AdjustableBedCoordinator
+from custom_components.adjustable_bed.hold_roster import ControlRoster
 from custom_components.adjustable_bed.services import async_register_services
 
 ROOT = Path(__file__).parents[1] / "custom_components" / "adjustable_bed"
@@ -48,6 +49,8 @@ def target(bed_type: str = BED_TYPE_KEESON, name: str = "Bed", **capabilities: o
     coordinator.name = name
     coordinator.bed_type = bed_type
     coordinator.entry = SimpleNamespace(data={})
+    # What a real coordinator of a bed that declares no hold control carries.
+    coordinator.control_roster = ControlRoster.empty()
     coordinator.capability_controller = controller
 
     async def execute(command, **kwargs):
