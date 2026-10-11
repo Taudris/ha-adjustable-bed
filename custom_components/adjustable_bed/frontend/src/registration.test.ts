@@ -12,6 +12,7 @@ function hassWithEntity(
   deviceId: string | undefined,
 ): HomeAssistant {
   return {
+    connection: { sendMessagePromise: async () => ({}), addEventListener: () => {} },
     entities: {
       "cover.bed_back": {
         entity_id: "cover.bed_back",

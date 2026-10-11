@@ -330,12 +330,21 @@ under `custom_components/adjustable_bed/frontend/`.
   - `bed-graphic.ts` — theme-aware angle SVG. `localize.ts` + `translations/`
     hold the card's own strings (section headers / editor labels);
     entity names come from HA's localized `friendly_name`.
+  - `freshness.ts` — travels in the bundle and evaluates once per document. It
+    asks `adjustable_bed/card_freshness` for the cache key the server serves,
+    when `hass` first reaches a card and on every websocket reconnect after
+    that. It reloads the page when the answer is not the key its own
+    `import.meta.url` carries. On the app page only: the registry it is handed
+    holds `home-assistant` there, and a Cast receiver, which defines `hc-main`
+    instead, is skipped because what a reload does to a cast session is unread.
+    Pure: the registry, the connection, and the reload are all handed in, which
+    is what its tests fake.
 - **Build** (requires [bun](https://bun.sh)):
   ```bash
   cd custom_components/adjustable_bed/frontend
   bun install --frozen-lockfile
   bun run check   # tsc (TypeScript 7) typecheck + esbuild bundle
-  bun test        # discovery, paired-state and hold behavior
+  bun test        # discovery, paired-state, hold and freshness behavior
   ```
   The bundle is written to `frontend/dist/adjustable-bed-card.js` and is
   **committed** (it ships with the integration). Rebuild and commit it whenever
@@ -343,8 +352,10 @@ under `custom_components/adjustable_bed/frontend/`.
 - **Registration**: `frontend.py` serves the committed bundle and a stable,
   uncached module loader at `/adjustable_bed_frontend/adjustable-bed-card.js`.
   It registers a Lovelace resource and an extra frontend module automatically,
-  consolidating old storage-mode resources. `frontend` and `lovelace` are in
-  `after_dependencies`; registration is best-effort and does not block setup.
+  consolidating old storage-mode resources. The same run registers the
+  `adjustable_bed/card_freshness` command `freshness.ts` asks, closing over that
+  run's cache key. `frontend` and `lovelace` are in `after_dependencies`;
+  registration is best-effort and does not block setup.
 
 ## Development
 

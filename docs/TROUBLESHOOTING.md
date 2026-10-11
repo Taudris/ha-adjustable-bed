@@ -116,9 +116,11 @@ card as missing until the next page load. The card now also registers in the
 replacement registry, so this no longer needs a reload or cache reset. Remove any manually added duplicate or relative
 `adjustable_bed_frontend/...` resource; it is not needed.
 
-After updating the integration and restarting Home Assistant, reload the page
-or fully close and reopen the Companion app. A page already running JavaScript
-from an older version cannot replace its registered custom element in place.
+After updating the integration and restarting Home Assistant, a dashboard left
+open reloads itself once its websocket reconnects. If it does not, reload the
+page or fully close and reopen the Companion app. A page already running
+JavaScript from an older version cannot replace its registered custom element
+in place.
 
 If the problem persists:
 
