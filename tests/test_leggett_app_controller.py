@@ -653,30 +653,51 @@ async def test_disconnect_invalidates_cu170_light_state():
     )
 
 
-async def test_tap_waits_one_scheduler_interval_before_release_and_cleans_up_on_cancel():
+async def test_tap_cancelled_while_holding_the_press_still_releases():
     controller = make_controller()
-    waiting = asyncio.Event()
-    release_wait = asyncio.Event()
-    deadlines = []
+    pressed = asyncio.Event()
 
-    async def wait(deadline):
-        deadlines.append(deadline)
-        waiting.set()
-        await release_wait.wait()
+    async def press(*args, **kwargs):
+        pressed.set()
 
-    controller._wait_hold_deadline = wait
-    started = asyncio.get_running_loop().time()
+    controller.write_command.side_effect = press
     task = asyncio.create_task(controller.lights_toggle())
-    await waiting.wait()
-    assert deadlines[0] >= started + 0.1
-    assert controller.write_command.await_count == 1
+    await pressed.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert controller.write_command.await_count == 2
     release = controller.write_command.await_args_list[-1]
     assert release.args[0] == bytes.fromhex("040200000000")
     assert release.kwargs["repeat_count"] == 4
     assert not release.kwargs["cancel_event"].is_set()
+
+
+async def test_light_confirmation_survives_the_receipt_anchored_tap():
+    """A receipt and a state change are distinct frames on the same channel.
+
+    The tap waits for the first; the light logic still has to see the second,
+    and neither wait may consume the other's notification.
+    """
+    controller = make_controller()
+    report_cu170(controller, 0)
+    released = asyncio.Event()
+
+    async def press(packet, **kwargs):
+        if packet == bytes.fromhex("040200000000"):
+            released.set()
+            return
+        report_cu170(controller, 0)  # The receipt carries the pre-toggle state.
+
+    controller.write_command.side_effect = press
+
+    task = asyncio.create_task(controller.lights_on())
+    async with asyncio.timeout(1):
+        await released.wait()
+        assert not task.done()
+        report_cu170(controller, 0x20000)
+        await task
+    assert controller.get_light_state() == {"is_on": True}
 
 
 async def test_cu170_reset_chord_is_not_exposed_and_cannot_be_sent():
